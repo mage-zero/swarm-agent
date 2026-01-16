@@ -4,6 +4,7 @@ import http from 'http';
 import os from 'os';
 
 export type StatusConfig = {
+  stack_id?: number;
   stack_domain?: string;
   stack_name?: string;
   magento_base_url?: string;

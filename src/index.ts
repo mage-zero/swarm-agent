@@ -1,10 +1,12 @@
 import { serve } from '@hono/node-server';
 import { createApp } from './app.js';
+import { startEnvironmentSync } from './env-sync.js';
 import { startStatusReporter } from './status.js';
 
 const port = Number(process.env.PORT ?? 8080);
 
 startStatusReporter();
+startEnvironmentSync();
 
 serve({
   fetch: createApp().fetch,
