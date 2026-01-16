@@ -27,7 +27,9 @@ jobs:
         run: npm run build:bundle
 
       - name: Generate checksum
-        run: sha256sum dist/swarm-agent.js > dist/swarm-agent.js.sha256
+        run: |
+          cd dist
+          sha256sum swarm-agent.js > swarm-agent.js.sha256
 
       - name: Release
         uses: softprops/action-gh-release@v2
