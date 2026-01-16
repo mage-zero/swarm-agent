@@ -22,6 +22,7 @@ type R2Credentials = {
 
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
+const ENV_STATE_DIR = process.env.MZ_ENV_STATE_DIR || '/etc/magezero/env-sync';
 const SYNC_INTERVAL_MS = Number(process.env.MZ_ENV_SYNC_INTERVAL_MS || 60000);
 
 let cachedDockerApiVersion: string | null = null;
@@ -32,6 +33,33 @@ function readNodeFile(filename: string) {
     return fs.readFileSync(`${NODE_DIR}/${filename}`, 'utf8').trim();
   } catch {
     return '';
+  }
+}
+
+function ensureStateDir() {
+  if (!fs.existsSync(ENV_STATE_DIR)) {
+    fs.mkdirSync(ENV_STATE_DIR, { recursive: true });
+  }
+}
+
+function getEnvMarkerPath(environmentId: number) {
+  return `${ENV_STATE_DIR}/env-${environmentId}-r2.done`;
+}
+
+function hasEnvMarker(environmentId: number): boolean {
+  return fs.existsSync(getEnvMarkerPath(environmentId));
+}
+
+function writeEnvMarker(environmentId: number) {
+  ensureStateDir();
+  fs.writeFileSync(getEnvMarkerPath(environmentId), `${new Date().toISOString()}\n`, 'utf8');
+}
+
+function clearEnvMarker(environmentId: number) {
+  try {
+    fs.unlinkSync(getEnvMarkerPath(environmentId));
+  } catch {
+    // ignore
   }
 }
 
@@ -220,13 +248,21 @@ async function syncEnvironmentCredentials() {
     const mediaAccessName = `mz-env-${environmentId}-r2-media-access-key`;
     const mediaSecretName = `mz-env-${environmentId}-r2-media-secret-key`;
 
-    if (
+    const hasAllSecrets =
       existingSecrets.has(backupAccessName)
       && existingSecrets.has(backupSecretName)
       && existingSecrets.has(mediaAccessName)
-      && existingSecrets.has(mediaSecretName)
-    ) {
+      && existingSecrets.has(mediaSecretName);
+
+    if (hasAllSecrets) {
+      if (!hasEnvMarker(environmentId)) {
+        writeEnvMarker(environmentId);
+      }
       continue;
+    }
+
+    if (hasEnvMarker(environmentId)) {
+      clearEnvMarker(environmentId);
     }
 
     const creds = await fetchJson(
@@ -252,6 +288,8 @@ async function syncEnvironmentCredentials() {
     await ensureSecret(backupSecretName, creds.backups.secretAccessKey, labels, existingSecrets);
     await ensureSecret(mediaAccessName, creds.media.accessKeyId, labels, existingSecrets);
     await ensureSecret(mediaSecretName, creds.media.secretAccessKey, labels, existingSecrets);
+
+    writeEnvMarker(environmentId);
   }
 }
 
