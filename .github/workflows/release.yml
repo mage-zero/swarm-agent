@@ -29,11 +29,11 @@ jobs:
       - name: Generate checksum
         run: |
           cd dist
-          sha256sum swarm-agent.js > swarm-agent.js.sha256
+          sha256sum swarm-agent.cjs > swarm-agent.cjs.sha256
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/swarm-agent.js
-            dist/swarm-agent.js.sha256
+            dist/swarm-agent.cjs
+            dist/swarm-agent.cjs.sha256
