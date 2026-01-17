@@ -149,6 +149,11 @@ async function getLocalSwarmInfo(): Promise<LocalSwarmInfo> {
   }
 }
 
+export async function isSwarmManager(): Promise<boolean> {
+  const local = await getLocalSwarmInfo();
+  return local.controlAvailable === true;
+}
+
 function summarizeNodes(nodes: any[]): SwarmSummary {
   const managers = nodes.filter((node) => node.ManagerStatus && node.ManagerStatus.Leader !== undefined);
   const workers = nodes.filter((node) => !node.ManagerStatus);

@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { getHealthStatus } from './health.js';
+import { handleDeployArtifact } from './deploy.js';
 import { buildStatusPayload, handleJoinTokenRequest } from './status.js';
 
 export const createApp = () => {
@@ -10,6 +11,11 @@ export const createApp = () => {
   app.get('/join-token', async (c) => {
     const secret = c.req.header('x-mz-join-secret');
     const result = await handleJoinTokenRequest(secret);
+    return c.json(result.body, result.status);
+  });
+
+  app.post('/deploy/artifact', async (c) => {
+    const result = await handleDeployArtifact(c);
     return c.json(result.body, result.status);
   });
 
