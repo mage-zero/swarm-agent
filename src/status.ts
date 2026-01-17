@@ -30,6 +30,12 @@ type SwarmSummary = {
   nodes: SwarmNode[];
 };
 
+type LocalSwarmInfo = {
+  localNodeState?: string;
+  controlAvailable?: boolean;
+  nodeId?: string;
+};
+
 const CONFIG_PATH = process.env.STATUS_CONFIG_PATH || '/opt/status/data.json';
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
@@ -111,6 +117,36 @@ async function getDockerApiVersion(): Promise<string> {
   }
 
   return normalizedFallback;
+}
+
+function normalizeLocalSwarmInfo(info: any): LocalSwarmInfo {
+  const swarm = info?.Swarm || {};
+  return {
+    localNodeState: swarm.LocalNodeState ? String(swarm.LocalNodeState) : '',
+    controlAvailable: Boolean(swarm.ControlAvailable),
+    nodeId: swarm.NodeID ? String(swarm.NodeID) : '',
+  };
+}
+
+async function getLocalSwarmInfo(): Promise<LocalSwarmInfo> {
+  if (process.env.MZ_DISABLE_DOCKER === '1') {
+    return {};
+  }
+
+  try {
+    const info = await dockerRequest('/info');
+    return normalizeLocalSwarmInfo(info);
+  } catch {
+    // ignore and retry with versioned path
+  }
+
+  try {
+    const apiVersion = await getDockerApiVersion();
+    const info = await dockerRequest(`/${apiVersion}/info`);
+    return normalizeLocalSwarmInfo(info);
+  } catch {
+    return {};
+  }
 }
 
 function summarizeNodes(nodes: any[]): SwarmSummary {
@@ -228,8 +264,11 @@ function buildSignature(method: string, path: string, query: string, timestamp: 
   return crypto.createHmac('sha256', secret).update(stringToSign).digest('base64');
 }
 
-async function getSwarmSummary(): Promise<SwarmSummary> {
+async function getSwarmSummary(controlAvailable?: boolean): Promise<SwarmSummary> {
   if (process.env.MZ_DISABLE_DOCKER === '1') {
+    return { total: 0, managers: 0, workers: 0, nodes: [] };
+  }
+  if (controlAvailable === false) {
     return { total: 0, managers: 0, workers: 0, nodes: [] };
   }
   let nodes: any[] = [];
@@ -247,7 +286,8 @@ async function getSwarmSummary(): Promise<SwarmSummary> {
 
 export async function buildStatusPayload(reqHost: string, wantsJson: boolean) {
   const config = readConfig();
-  const swarm = await getSwarmSummary();
+  const localSwarm = await getLocalSwarmInfo();
+  const swarm = await getSwarmSummary(localSwarm.controlAvailable);
   const nodeAssignments = mapSwarmNodes(config.nodes || [], swarm.nodes || []);
   const summary = {
     host: reqHost,
@@ -314,24 +354,33 @@ export async function pushStatus() {
     return;
   }
 
-  const swarm = await getSwarmSummary();
-  const stackStatus = swarm.total > 0 && swarm.nodes.every((node) => node.status === 'ready')
-    ? 'healthy'
-    : 'unhealthy';
+  const localSwarm = await getLocalSwarmInfo();
+  const swarm = await getSwarmSummary(localSwarm.controlAvailable);
+  const stackStatus = localSwarm.controlAvailable
+    ? (swarm.total > 0 && swarm.nodes.every((node) => node.status === 'ready') ? 'healthy' : 'unhealthy')
+    : null;
 
   const localHostname = os.hostname();
-  const swarmNode = swarm.nodes.find((node) => node.labels?.['mz.node_id'] === String(nodeId))
-    || swarm.nodes.find((node) => node.hostname === localHostname);
-  const nodeStatus = swarmNode && swarmNode.status === 'ready' ? 'active' : 'provisioning';
+  const localState = String(localSwarm.localNodeState || '').toLowerCase();
+  let nodeStatus = localState === 'active' ? 'active' : 'provisioning';
+  if (localSwarm.controlAvailable) {
+    const swarmNode = swarm.nodes.find((node) => node.labels?.['mz.node_id'] === String(nodeId))
+      || swarm.nodes.find((node) => node.hostname === localHostname);
+    if (swarmNode) {
+      nodeStatus = swarmNode.status === 'ready' ? 'active' : 'provisioning';
+    }
+  }
 
   const cloudInitStatus = readCloudInitStatus();
   const cloudInitPayload = cloudInitStatus ? JSON.stringify(cloudInitStatus) : null;
   const masterSshPublicKey = readNodeFile('stack_master_ssh.pub');
   const payload: Record<string, unknown> = {
     status: nodeStatus,
-    stack_status: stackStatus,
     cloud_init_status: cloudInitPayload,
   };
+  if (stackStatus) {
+    payload.stack_status = stackStatus;
+  }
   if (masterSshPublicKey) {
     payload.master_ssh_public_key = masterSshPublicKey;
   }
