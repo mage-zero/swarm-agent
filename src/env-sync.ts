@@ -153,6 +153,27 @@ async function getDockerApiVersion(): Promise<string> {
   return normalizedFallback;
 }
 
+async function isSwarmManager(): Promise<boolean> {
+  if (process.env.MZ_DISABLE_DOCKER === '1') {
+    return false;
+  }
+
+  try {
+    const info = await dockerRequest('GET', '/info');
+    return Boolean(info?.Swarm?.ControlAvailable);
+  } catch {
+    // ignore and retry with versioned path
+  }
+
+  try {
+    const apiVersion = await getDockerApiVersion();
+    const info = await dockerRequest('GET', `/${apiVersion}/info`);
+    return Boolean(info?.Swarm?.ControlAvailable);
+  } catch {
+    return false;
+  }
+}
+
 async function listSecretNames(): Promise<Set<string>> {
   if (process.env.MZ_DISABLE_DOCKER === '1') {
     return new Set();
@@ -213,6 +234,9 @@ async function syncEnvironmentCredentials() {
   const nodeSecret = readNodeFile('node-secret');
 
   if (!stackId || !baseUrl || !nodeId || !nodeSecret) {
+    return;
+  }
+  if (!(await isSwarmManager())) {
     return;
   }
 
