@@ -1,11 +1,12 @@
 import crypto from 'crypto';
 import fs from 'fs';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import { isSwarmManager } from './status.js';
 
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/deployments';
 const DEPLOY_SCRIPT = process.env.MZ_DEPLOY_SCRIPT || '';
+const CLOUD_SWARM_KEY_PATH = process.env.MZ_CLOUD_SWARM_KEY_PATH || '/opt/mage-zero/keys/cloud-swarm-deploy';
 const MAX_SKEW_SECONDS = 300;
 const NONCE_TTL_MS = 10 * 60 * 1000;
 
@@ -79,6 +80,89 @@ function enqueueDeployment(payload: DeployPayload, deploymentId: string) {
 }
 
 export async function handleDeployArtifact(c: { req: { raw: Request; header: (name: string) => string | undefined } }) {
+  const validated = await validateRequest(c);
+  if ('status' in validated) {
+    return validated;
+  }
+
+  if (!(await isSwarmManager())) {
+    return { status: 403, body: { error: 'not_manager' } } as const;
+  }
+
+  let payload: DeployPayload | null = null;
+  try {
+    const bodyText = await c.req.raw.clone().text();
+    payload = JSON.parse(bodyText);
+  } catch {
+    payload = null;
+  }
+
+  const artifact = (payload?.artifact || '').trim();
+  if (!artifact) {
+    return { status: 400, body: { error: 'missing_artifact' } } as const;
+  }
+
+  const deploymentId = crypto.randomUUID();
+  enqueueDeployment(payload ?? {}, deploymentId);
+
+  if (DEPLOY_SCRIPT && fs.existsSync(DEPLOY_SCRIPT)) {
+    spawn(DEPLOY_SCRIPT, [artifact], {
+      stdio: 'ignore',
+      detached: true,
+      env: process.env,
+    }).unref();
+  }
+
+  return {
+    status: 202,
+    body: {
+      deployment_id: deploymentId,
+      status: 'queued',
+      artifact,
+    },
+  } as const;
+}
+
+export async function handleDeployKey(c: { req: { raw: Request; header: (name: string) => string | undefined } }) {
+  const validated = await validateRequest(c);
+  if ('status' in validated) {
+    return validated;
+  }
+
+  if (!(await isSwarmManager())) {
+    return { status: 403, body: { error: 'not_manager' } } as const;
+  }
+
+  const keyPath = CLOUD_SWARM_KEY_PATH;
+  const pubPath = `${keyPath}.pub`;
+  ensureQueueDir();
+
+  if (!fs.existsSync(keyPath) || !fs.existsSync(pubPath)) {
+    const dir = keyPath.split('/').slice(0, -1).join('/') || '.';
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    spawnSync('ssh-keygen', ['-t', 'ed25519', '-a', '64', '-N', '', '-f', keyPath, '-C', 'mz-cloud-swarm'], {
+      stdio: 'ignore',
+    });
+  }
+
+  if (fs.existsSync(keyPath)) {
+    fs.chmodSync(keyPath, 0o600);
+  }
+
+  const publicKey = fs.readFileSync(pubPath, 'utf8').trim();
+  if (!publicKey) {
+    return { status: 500, body: { error: 'missing_public_key' } } as const;
+  }
+
+  return {
+    status: 200,
+    body: { public_key: publicKey, key_path: keyPath },
+  } as const;
+}
+
+async function validateRequest(c: { req: { raw: Request; header: (name: string) => string | undefined } }) {
   const request = c.req.raw;
   const nodeIdHeader = (c.req.header('X-MZ-Node-Id') || '').trim();
   const timestamp = (c.req.header('X-MZ-Timestamp') || '').trim();
@@ -117,39 +201,5 @@ export async function handleDeployArtifact(c: { req: { raw: Request; header: (na
     return { status: 401, body: { error: 'signature_invalid' } } as const;
   }
 
-  if (!(await isSwarmManager())) {
-    return { status: 403, body: { error: 'not_manager' } } as const;
-  }
-
-  let payload: DeployPayload | null = null;
-  try {
-    payload = JSON.parse(bodyText);
-  } catch {
-    payload = null;
-  }
-
-  const artifact = (payload?.artifact || '').trim();
-  if (!artifact) {
-    return { status: 400, body: { error: 'missing_artifact' } } as const;
-  }
-
-  const deploymentId = crypto.randomUUID();
-  enqueueDeployment(payload ?? {}, deploymentId);
-
-  if (DEPLOY_SCRIPT && fs.existsSync(DEPLOY_SCRIPT)) {
-    spawn(DEPLOY_SCRIPT, [artifact], {
-      stdio: 'ignore',
-      detached: true,
-      env: process.env,
-    }).unref();
-  }
-
-  return {
-    status: 202,
-    body: {
-      deployment_id: deploymentId,
-      status: 'queued',
-      artifact,
-    },
-  } as const;
+  return { ok: true } as const;
 }
