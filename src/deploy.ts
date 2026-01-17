@@ -1,12 +1,13 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import { spawn, spawnSync } from 'child_process';
-import { isSwarmManager } from './status.js';
+import { isSwarmManager, readConfig } from './status.js';
 
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/deployments';
 const DEPLOY_SCRIPT = process.env.MZ_DEPLOY_SCRIPT || '';
 const CLOUD_SWARM_KEY_PATH = process.env.MZ_CLOUD_SWARM_KEY_PATH || '/opt/mage-zero/keys/cloud-swarm-deploy';
+const CLOUD_SWARM_BOOTSTRAP = process.env.MZ_CLOUD_SWARM_BOOTSTRAP || '1';
 const MAX_SKEW_SECONDS = 300;
 const NONCE_TTL_MS = 10 * 60 * 1000;
 
@@ -134,24 +135,7 @@ export async function handleDeployKey(c: { req: { raw: Request; header: (name: s
   }
 
   const keyPath = CLOUD_SWARM_KEY_PATH;
-  const pubPath = `${keyPath}.pub`;
-  ensureQueueDir();
-
-  if (!fs.existsSync(keyPath) || !fs.existsSync(pubPath)) {
-    const dir = keyPath.split('/').slice(0, -1).join('/') || '.';
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    spawnSync('ssh-keygen', ['-t', 'ed25519', '-a', '64', '-N', '', '-f', keyPath, '-C', 'mz-cloud-swarm'], {
-      stdio: 'ignore',
-    });
-  }
-
-  if (fs.existsSync(keyPath)) {
-    fs.chmodSync(keyPath, 0o600);
-  }
-
-  const publicKey = fs.readFileSync(pubPath, 'utf8').trim();
+  const publicKey = await ensureKeypair();
   if (!publicKey) {
     return { status: 500, body: { error: 'missing_public_key' } } as const;
   }
@@ -160,6 +144,45 @@ export async function handleDeployKey(c: { req: { raw: Request; header: (name: s
     status: 200,
     body: { public_key: publicKey, key_path: keyPath },
   } as const;
+}
+
+export async function ensureCloudSwarmDeployKey(): Promise<void> {
+  if (CLOUD_SWARM_BOOTSTRAP === '0') {
+    return;
+  }
+  if (!(await isSwarmManager())) {
+    return;
+  }
+
+  const config = readConfig();
+  const stackId = Number((config as Record<string, unknown>).stack_id ?? 0);
+  const baseUrl = String((config as Record<string, unknown>).mz_control_base_url || process.env.MZ_CONTROL_BASE_URL || '').trim();
+  if (!stackId || !baseUrl) {
+    return;
+  }
+
+  const nodeId = readNodeFile('node-id');
+  const secret = readNodeFile('node-secret');
+  if (!nodeId || !secret) {
+    return;
+  }
+
+  const publicKey = await ensureKeypair();
+  if (!publicKey) {
+    return;
+  }
+
+  const payload = JSON.stringify({ stack_id: stackId, public_key: publicKey });
+  const url = new URL('/v1/deploy/cloud-swarm-key', baseUrl);
+  const headers = buildNodeHeaders('POST', url.pathname, url.search.slice(1), payload, nodeId, secret);
+  headers['Content-Type'] = 'application/json';
+  headers['Accept'] = 'application/json';
+
+  try {
+    await fetch(url.toString(), { method: 'POST', headers, body: payload });
+  } catch {
+    // ignore bootstrap failures
+  }
 }
 
 async function validateRequest(c: { req: { raw: Request; header: (name: string) => string | undefined } }) {
@@ -202,4 +225,43 @@ async function validateRequest(c: { req: { raw: Request; header: (name: string) 
   }
 
   return { ok: true } as const;
+}
+
+function buildNodeHeaders(method: string, path: string, query: string, body: string, nodeId: string, secret: string) {
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const nonce = crypto.randomUUID();
+  const signature = buildSignature(method, path, query, timestamp, nonce, body, secret);
+
+  return {
+    'X-MZ-Node-Id': nodeId,
+    'X-MZ-Timestamp': timestamp,
+    'X-MZ-Nonce': nonce,
+    'X-MZ-Signature': signature,
+  };
+}
+
+async function ensureKeypair(): Promise<string> {
+  const keyPath = CLOUD_SWARM_KEY_PATH;
+  const pubPath = `${keyPath}.pub`;
+  ensureQueueDir();
+
+  if (!fs.existsSync(keyPath) || !fs.existsSync(pubPath)) {
+    const dir = keyPath.split('/').slice(0, -1).join('/') || '.';
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    spawnSync('ssh-keygen', ['-t', 'ed25519', '-a', '64', '-N', '', '-f', keyPath, '-C', 'mz-cloud-swarm'], {
+      stdio: 'ignore',
+    });
+  }
+
+  if (fs.existsSync(keyPath)) {
+    fs.chmodSync(keyPath, 0o600);
+  }
+
+  if (!fs.existsSync(pubPath)) {
+    return '';
+  }
+
+  return fs.readFileSync(pubPath, 'utf8').trim();
 }
