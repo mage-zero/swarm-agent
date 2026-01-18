@@ -225,7 +225,11 @@ async function listSecretNames(): Promise<Set<string>> {
   }
   const apiVersion = await getDockerApiVersion();
   const response = await dockerRequest('GET', `/${apiVersion}/secrets`);
-  const secrets = Array.isArray(response?.Secrets) ? response.Secrets : [];
+  const secrets = Array.isArray(response)
+    ? response
+    : Array.isArray(response?.Secrets)
+      ? response.Secrets
+      : [];
   return new Set(secrets.map((secret: { Spec?: { Name?: string } }) => secret?.Spec?.Name).filter(Boolean));
 }
 
