@@ -325,8 +325,9 @@ async function syncEnvironmentCredentials() {
       && existingSecrets.has(backupSecretName)
       && existingSecrets.has(mediaAccessName)
       && existingSecrets.has(mediaSecretName);
+    const hasCredFile = fs.existsSync(getR2CredPath(environmentId));
 
-    if (hasAllSecrets) {
+    if (hasAllSecrets && hasCredFile) {
       if (!hasEnvMarker(environmentId)) {
         writeEnvMarker(environmentId);
       }
