@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { getHealthStatus } from './health.js';
-import { handleDeployArtifact, handleDeployKey } from './deploy.js';
+import { handleDeployArtifact, handleDeployKey, handleR2Presign } from './deploy.js';
 import { buildStatusPayload, handleJoinTokenRequest } from './status.js';
 
 export const createApp = () => {
@@ -21,6 +21,11 @@ export const createApp = () => {
 
   app.post('/deploy/cloud-swarm-key', async (c) => {
     const result = await handleDeployKey(c);
+    return c.json(result.body, result.status);
+  });
+
+  app.post('/r2/presign', async (c) => {
+    const result = await handleR2Presign(c);
     return c.json(result.body, result.status);
   });
 

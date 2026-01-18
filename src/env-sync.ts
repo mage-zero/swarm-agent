@@ -23,6 +23,7 @@ type R2Credentials = {
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
 const ENV_STATE_DIR = process.env.MZ_ENV_STATE_DIR || '/etc/magezero/env-sync';
+const R2_CRED_DIR = process.env.MZ_R2_CRED_DIR || '/opt/mage-zero/r2';
 const SYNC_INTERVAL_MS = Number(process.env.MZ_ENV_SYNC_INTERVAL_MS || 60000);
 
 let cachedDockerApiVersion: string | null = null;
@@ -40,6 +41,29 @@ function ensureStateDir() {
   if (!fs.existsSync(ENV_STATE_DIR)) {
     fs.mkdirSync(ENV_STATE_DIR, { recursive: true });
   }
+}
+
+function ensureR2Dir() {
+  if (!fs.existsSync(R2_CRED_DIR)) {
+    fs.mkdirSync(R2_CRED_DIR, { recursive: true });
+  }
+}
+
+function getR2CredPath(environmentId: number) {
+  return `${R2_CRED_DIR}/env-${environmentId}.json`;
+}
+
+function writeR2CredFile(environmentId: number, backups: R2Credentials, media: R2Credentials) {
+  ensureR2Dir();
+  const payload = {
+    environment_id: environmentId,
+    backups,
+    media,
+    updated_at: new Date().toISOString(),
+  };
+  const target = getR2CredPath(environmentId);
+  fs.writeFileSync(target, JSON.stringify(payload, null, 2), 'utf8');
+  fs.chmodSync(target, 0o600);
 }
 
 function getEnvMarkerPath(environmentId: number) {
@@ -339,6 +363,7 @@ async function syncEnvironmentCredentials() {
       await ensureSecret(mediaAccessName, creds.media.accessKeyId, labels, existingSecrets);
       await ensureSecret(mediaSecretName, creds.media.secretAccessKey, labels, existingSecrets);
 
+      writeR2CredFile(environmentId, creds.backups, creds.media);
       writeEnvMarker(environmentId);
     } finally {
       clearEnvPending(environmentId);

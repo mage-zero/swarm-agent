@@ -8,8 +8,11 @@ const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/depl
 const DEPLOY_SCRIPT = process.env.MZ_DEPLOY_SCRIPT || '';
 const CLOUD_SWARM_KEY_PATH = process.env.MZ_CLOUD_SWARM_KEY_PATH || '/opt/mage-zero/keys/cloud-swarm-deploy';
 const CLOUD_SWARM_BOOTSTRAP = process.env.MZ_CLOUD_SWARM_BOOTSTRAP || '1';
+const R2_CRED_DIR = process.env.MZ_R2_CRED_DIR || '/opt/mage-zero/r2';
 const MAX_SKEW_SECONDS = 300;
 const NONCE_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_PRESIGN_EXPIRES = 900;
+const MAX_PRESIGN_EXPIRES = 3600;
 
 const nonceCache = new Map<string, number>();
 
@@ -21,11 +24,35 @@ type DeployPayload = {
   ref?: string;
 };
 
+type R2Credentials = {
+  accessKeyId: string;
+  secretAccessKey: string;
+  bucket: string;
+  endpoint: string;
+  region?: string;
+};
+
+type R2CredFile = {
+  environment_id?: number;
+  backups?: R2Credentials;
+  media?: R2Credentials;
+  updated_at?: string;
+};
+
 function readNodeFile(name: string) {
   try {
     return fs.readFileSync(`${NODE_DIR}/${name}`, 'utf8').trim();
   } catch {
     return '';
+  }
+}
+
+function readR2CredFile(environmentId: number): R2CredFile | null {
+  try {
+    const raw = fs.readFileSync(`${R2_CRED_DIR}/env-${environmentId}.json`, 'utf8');
+    return JSON.parse(raw) as R2CredFile;
+  } catch {
+    return null;
   }
 }
 
@@ -146,6 +173,74 @@ export async function handleDeployKey(c: { req: { raw: Request; header: (name: s
   } as const;
 }
 
+export async function handleR2Presign(c: { req: { raw: Request; header: (name: string) => string | undefined } }) {
+  const validated = await validateRequest(c);
+  if ('status' in validated) {
+    return validated;
+  }
+
+  if (!(await isSwarmManager())) {
+    return { status: 403, body: { error: 'not_manager' } } as const;
+  }
+
+  const body = await c.req.raw.json().catch(() => null) as {
+    environment_id?: number;
+    bucket?: 'backups' | 'media';
+    object_key?: string;
+    method?: 'PUT' | 'GET';
+    expires_in?: number;
+  } | null;
+
+  const environmentId = Number(body?.environment_id ?? 0);
+  if (!environmentId) {
+    return { status: 400, body: { error: 'missing_environment_id' } } as const;
+  }
+
+  const objectKey = String(body?.object_key ?? '').replace(/^\/+/, '');
+  if (!objectKey) {
+    return { status: 400, body: { error: 'missing_object_key' } } as const;
+  }
+
+  const bucketKind = body?.bucket === 'media' ? 'media' : 'backups';
+  const method = body?.method === 'GET' ? 'GET' : 'PUT';
+  const expiresIn = Math.min(
+    Math.max(Number(body?.expires_in ?? DEFAULT_PRESIGN_EXPIRES) || DEFAULT_PRESIGN_EXPIRES, 60),
+    MAX_PRESIGN_EXPIRES
+  );
+
+  const file = readR2CredFile(environmentId);
+  if (!file) {
+    return { status: 404, body: { error: 'missing_r2_credentials' } } as const;
+  }
+
+  const creds = bucketKind === 'media' ? file.media : file.backups;
+  if (!creds?.accessKeyId || !creds.secretAccessKey || !creds.bucket || !creds.endpoint) {
+    return { status: 404, body: { error: 'incomplete_r2_credentials' } } as const;
+  }
+
+  const url = presignS3Url({
+    method,
+    endpoint: creds.endpoint,
+    bucket: creds.bucket,
+    key: objectKey,
+    accessKeyId: creds.accessKeyId,
+    secretAccessKey: creds.secretAccessKey,
+    region: creds.region || 'auto',
+    expiresIn,
+  });
+
+  return {
+    status: 200,
+    body: {
+      url,
+      method,
+      expires_in: expiresIn,
+      bucket: creds.bucket,
+      object_key: objectKey,
+    },
+  } as const;
+}
+
 export async function ensureCloudSwarmDeployKey(): Promise<void> {
   if (CLOUD_SWARM_BOOTSTRAP === '0') {
     return;
@@ -240,6 +335,98 @@ function buildNodeHeaders(method: string, path: string, query: string, body: str
     'X-MZ-Nonce': nonce,
     'X-MZ-Signature': signature,
   };
+}
+
+function presignS3Url(params: {
+  method: 'PUT' | 'GET';
+  endpoint: string;
+  bucket: string;
+  key: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  region: string;
+  expiresIn: number;
+}) {
+  const endpointUrl = new URL(params.endpoint);
+  const host = endpointUrl.host;
+  const now = new Date();
+  const amzDate = toAmzDate(now);
+  const dateStamp = amzDate.slice(0, 8);
+  const credentialScope = `${dateStamp}/${params.region}/s3/aws4_request`;
+  const signedHeaders = 'host';
+
+  const canonicalUri = `/${encodePath(`${params.bucket}/${params.key}`)}`;
+  const queryParams: Array<[string, string]> = [
+    ['X-Amz-Algorithm', 'AWS4-HMAC-SHA256'],
+    ['X-Amz-Credential', `${params.accessKeyId}/${credentialScope}`],
+    ['X-Amz-Date', amzDate],
+    ['X-Amz-Expires', String(params.expiresIn)],
+    ['X-Amz-SignedHeaders', signedHeaders],
+    ['X-Amz-Content-Sha256', 'UNSIGNED-PAYLOAD'],
+  ];
+  const canonicalQuery = buildCanonicalQuery(queryParams);
+
+  const canonicalHeaders = `host:${host}\n`;
+  const canonicalRequest = [
+    params.method,
+    canonicalUri,
+    canonicalQuery,
+    canonicalHeaders,
+    signedHeaders,
+    'UNSIGNED-PAYLOAD',
+  ].join('\n');
+
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    hashHex(canonicalRequest),
+  ].join('\n');
+
+  const signingKey = getSigningKey(params.secretAccessKey, dateStamp, params.region, 's3');
+  const signature = hmac(signingKey, stringToSign).toString('hex');
+
+  const finalQuery = `${canonicalQuery}&X-Amz-Signature=${signature}`;
+  return `${endpointUrl.origin}${canonicalUri}?${finalQuery}`;
+}
+
+function toAmzDate(date: Date) {
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}T${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}Z`;
+}
+
+function encodePath(path: string) {
+  return path
+    .split('/')
+    .map((part) => encodeRfc3986(part))
+    .join('/');
+}
+
+function encodeRfc3986(value: string) {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function buildCanonicalQuery(params: Array<[string, string]>) {
+  return params
+    .map(([key, value]) => [encodeRfc3986(key), encodeRfc3986(value)])
+    .sort((a, b) => (a[0] === b[0] ? a[1].localeCompare(b[1]) : a[0].localeCompare(b[0])))
+    .map(([key, value]) => `${key}=${value}`)
+    .join('&');
+}
+
+function hashHex(value: string) {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function hmac(key: Buffer, value: string) {
+  return crypto.createHmac('sha256', key).update(value).digest();
+}
+
+function getSigningKey(secret: string, dateStamp: string, region: string, service: string) {
+  const kDate = hmac(Buffer.from(`AWS4${secret}`, 'utf8'), dateStamp);
+  const kRegion = hmac(kDate, region);
+  const kService = hmac(kRegion, service);
+  return hmac(kService, 'aws4_request');
 }
 
 async function ensureKeypair(): Promise<string> {
