@@ -174,9 +174,11 @@ export async function ensureCloudSwarmDeployKey(): Promise<void> {
 
   const payload = JSON.stringify({ stack_id: stackId, public_key: publicKey });
   const url = new URL('/v1/deploy/cloud-swarm-key', baseUrl);
-  const headers = buildNodeHeaders('POST', url.pathname, url.search.slice(1), payload, nodeId, secret);
-  headers['Content-Type'] = 'application/json';
-  headers['Accept'] = 'application/json';
+  const headers = {
+    ...buildNodeHeaders('POST', url.pathname, url.search.slice(1), payload, nodeId, secret),
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+  };
 
   try {
     await fetch(url.toString(), { method: 'POST', headers, body: payload });
