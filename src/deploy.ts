@@ -11,7 +11,7 @@ const CLOUD_SWARM_BOOTSTRAP = process.env.MZ_CLOUD_SWARM_BOOTSTRAP || '1';
 const R2_CRED_DIR = process.env.MZ_R2_CRED_DIR || '/opt/mage-zero/r2';
 const MAX_SKEW_SECONDS = 300;
 const NONCE_TTL_MS = 10 * 60 * 1000;
-const DEFAULT_PRESIGN_EXPIRES = 900;
+const DEFAULT_PRESIGN_EXPIRES = 1800;
 const MAX_PRESIGN_EXPIRES = 3600;
 
 const nonceCache = new Map<string, number>();
