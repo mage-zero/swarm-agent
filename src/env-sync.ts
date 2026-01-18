@@ -46,8 +46,16 @@ function getEnvMarkerPath(environmentId: number) {
   return `${ENV_STATE_DIR}/env-${environmentId}-r2.done`;
 }
 
+function getEnvPendingPath(environmentId: number) {
+  return `${ENV_STATE_DIR}/env-${environmentId}-r2.pending`;
+}
+
 function hasEnvMarker(environmentId: number): boolean {
   return fs.existsSync(getEnvMarkerPath(environmentId));
+}
+
+function hasEnvPending(environmentId: number): boolean {
+  return fs.existsSync(getEnvPendingPath(environmentId));
 }
 
 function writeEnvMarker(environmentId: number) {
@@ -55,9 +63,22 @@ function writeEnvMarker(environmentId: number) {
   fs.writeFileSync(getEnvMarkerPath(environmentId), `${new Date().toISOString()}\n`, 'utf8');
 }
 
+function writeEnvPending(environmentId: number) {
+  ensureStateDir();
+  fs.writeFileSync(getEnvPendingPath(environmentId), `${new Date().toISOString()}\n`, 'utf8');
+}
+
 function clearEnvMarker(environmentId: number) {
   try {
     fs.unlinkSync(getEnvMarkerPath(environmentId));
+  } catch {
+    // ignore
+  }
+}
+
+function clearEnvPending(environmentId: number) {
+  try {
+    fs.unlinkSync(getEnvPendingPath(environmentId));
   } catch {
     // ignore
   }
@@ -260,6 +281,9 @@ async function syncEnvironmentCredentials() {
     if (!environmentId) {
       continue;
     }
+    if (hasEnvPending(environmentId)) {
+      continue;
+    }
 
     const backupBucket = String(environment.db_backup_bucket ?? '').trim();
     const mediaBucket = String(environment.media_bucket ?? '').trim();
@@ -289,31 +313,36 @@ async function syncEnvironmentCredentials() {
       clearEnvMarker(environmentId);
     }
 
-    const creds = await fetchJson(
-      baseUrl,
-      `/v1/agent/environment/${environmentId}/r2-credentials`,
-      'POST',
-      JSON.stringify({ environment_id: environmentId }),
-      nodeId,
-      nodeSecret,
-    ) as { backups?: R2Credentials; media?: R2Credentials };
+    writeEnvPending(environmentId);
+    try {
+      const creds = await fetchJson(
+        baseUrl,
+        `/v1/agent/environment/${environmentId}/r2-credentials`,
+        'POST',
+        JSON.stringify({ environment_id: environmentId }),
+        nodeId,
+        nodeSecret,
+      ) as { backups?: R2Credentials; media?: R2Credentials };
 
-    if (!creds?.backups || !creds?.media) {
-      continue;
+      if (!creds?.backups || !creds?.media) {
+        continue;
+      }
+
+      const labels = {
+        'mz.environment_id': String(environmentId),
+        'mz.stack_id': String(stackId),
+        'mz.managed': 'true',
+      };
+
+      await ensureSecret(backupAccessName, creds.backups.accessKeyId, labels, existingSecrets);
+      await ensureSecret(backupSecretName, creds.backups.secretAccessKey, labels, existingSecrets);
+      await ensureSecret(mediaAccessName, creds.media.accessKeyId, labels, existingSecrets);
+      await ensureSecret(mediaSecretName, creds.media.secretAccessKey, labels, existingSecrets);
+
+      writeEnvMarker(environmentId);
+    } finally {
+      clearEnvPending(environmentId);
     }
-
-    const labels = {
-      'mz.environment_id': String(environmentId),
-      'mz.stack_id': String(stackId),
-      'mz.managed': 'true',
-    };
-
-    await ensureSecret(backupAccessName, creds.backups.accessKeyId, labels, existingSecrets);
-    await ensureSecret(backupSecretName, creds.backups.secretAccessKey, labels, existingSecrets);
-    await ensureSecret(mediaAccessName, creds.media.accessKeyId, labels, existingSecrets);
-    await ensureSecret(mediaSecretName, creds.media.secretAccessKey, labels, existingSecrets);
-
-    writeEnvMarker(environmentId);
   }
 }
 
