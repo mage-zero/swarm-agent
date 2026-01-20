@@ -130,6 +130,52 @@ async function runCommand(command: string, args: string[], options: { cwd?: stri
   });
 }
 
+async function runCommandLogged(
+  command: string,
+  args: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; logDir: string; label: string }
+) {
+  ensureDir(options.logDir);
+  const safeLabel = options.label.replace(/[^a-z0-9._-]/gi, '_');
+  const stdoutPath = path.join(options.logDir, `${safeLabel}.stdout.log`);
+  const stderrPath = path.join(options.logDir, `${safeLabel}.stderr.log`);
+  const header = `\n# ${new Date().toISOString()} ${command} ${args.join(' ')}\n`;
+  fs.appendFileSync(stdoutPath, header);
+  fs.appendFileSync(stderrPath, header);
+
+  await new Promise<void>((resolve, reject) => {
+    const stdoutStream = fs.createWriteStream(stdoutPath, { flags: 'a' });
+    const stderrStream = fs.createWriteStream(stderrPath, { flags: 'a' });
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout.on('data', (chunk) => {
+      stdoutStream.write(chunk);
+      process.stdout.write(chunk);
+    });
+    child.stderr.on('data', (chunk) => {
+      stderrStream.write(chunk);
+      process.stderr.write(chunk);
+    });
+    child.on('error', (error) => {
+      stdoutStream.end();
+      stderrStream.end();
+      reject(error);
+    });
+    child.on('close', (code) => {
+      stdoutStream.end();
+      stderrStream.end();
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`${command} ${args.join(' ')} exited with code ${code}`));
+      }
+    });
+  });
+}
+
 async function runCommandCapture(command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) {
   return await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
     const child = spawn(command, args, {
@@ -496,6 +542,9 @@ async function processDeployment(recordPath: string) {
   const extractDir = path.join(workDir, 'artifact');
   await extractArtifact(artifactPath, extractDir);
 
+  const logDir = path.join(workDir, 'logs');
+  ensureDir(logDir);
+
   const imageTag = resolveImageTag(artifactKey, ref, deploymentId);
   const mageVersion = `env-${environmentId}-${imageTag}`;
   const defaultVersions = readVersionDefaults();
@@ -518,18 +567,26 @@ async function processDeployment(recordPath: string) {
     MAGE_VERSION: mageVersion,
   };
 
-  await runCommand('bash', [path.join(CLOUD_SWARM_DIR, 'scripts/build-services.sh')], { cwd: CLOUD_SWARM_DIR, env: envVars });
-  await runCommand('bash', [path.join(CLOUD_SWARM_DIR, 'scripts/build-magento.sh'), extractDir], { cwd: CLOUD_SWARM_DIR, env: envVars });
+  await runCommandLogged(
+    'bash',
+    [path.join(CLOUD_SWARM_DIR, 'scripts/build-services.sh')],
+    { cwd: CLOUD_SWARM_DIR, env: envVars, logDir, label: 'build-services' }
+  );
+  await runCommandLogged(
+    'bash',
+    [path.join(CLOUD_SWARM_DIR, 'scripts/build-magento.sh'), extractDir],
+    { cwd: CLOUD_SWARM_DIR, env: envVars, logDir, label: 'build-magento' }
+  );
 
   const stackName = `mz-env-${environmentId}`;
-  await runCommand('docker', [
+  await runCommandLogged('docker', [
     'stack',
     'deploy',
     '--with-registry-auth',
     '-c',
     path.join(CLOUD_SWARM_DIR, 'stacks/magento.yml'),
     stackName,
-  ], { env: envVars });
+  ], { env: envVars, logDir, label: 'stack-deploy' });
 
   const dbContainerId = await waitForContainer(stackName, 'database', 5 * 60 * 1000);
   await waitForDatabase(dbContainerId, 5 * 60 * 1000);
