@@ -512,6 +512,7 @@ async function processDeployment(recordPath: string) {
     ...defaultVersions,
     ...overrideVersions,
     REGISTRY_HOST: 'registry',
+    REGISTRY_PUSH_HOST: '127.0.0.1',
     REGISTRY_PORT: '5000',
     SECRET_VERSION,
     MAGE_VERSION: mageVersion,
