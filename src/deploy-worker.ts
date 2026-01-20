@@ -539,9 +539,6 @@ async function processDeployment(recordPath: string) {
   const artifactPath = path.join(workDir, path.basename(artifactKey));
   await downloadArtifact(r2.backups, artifactKey, artifactPath);
 
-  const extractDir = path.join(workDir, 'artifact');
-  await extractArtifact(artifactPath, extractDir);
-
   const logDir = path.join(workDir, 'logs');
   ensureDir(logDir);
 
@@ -574,7 +571,7 @@ async function processDeployment(recordPath: string) {
   );
   await runCommandLogged(
     'bash',
-    [path.join(CLOUD_SWARM_DIR, 'scripts/build-magento.sh'), extractDir],
+    [path.join(CLOUD_SWARM_DIR, 'scripts/build-magento.sh'), artifactPath],
     { cwd: CLOUD_SWARM_DIR, env: envVars, logDir, label: 'build-magento' }
   );
 
