@@ -35,6 +35,11 @@ type R2CredFile = {
   updated_at?: string;
 };
 
+type EnvironmentSecrets = {
+  crypt_key?: string;
+  graphql_id_salt?: string;
+};
+
 type AppSelection = { flavor?: string; version?: string };
 type ApplicationSelections = {
   php?: string;
@@ -51,6 +56,7 @@ type EnvironmentRecord = {
   db_backup_bucket?: string;
   db_backup_object?: string;
   application_selections?: ApplicationSelections;
+  environment_secrets?: EnvironmentSecrets | null;
 };
 
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
@@ -200,6 +206,31 @@ async function runCommandCapture(command: string, args: string[], options: { cwd
 
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function ensureDockerSecret(secretName: string, value: string, workDir: string) {
+  if (!value) {
+    throw new Error(`Missing secret value for ${secretName}`);
+  }
+  try {
+    await runCommandCapture('docker', ['secret', 'inspect', secretName]);
+    return;
+  } catch {
+    // secret missing
+  }
+
+  ensureDir(workDir);
+  const secretPath = path.join(workDir, `${secretName}.secret`);
+  fs.writeFileSync(secretPath, value, { mode: 0o600 });
+  try {
+    await runCommand('docker', ['secret', 'create', secretName, secretPath]);
+  } finally {
+    try {
+      fs.unlinkSync(secretPath);
+    } catch {
+      // ignore cleanup failure
+    }
+  }
 }
 
 function readR2CredFile(environmentId: number): R2CredFile | null {
@@ -563,6 +594,12 @@ async function processDeployment(recordPath: string) {
     SECRET_VERSION,
     MAGE_VERSION: mageVersion,
   };
+
+  const secrets = envRecord?.environment_secrets ?? null;
+  if (secrets?.crypt_key) {
+    const mageSecretName = `mz_mage_crypto_key_v${SECRET_VERSION}`;
+    await ensureDockerSecret(mageSecretName, secrets.crypt_key, workDir);
+  }
 
   await runCommandLogged(
     'bash',
