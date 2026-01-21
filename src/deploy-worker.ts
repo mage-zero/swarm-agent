@@ -510,6 +510,7 @@ async function restoreDatabase(
 async function syncDatabaseUser(containerId: string, dbName: string, dbUser: string) {
   const safeDbName = dbName.replace(/`/g, '``');
   const safeDbUser = dbUser.replace(/'/g, "''");
+  const grantStatement = `GRANT ALL PRIVILEGES ON \`${safeDbName}\`.* TO '${safeDbUser}'@'%';`;
   await runCommand('docker', [
     'exec',
     containerId,
@@ -519,7 +520,7 @@ async function syncDatabaseUser(containerId: string, dbName: string, dbUser: str
       'DB_PASS="$(cat /run/secrets/db_password)"',
       `mysql -uroot -p"$(cat /run/secrets/db_root_password)" -e "CREATE USER IF NOT EXISTS '${safeDbUser}'@'%' IDENTIFIED BY '${DB_PASS}';`,
       `ALTER USER '${safeDbUser}'@'%' IDENTIFIED BY '${DB_PASS}';`,
-      `GRANT ALL PRIVILEGES ON \\`${safeDbName}\\`.* TO '${safeDbUser}'@'%';`,
+      grantStatement,
       'FLUSH PRIVILEGES;"',
     ].join(' '),
   ]);
