@@ -208,6 +208,10 @@ function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function generateSecretHex(bytes: number) {
+  return crypto.randomBytes(bytes).toString('hex');
+}
+
 async function ensureDockerSecret(secretName: string, value: string, workDir: string) {
   if (!value) {
     throw new Error(`Missing secret value for ${secretName}`);
@@ -493,6 +497,24 @@ async function restoreDatabase(
   ]);
 }
 
+async function syncDatabaseUser(containerId: string, dbName: string, dbUser: string) {
+  const safeDbName = dbName.replace(/`/g, '``');
+  const safeDbUser = dbUser.replace(/'/g, "''");
+  await runCommand('docker', [
+    'exec',
+    containerId,
+    'sh',
+    '-c',
+    [
+      'DB_PASS="$(cat /run/secrets/db_password)"',
+      `mysql -uroot -p"$(cat /run/secrets/db_root_password)" -e "CREATE USER IF NOT EXISTS '${safeDbUser}'@'%' IDENTIFIED BY '${DB_PASS}';`,
+      `ALTER USER '${safeDbUser}'@'%' IDENTIFIED BY '${DB_PASS}';`,
+      `GRANT ALL PRIVILEGES ON \\`${safeDbName}\\`.* TO '${safeDbUser}'@'%';`,
+      'FLUSH PRIVILEGES;"',
+    ].join(' '),
+  ]);
+}
+
 async function runMagentoCommand(containerId: string, command: string) {
   await runCommand('docker', ['exec', containerId, 'sh', '-c', command]);
 }
@@ -593,13 +615,24 @@ async function processDeployment(recordPath: string) {
     REGISTRY_PORT: '5000',
     SECRET_VERSION,
     MAGE_VERSION: mageVersion,
+    MYSQL_DATABASE: process.env.MYSQL_DATABASE || 'magento',
+    MYSQL_USER: process.env.MYSQL_USER || 'magento',
   };
 
   const secrets = envRecord?.environment_secrets ?? null;
-  if (secrets?.crypt_key) {
-    const mageSecretName = `mz_mage_crypto_key_v${SECRET_VERSION}`;
-    await ensureDockerSecret(mageSecretName, secrets.crypt_key, workDir);
+  const dbSecretName = `mz_db_password_v${SECRET_VERSION}`;
+  const dbRootSecretName = `mz_db_root_password_v${SECRET_VERSION}`;
+  const rabbitSecretName = `mz_rabbitmq_password_v${SECRET_VERSION}`;
+  const mageSecretName = `mz_mage_crypto_key_v${SECRET_VERSION}`;
+
+  await ensureDockerSecret(dbSecretName, generateSecretHex(24), workDir);
+  await ensureDockerSecret(dbRootSecretName, generateSecretHex(24), workDir);
+  await ensureDockerSecret(rabbitSecretName, generateSecretHex(24), workDir);
+
+  if (!secrets?.crypt_key) {
+    throw new Error('Missing Magento crypt key for environment');
   }
+  await ensureDockerSecret(mageSecretName, secrets.crypt_key, workDir);
 
   await runCommandLogged(
     'bash',
@@ -628,6 +661,11 @@ async function processDeployment(recordPath: string) {
   const encryptedBackupPath = path.join(workDir, path.basename(objectKey));
   await downloadArtifact(r2.backups, objectKey, encryptedBackupPath);
   await restoreDatabase(dbContainerId, encryptedBackupPath, workDir);
+  await syncDatabaseUser(
+    dbContainerId,
+    envVars.MYSQL_DATABASE || 'magento',
+    envVars.MYSQL_USER || 'magento'
+  );
 
   const adminContainerId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
   await runMagentoCommand(adminContainerId, 'php bin/magento setup:upgrade --keep-generated');
