@@ -516,23 +516,24 @@ async function syncDatabaseUser(containerId: string, dbName: string, dbUser: str
   const safeDbName = dbName.replace(/`/g, '``');
   const safeDbUser = dbUser.replace(/'/g, "''");
   const grantStatement =
-    'GRANT ALL PRIVILEGES ON \\`' +
+    'GRANT ALL PRIVILEGES ON `' +
     safeDbName +
-    "\\`.* TO '" +
+    "`.* TO '" +
     safeDbUser +
-    "'@'%';";
+    "'@'%'; FLUSH PRIVILEGES;";
   await runCommand('docker', [
     'exec',
     containerId,
     'sh',
     '-c',
     [
+      'set -e',
       'DB_PASS="$(cat /run/secrets/db_password)"',
-      `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -e "CREATE USER IF NOT EXISTS '${safeDbUser}'@'%' IDENTIFIED BY '\${DB_PASS}';`,
-      `ALTER USER '${safeDbUser}'@'%' IDENTIFIED BY '\${DB_PASS}';`,
-      grantStatement,
-      'FLUSH PRIVILEGES;"',
-    ].join(' '),
+      'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+      `mariadb -uroot -p"$ROOT_PASS" -e "CREATE USER IF NOT EXISTS '${safeDbUser}'@'%' IDENTIFIED BY '${DB_PASS}';"`,
+      `mariadb -uroot -p"$ROOT_PASS" -e "ALTER USER '${safeDbUser}'@'%' IDENTIFIED BY '${DB_PASS}';"`,
+      `mariadb -uroot -p"$ROOT_PASS" -e "${grantStatement}"`,
+    ].join(' && '),
   ]);
 }
 
