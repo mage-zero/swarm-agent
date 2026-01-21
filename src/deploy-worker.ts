@@ -521,6 +521,7 @@ async function syncDatabaseUser(containerId: string, dbName: string, dbUser: str
     "`.* TO '" +
     safeDbUser +
     "'@'%'; FLUSH PRIVILEGES;";
+  const dbPassRef = '${DB_PASS}';
   await runCommand('docker', [
     'exec',
     containerId,
@@ -530,8 +531,8 @@ async function syncDatabaseUser(containerId: string, dbName: string, dbUser: str
       'set -e',
       'DB_PASS="$(cat /run/secrets/db_password)"',
       'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
-      `mariadb -uroot -p"$ROOT_PASS" -e "CREATE USER IF NOT EXISTS '${safeDbUser}'@'%' IDENTIFIED BY '${DB_PASS}';"`,
-      `mariadb -uroot -p"$ROOT_PASS" -e "ALTER USER '${safeDbUser}'@'%' IDENTIFIED BY '${DB_PASS}';"`,
+      `mariadb -uroot -p"$ROOT_PASS" -e "CREATE USER IF NOT EXISTS '${safeDbUser}'@'%' IDENTIFIED BY '${dbPassRef}';"`,
+      `mariadb -uroot -p"$ROOT_PASS" -e "ALTER USER '${safeDbUser}'@'%' IDENTIFIED BY '${dbPassRef}';"`,
       `mariadb -uroot -p"$ROOT_PASS" -e "${grantStatement}"`,
     ].join(' && '),
   ]);
