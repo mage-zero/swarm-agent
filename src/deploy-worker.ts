@@ -563,10 +563,15 @@ async function processDeployment(recordPath: string) {
   const stackId = Number(payload.stack_id ?? 0);
   const environmentId = Number(payload.environment_id ?? 0);
   const ref = String(payload.ref || '').trim();
+  const logPrefix = `[deploy ${deploymentId}]`;
+  const log = (message: string) => {
+    console.log(`${logPrefix} ${message}`);
+  };
 
   if (!artifactKey || !stackId || !environmentId) {
     throw new Error('Deployment payload missing artifact/stack/environment');
   }
+  log(`start stack=${stackId} env=${environmentId} artifact=${artifactKey}`);
 
   const config = readConfig();
   const baseUrl = (config.mz_control_base_url || process.env.MZ_CONTROL_BASE_URL || '').trim();
@@ -581,13 +586,16 @@ async function processDeployment(recordPath: string) {
     environment_id: environmentId,
     status: 'deploying',
   });
+  log('reported deploying status');
 
   await ensureCloudSwarmRepo();
+  log('cloud-swarm repo updated');
 
   const envRecord = await fetchEnvironmentRecord(stackId, environmentId, baseUrl, nodeId, nodeSecret);
   if (!envRecord) {
     throw new Error(`Environment ${environmentId} not found in stack ${stackId}`);
   }
+  log('fetched environment record');
   const selections = envRecord?.application_selections;
   const versions = resolveVersionEnv(selections);
 
@@ -601,7 +609,9 @@ async function processDeployment(recordPath: string) {
   ensureDir(workDir);
 
   const artifactPath = path.join(workDir, path.basename(artifactKey));
+  log('downloading build artifact');
   await downloadArtifact(r2.backups, artifactKey, artifactPath);
+  log('downloaded build artifact');
 
   const logDir = path.join(workDir, 'logs');
   ensureDir(logDir);
@@ -636,6 +646,7 @@ async function processDeployment(recordPath: string) {
   const rabbitSecretName = `mz_rabbitmq_password_v${SECRET_VERSION}`;
   const mageSecretName = `mz_mage_crypto_key_v${SECRET_VERSION}`;
 
+  log('ensuring docker secrets');
   await ensureDockerSecret(dbSecretName, generateSecretHex(24), workDir);
   await ensureDockerSecret(dbRootSecretName, generateSecretHex(24), workDir);
   await ensureDockerSecret(rabbitSecretName, generateSecretHex(24), workDir);
@@ -644,17 +655,20 @@ async function processDeployment(recordPath: string) {
     throw new Error('Missing Magento crypt key for environment');
   }
   await ensureDockerSecret(mageSecretName, secrets.crypt_key, workDir);
+  log('docker secrets ready');
 
   await runCommandLogged(
     'bash',
     [path.join(CLOUD_SWARM_DIR, 'scripts/build-services.sh')],
     { cwd: CLOUD_SWARM_DIR, env: envVars, logDir, label: 'build-services' }
   );
+  log('built base services');
   await runCommandLogged(
     'bash',
     [path.join(CLOUD_SWARM_DIR, 'scripts/build-magento.sh'), artifactPath],
     { cwd: CLOUD_SWARM_DIR, env: envVars, logDir, label: 'build-magento' }
   );
+  log('built magento images');
 
   const stackName = `mz-env-${environmentId}`;
   await runCommandLogged('docker', [
@@ -665,6 +679,7 @@ async function processDeployment(recordPath: string) {
     path.join(CLOUD_SWARM_DIR, 'stacks/magento.yml'),
     stackName,
   ], { env: envVars, logDir, label: 'stack-deploy' });
+  log('stack deployed');
 
   const dbContainerId = await waitForContainer(stackName, 'database', 5 * 60 * 1000);
   await waitForDatabase(dbContainerId, 5 * 60 * 1000);
@@ -672,15 +687,18 @@ async function processDeployment(recordPath: string) {
   const encryptedBackupPath = path.join(workDir, path.basename(objectKey));
   await downloadArtifact(r2.backups, objectKey, encryptedBackupPath);
   await restoreDatabase(dbContainerId, encryptedBackupPath, workDir);
+  log('database restored');
   await syncDatabaseUser(
     dbContainerId,
     envVars.MYSQL_DATABASE || 'magento',
     envVars.MYSQL_USER || 'magento'
   );
+  log('database user synced');
 
   const adminContainerId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
   await runMagentoCommand(adminContainerId, 'php bin/magento setup:upgrade --keep-generated');
   await runMagentoCommand(adminContainerId, 'php bin/magento cache:flush');
+  log('magento upgrade complete');
 
   await reportDeploymentStatus(baseUrl, nodeId, nodeSecret, {
     deployment_id: deploymentId,
