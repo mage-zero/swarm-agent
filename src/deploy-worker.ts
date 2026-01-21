@@ -474,7 +474,7 @@ async function waitForDatabase(containerId: string, timeoutMs: number) {
         containerId,
         'sh',
         '-c',
-        'mysqladmin ping -uroot -p"$(cat /run/secrets/db_root_password)" --silent',
+        'mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -e "SELECT 1" >/dev/null 2>&1',
       ]);
       return;
     } catch {
