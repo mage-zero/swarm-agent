@@ -516,9 +516,9 @@ async function syncDatabaseUser(containerId: string, dbName: string, dbUser: str
   const safeDbName = dbName.replace(/`/g, '``');
   const safeDbUser = dbUser.replace(/'/g, "''");
   const grantStatement =
-    'GRANT ALL PRIVILEGES ON `' +
+    'GRANT ALL PRIVILEGES ON ' +
     safeDbName +
-    "`.* TO '" +
+    ".* TO '" +
     safeDbUser +
     "'@'%'; FLUSH PRIVILEGES;";
   const dbPassRef = '${DB_PASS}';
