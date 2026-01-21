@@ -487,30 +487,40 @@ async function waitForDatabase(containerId: string, timeoutMs: number) {
 async function restoreDatabase(
   containerId: string,
   encryptedPath: string,
-  workDir: string
+  workDir: string,
+  dbName: string
 ) {
   const decryptedPath = path.join(workDir, 'db.sql.zst');
   const sqlPath = path.join(workDir, 'db.sql');
   const sanitizedPath = path.join(workDir, 'db.sanitized.sql');
 
   await runCommand('age', ['-d', '-i', STACK_MASTER_KEY_PATH, '-o', decryptedPath, encryptedPath]);
-  await runCommand('zstd', ['-d', '-o', sqlPath, decryptedPath]);
+  await runCommand('zstd', ['-d', '-f', '-o', sqlPath, decryptedPath]);
   await stripDefiners(sqlPath, sanitizedPath);
 
   await runCommand('docker', ['cp', sanitizedPath, `${containerId}:/tmp/mz-restore.sql`]);
+  const safeDbName = dbName.replace(/`/g, '``');
   await runCommand('docker', [
     'exec',
     containerId,
     'sh',
     '-c',
-    'mysql -uroot -p"$(cat /run/secrets/db_root_password)" < /tmp/mz-restore.sql',
+    [
+      `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -e "CREATE DATABASE IF NOT EXISTS \\\`${safeDbName}\\\`;"`,
+      `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" --database="${safeDbName}" < /tmp/mz-restore.sql`,
+    ].join(' && '),
   ]);
 }
 
 async function syncDatabaseUser(containerId: string, dbName: string, dbUser: string) {
   const safeDbName = dbName.replace(/`/g, '``');
   const safeDbUser = dbUser.replace(/'/g, "''");
-  const grantStatement = `GRANT ALL PRIVILEGES ON \`${safeDbName}\`.* TO '${safeDbUser}'@'%';`;
+  const grantStatement =
+    'GRANT ALL PRIVILEGES ON \\`' +
+    safeDbName +
+    "\\`.* TO '" +
+    safeDbUser +
+    "'@'%';";
   await runCommand('docker', [
     'exec',
     containerId,
@@ -518,11 +528,44 @@ async function syncDatabaseUser(containerId: string, dbName: string, dbUser: str
     '-c',
     [
       'DB_PASS="$(cat /run/secrets/db_password)"',
-      `mysql -uroot -p"$(cat /run/secrets/db_root_password)" -e "CREATE USER IF NOT EXISTS '${safeDbUser}'@'%' IDENTIFIED BY '${DB_PASS}';`,
-      `ALTER USER '${safeDbUser}'@'%' IDENTIFIED BY '${DB_PASS}';`,
+      `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -e "CREATE USER IF NOT EXISTS '${safeDbUser}'@'%' IDENTIFIED BY '\${DB_PASS}';`,
+      `ALTER USER '${safeDbUser}'@'%' IDENTIFIED BY '\${DB_PASS}';`,
       grantStatement,
       'FLUSH PRIVILEGES;"',
     ].join(' '),
+  ]);
+}
+
+async function setSearchEngine(containerId: string, dbName: string, engine: string) {
+  const safeDbName = dbName.replace(/`/g, '``');
+  await runCommand('docker', [
+    'exec',
+    containerId,
+    'sh',
+    '-c',
+    `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -D ${safeDbName} -e "INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/engine', '${engine}') ON DUPLICATE KEY UPDATE value=VALUES(value);"`,
+  ]);
+}
+
+async function setOpensearchSystemConfig(
+  containerId: string,
+  dbName: string,
+  host: string,
+  port: string,
+  timeout: string
+) {
+  const safeDbName = dbName.replace(/`/g, '``');
+  const statements = [
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/opensearch_server_hostname', '${host}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/opensearch_server_port', '${port}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/opensearch_server_timeout', '${timeout}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+  ].join('; ');
+  await runCommand('docker', [
+    'exec',
+    containerId,
+    'sh',
+    '-c',
+    `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -D ${safeDbName} -e "${statements};"`,
   ]);
 }
 
@@ -598,6 +641,10 @@ async function processDeployment(recordPath: string) {
   log('fetched environment record');
   const selections = envRecord?.application_selections;
   const versions = resolveVersionEnv(selections);
+  const searchEngine = process.env.MZ_SEARCH_ENGINE || 'opensearch';
+  const opensearchHost = process.env.MZ_OPENSEARCH_HOST || 'opensearch';
+  const opensearchPort = process.env.MZ_OPENSEARCH_PORT || '9200';
+  const opensearchTimeout = process.env.MZ_OPENSEARCH_TIMEOUT || '15';
 
   const r2 = readR2CredFile(environmentId);
   if (!r2?.backups) {
@@ -638,6 +685,10 @@ async function processDeployment(recordPath: string) {
     MAGE_VERSION: mageVersion,
     MYSQL_DATABASE: process.env.MYSQL_DATABASE || 'magento',
     MYSQL_USER: process.env.MYSQL_USER || 'magento',
+    MZ_SEARCH_ENGINE: searchEngine,
+    MZ_OPENSEARCH_HOST: opensearchHost,
+    MZ_OPENSEARCH_PORT: opensearchPort,
+    MZ_OPENSEARCH_TIMEOUT: opensearchTimeout,
   };
 
   const secrets = envRecord?.environment_secrets ?? null;
@@ -686,7 +737,12 @@ async function processDeployment(recordPath: string) {
 
   const encryptedBackupPath = path.join(workDir, path.basename(objectKey));
   await downloadArtifact(r2.backups, objectKey, encryptedBackupPath);
-  await restoreDatabase(dbContainerId, encryptedBackupPath, workDir);
+  await restoreDatabase(
+    dbContainerId,
+    encryptedBackupPath,
+    workDir,
+    envVars.MYSQL_DATABASE || 'magento'
+  );
   log('database restored');
   await syncDatabaseUser(
     dbContainerId,
@@ -696,8 +752,45 @@ async function processDeployment(recordPath: string) {
   log('database user synced');
 
   const adminContainerId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
-  await runMagentoCommand(adminContainerId, 'php bin/magento setup:upgrade --keep-generated');
-  await runMagentoCommand(adminContainerId, 'php bin/magento cache:flush');
+  await runCommand('docker', [
+    'exec',
+    '--user',
+    'root',
+    adminContainerId,
+    'sh',
+    '-c',
+    'mkdir -p /var/www/html/magento/var/log /var/www/html/magento/var/cache /var/www/html/magento/var/page_cache /var/www/html/magento/var/tmp /var/www/html/magento/var/export /var/www/html/magento/var/import /var/www/html/magento/pub/media && chmod -R 0777 /var/www/html/magento/var/log /var/www/html/magento/var/cache /var/www/html/magento/var/page_cache /var/www/html/magento/var/tmp /var/www/html/magento/var/export /var/www/html/magento/var/import /var/www/html/magento/pub/media',
+  ]);
+  let upgradeWarning = false;
+  await setOpensearchSystemConfig(
+    dbContainerId,
+    envVars.MYSQL_DATABASE || 'magento',
+    opensearchHost,
+    opensearchPort,
+    opensearchTimeout
+  );
+  await setSearchEngine(dbContainerId, envVars.MYSQL_DATABASE || 'magento', 'mysql');
+  try {
+    await runCommandCapture('docker', [
+      'exec',
+      adminContainerId,
+      'sh',
+      '-c',
+      'php bin/magento setup:upgrade --keep-generated',
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes('OpenSearch') || !message.includes('default website')) {
+      throw error;
+    }
+    upgradeWarning = true;
+    console.warn(`${logPrefix} setup:upgrade warning: ${message}`);
+  } finally {
+    await setSearchEngine(dbContainerId, envVars.MYSQL_DATABASE || 'magento', searchEngine);
+  }
+  if (!upgradeWarning) {
+    await runMagentoCommand(adminContainerId, 'php bin/magento cache:flush');
+  }
   log('magento upgrade complete');
 
   await reportDeploymentStatus(baseUrl, nodeId, nodeSecret, {
