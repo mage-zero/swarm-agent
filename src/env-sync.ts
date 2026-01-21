@@ -378,7 +378,7 @@ async function syncEnvironmentCredentials() {
         try {
           await fetchJson(
             baseUrl,
-            '/v1/environment/dns',
+            `/v1/agent/environment/${environmentId}/dns`,
             'POST',
             JSON.stringify({
               environment_id: environmentId,
