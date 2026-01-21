@@ -8,6 +8,7 @@ type EnvironmentRecord = {
   name?: string;
   stack_id?: number;
   hostname?: string;
+  environment_hostname?: string;
   db_backup_bucket?: string;
   media_bucket?: string;
 };
@@ -74,12 +75,38 @@ function getEnvPendingPath(environmentId: number) {
   return `${ENV_STATE_DIR}/env-${environmentId}-r2.pending`;
 }
 
+function getEnvDnsMarkerPath(environmentId: number) {
+  return `${ENV_STATE_DIR}/env-${environmentId}-dns.done`;
+}
+
+function getEnvDnsPendingPath(environmentId: number) {
+  return `${ENV_STATE_DIR}/env-${environmentId}-dns.pending`;
+}
+
 function hasEnvMarker(environmentId: number): boolean {
   return fs.existsSync(getEnvMarkerPath(environmentId));
 }
 
 function hasEnvPending(environmentId: number): boolean {
   return fs.existsSync(getEnvPendingPath(environmentId));
+}
+
+function hasEnvDnsMarker(environmentId: number): boolean {
+  return fs.existsSync(getEnvDnsMarkerPath(environmentId));
+}
+
+function hasEnvDnsPending(environmentId: number): boolean {
+  return fs.existsSync(getEnvDnsPendingPath(environmentId));
+}
+
+function readEnvDnsMarker(environmentId: number): string {
+  try {
+    const raw = fs.readFileSync(getEnvDnsMarkerPath(environmentId), 'utf8');
+    const parsed = JSON.parse(raw) as { hostname?: string };
+    return typeof parsed?.hostname === 'string' ? parsed.hostname : '';
+  } catch {
+    return '';
+  }
 }
 
 function writeEnvMarker(environmentId: number) {
@@ -90,6 +117,20 @@ function writeEnvMarker(environmentId: number) {
 function writeEnvPending(environmentId: number) {
   ensureStateDir();
   fs.writeFileSync(getEnvPendingPath(environmentId), `${new Date().toISOString()}\n`, 'utf8');
+}
+
+function writeEnvDnsMarker(environmentId: number, hostname: string) {
+  ensureStateDir();
+  const payload = {
+    hostname,
+    updated_at: new Date().toISOString(),
+  };
+  fs.writeFileSync(getEnvDnsMarkerPath(environmentId), JSON.stringify(payload, null, 2), 'utf8');
+}
+
+function writeEnvDnsPending(environmentId: number) {
+  ensureStateDir();
+  fs.writeFileSync(getEnvDnsPendingPath(environmentId), `${new Date().toISOString()}\n`, 'utf8');
 }
 
 function clearEnvMarker(environmentId: number) {
@@ -103,6 +144,22 @@ function clearEnvMarker(environmentId: number) {
 function clearEnvPending(environmentId: number) {
   try {
     fs.unlinkSync(getEnvPendingPath(environmentId));
+  } catch {
+    // ignore
+  }
+}
+
+function clearEnvDnsMarker(environmentId: number) {
+  try {
+    fs.unlinkSync(getEnvDnsMarkerPath(environmentId));
+  } catch {
+    // ignore
+  }
+}
+
+function clearEnvDnsPending(environmentId: number) {
+  try {
+    fs.unlinkSync(getEnvDnsPendingPath(environmentId));
   } catch {
     // ignore
   }
@@ -308,6 +365,34 @@ async function syncEnvironmentCredentials() {
     const environmentId = Number(environment.environment_id ?? 0);
     if (!environmentId) {
       continue;
+    }
+    const hostname = String(
+      environment.environment_hostname ?? environment.hostname ?? ''
+    ).trim();
+    if (!hostname) {
+      clearEnvDnsMarker(environmentId);
+    } else if (!hasEnvDnsPending(environmentId)) {
+      const markedHostname = readEnvDnsMarker(environmentId);
+      if (!markedHostname || markedHostname !== hostname || !hasEnvDnsMarker(environmentId)) {
+        writeEnvDnsPending(environmentId);
+        try {
+          await fetchJson(
+            baseUrl,
+            '/v1/environment/dns',
+            'POST',
+            JSON.stringify({
+              environment_id: environmentId,
+              stack_id: stackId,
+              environment_hostname: hostname,
+            }),
+            nodeId,
+            nodeSecret,
+          );
+          writeEnvDnsMarker(environmentId, hostname);
+        } finally {
+          clearEnvDnsPending(environmentId);
+        }
+      }
     }
     if (hasEnvPending(environmentId)) {
       continue;
