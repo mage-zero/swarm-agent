@@ -70,6 +70,7 @@ const STACK_MASTER_KEY_PATH = process.env.MZ_STACK_MASTER_KEY_PATH || '/etc/mage
 const DEFAULT_DB_BACKUP_OBJECT = process.env.MZ_DB_BACKUP_OBJECT || 'provisioning-database.sql.zst.age';
 const SECRET_VERSION = process.env.MZ_SECRET_VERSION || '1';
 const DEPLOY_INTERVAL_MS = Number(process.env.MZ_DEPLOY_WORKER_INTERVAL_MS || 5000);
+const FETCH_TIMEOUT_MS = Number(process.env.MZ_FETCH_TIMEOUT_MS || 30000);
 
 let processing = false;
 
@@ -276,16 +277,25 @@ async function fetchJson(baseUrl: string, pathName: string, method: string, body
   const query = url.search ? url.search.slice(1) : '';
   const payload = body ?? '';
   const headers = buildNodeHeaders(method, url.pathname, query, payload, nodeId, nodeSecret);
+  const controller = new AbortController();
+  const timeoutMs = Number.isFinite(FETCH_TIMEOUT_MS) && FETCH_TIMEOUT_MS > 0 ? FETCH_TIMEOUT_MS : 30000;
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-  const response = await fetch(url.toString(), {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-      ...headers,
-    },
-    body: payload || undefined,
-  });
+  let response: Response;
+  try {
+    response = await fetch(url.toString(), {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        ...headers,
+      },
+      body: payload || undefined,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   if (!response.ok) {
     const errorBody = await response.text();
