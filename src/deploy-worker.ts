@@ -551,6 +551,26 @@ async function setSearchEngine(containerId: string, dbName: string, engine: stri
   ]);
 }
 
+function escapeSqlValue(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
+async function databaseHasTables(containerId: string, dbName: string): Promise<boolean> {
+  const safeSchema = escapeSqlValue(dbName);
+  const result = await runCommandCapture('docker', [
+    'exec',
+    containerId,
+    'sh',
+    '-c',
+    `ROOT_PASS="$(cat /run/secrets/db_root_password)"; mariadb -uroot -p"$ROOT_PASS" -N -s -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${safeSchema}'"`,
+  ]);
+  const count = Number(result.stdout.trim());
+  if (!Number.isFinite(count)) {
+    throw new Error(`Unable to determine table count for schema ${dbName}`);
+  }
+  return count > 0;
+}
+
 async function setFullPageCacheConfig(containerId: string, dbName: string, ttlSeconds: number) {
   const safeDbName = dbName.replace(/`/g, '``');
   const ttl = Number.isFinite(ttlSeconds) ? Math.max(60, Math.floor(ttlSeconds)) : 86400;
@@ -799,18 +819,19 @@ async function processDeployment(recordPath: string) {
   const dbContainerId = await waitForContainer(stackName, 'database', 5 * 60 * 1000);
   await waitForDatabase(dbContainerId, 5 * 60 * 1000);
 
-  const encryptedBackupPath = path.join(workDir, path.basename(objectKey));
-  await downloadArtifact(r2.backups, objectKey, encryptedBackupPath);
-  await restoreDatabase(
-    dbContainerId,
-    encryptedBackupPath,
-    workDir,
-    envVars.MYSQL_DATABASE || 'magento'
-  );
-  log('database restored');
+  const dbName = envVars.MYSQL_DATABASE || 'magento';
+  const hasTables = await databaseHasTables(dbContainerId, dbName);
+  if (hasTables) {
+    log('database already populated; skipping restore');
+  } else {
+    const encryptedBackupPath = path.join(workDir, path.basename(objectKey));
+    await downloadArtifact(r2.backups, objectKey, encryptedBackupPath);
+    await restoreDatabase(dbContainerId, encryptedBackupPath, workDir, dbName);
+    log('database restored');
+  }
   await syncDatabaseUser(
     dbContainerId,
-    envVars.MYSQL_DATABASE || 'magento',
+    dbName,
     envVars.MYSQL_USER || 'magento'
   );
   log('database user synced');
