@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import http from 'http';
 import os from 'os';
+import path from 'path';
 
 export type StatusConfig = {
   stack_id?: number;
@@ -130,6 +131,9 @@ type LocalSwarmInfo = {
 const CONFIG_PATH = process.env.STATUS_CONFIG_PATH || '/opt/status/data.json';
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
+const VERSION_PATH = process.env.MZ_SWARM_AGENT_VERSION_PATH || path.join(NODE_DIR, 'version');
+
+let cachedAgentVersion: string | null = null;
 
 let cachedDockerApiVersion: string | null = null;
 let cachedDockerApiVersionAt = 0;
@@ -140,6 +144,28 @@ export function readConfig(): StatusConfig {
   } catch {
     return { stack_domain: '', nodes: [] };
   }
+}
+
+function readAgentVersion(): string {
+  if (cachedAgentVersion) {
+    return cachedAgentVersion;
+  }
+  const envVersion = process.env.MZ_SWARM_AGENT_VERSION;
+  if (envVersion) {
+    cachedAgentVersion = envVersion.trim();
+    return cachedAgentVersion;
+  }
+  try {
+    const fileVersion = fs.readFileSync(VERSION_PATH, 'utf8').trim();
+    if (fileVersion) {
+      cachedAgentVersion = fileVersion;
+      return cachedAgentVersion;
+    }
+  } catch {
+    // ignore missing file
+  }
+  cachedAgentVersion = 'unknown';
+  return cachedAgentVersion;
 }
 
 function dockerRequest(path: string): Promise<any> {
@@ -450,6 +476,7 @@ export async function buildStatusPayload(
     stack_domain: config.stack_domain || '',
     stack_name: config.stack_name || '',
     generated_at: new Date().toISOString(),
+    agent_version: readAgentVersion(),
     swarm,
   };
 
@@ -495,7 +522,7 @@ export async function buildStatusPayload(
     '</head>',
     '<body>',
     '  <h1>MageZero Provisioning Status</h1>',
-    `  <div class="hint">Host: ${escapeHtml(reqHost || 'unknown')}</div>`,
+    `  <div class="hint">Host: ${escapeHtml(reqHost || 'unknown')} | Agent: ${escapeHtml(readAgentVersion())}</div>`,
     `  <pre>${escapeHtml(JSON.stringify(payload, null, 2))}</pre>`,
     '</body>',
     '</html>',
