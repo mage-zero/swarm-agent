@@ -53,6 +53,8 @@ type ApplicationSelections = {
 type EnvironmentRecord = {
   environment_id?: number;
   stack_id?: number;
+  hostname?: string;
+  environment_hostname?: string;
   db_backup_bucket?: string;
   db_backup_object?: string;
   application_selections?: ApplicationSelections;
@@ -549,6 +551,22 @@ async function setSearchEngine(containerId: string, dbName: string, engine: stri
   ]);
 }
 
+async function setFullPageCacheConfig(containerId: string, dbName: string, ttlSeconds: number) {
+  const safeDbName = dbName.replace(/`/g, '``');
+  const ttl = Number.isFinite(ttlSeconds) ? Math.max(60, Math.floor(ttlSeconds)) : 86400;
+  const statements = [
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'system/full_page_cache/caching_application', '2') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'system/full_page_cache/ttl', '${ttl}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+  ].join('; ');
+  await runCommand('docker', [
+    'exec',
+    containerId,
+    'sh',
+    '-c',
+    `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -D ${safeDbName} -e "${statements};"`,
+  ]);
+}
+
 async function setBaseUrls(containerId: string, dbName: string, baseUrl: string) {
   const safeDbName = dbName.replace(/`/g, '``');
   const normalized = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
@@ -825,6 +843,16 @@ async function processDeployment(recordPath: string) {
     await setSearchEngine(dbContainerId, envVars.MYSQL_DATABASE || 'magento', searchEngine);
   }
   if (!upgradeWarning) {
+    await runMagentoCommand(
+      adminContainerId,
+      'php bin/magento deploy:mode:set production --skip-compilation',
+    );
+    await setFullPageCacheConfig(
+      dbContainerId,
+      envVars.MYSQL_DATABASE || 'magento',
+      86400,
+    );
+    await runMagentoCommand(adminContainerId, 'php bin/magento cache:enable');
     await runMagentoCommand(adminContainerId, 'php bin/magento cache:flush');
   }
   log('magento upgrade complete');
