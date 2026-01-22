@@ -713,7 +713,7 @@ async function processDeployment(recordPath: string) {
 
   const secrets = envRecord?.environment_secrets ?? null;
   const envHostname = String(envRecord?.environment_hostname || envRecord?.hostname || '').trim();
-  const baseUrl = envHostname ? `https://${envHostname.replace(/^https?:\/\//, '').replace(/\/+$/, '')}` : '';
+  const envBaseUrl = envHostname ? `https://${envHostname.replace(/^https?:\/\//, '').replace(/\/+$/, '')}` : '';
   const dbSecretName = `mz_db_password_v${SECRET_VERSION}`;
   const dbRootSecretName = `mz_db_root_password_v${SECRET_VERSION}`;
   const rabbitSecretName = `mz_rabbitmq_password_v${SECRET_VERSION}`;
@@ -772,9 +772,9 @@ async function processDeployment(recordPath: string) {
     envVars.MYSQL_USER || 'magento'
   );
   log('database user synced');
-  if (baseUrl) {
-    await setBaseUrls(dbContainerId, envVars.MYSQL_DATABASE || 'magento', baseUrl);
-    log(`base URLs set to ${baseUrl}`);
+  if (envBaseUrl) {
+    await setBaseUrls(dbContainerId, envVars.MYSQL_DATABASE || 'magento', envBaseUrl);
+    log(`base URLs set to ${envBaseUrl}`);
   }
 
   const adminContainerId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
