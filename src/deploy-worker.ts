@@ -486,6 +486,25 @@ async function waitForDatabase(containerId: string, timeoutMs: number) {
   throw new Error('Database did not become ready in time');
 }
 
+async function waitForProxySql(containerId: string, timeoutMs: number) {
+  const start = Date.now();
+  const probe = [
+    '$host=getenv("MZ_DB_HOST") ?: "proxysql";',
+    '$port=(int)(getenv("MZ_DB_PORT") ?: 6033);',
+    '$fp=@fsockopen($host,$port,$errno,$errstr,1);',
+    'if(!$fp){fwrite(STDERR,$errstr ?: "connect failed"); exit(1);} fclose($fp);',
+  ].join(' ');
+  while (Date.now() - start < timeoutMs) {
+    try {
+      await runCommandCapture('docker', ['exec', containerId, 'php', '-r', probe]);
+      return;
+    } catch {
+      await delay(2000);
+    }
+  }
+  throw new Error('ProxySQL did not become ready in time');
+}
+
 async function restoreDatabase(
   containerId: string,
   encryptedPath: string,
@@ -950,6 +969,7 @@ async function processDeployment(recordPath: string) {
     opensearchTimeout
   );
   await setSearchEngine(dbContainerId, envVars.MYSQL_DATABASE || 'magento', 'mysql');
+  await waitForProxySql(adminContainerId, 5 * 60 * 1000);
   try {
     await runCommandCapture('docker', [
       'exec',
