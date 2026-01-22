@@ -567,6 +567,30 @@ async function setFullPageCacheConfig(containerId: string, dbName: string, ttlSe
   ]);
 }
 
+async function setVarnishConfig(
+  containerId: string,
+  dbName: string,
+  backendHost: string,
+  backendPort: string,
+  accessList: string,
+  gracePeriod: string
+) {
+  const safeDbName = dbName.replace(/`/g, '``');
+  const statements = [
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'system/full_page_cache/varnish/backend_host', '${backendHost}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'system/full_page_cache/varnish/backend_port', '${backendPort}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'system/full_page_cache/varnish/access_list', '${accessList}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'system/full_page_cache/varnish/grace_period', '${gracePeriod}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+  ].join('; ');
+  await runCommand('docker', [
+    'exec',
+    containerId,
+    'sh',
+    '-c',
+    `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -D ${safeDbName} -e "${statements};"`,
+  ]);
+}
+
 async function setBaseUrls(containerId: string, dbName: string, baseUrl: string) {
   const safeDbName = dbName.replace(/`/g, '``');
   const normalized = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
@@ -851,6 +875,14 @@ async function processDeployment(recordPath: string) {
       dbContainerId,
       envVars.MYSQL_DATABASE || 'magento',
       86400,
+    );
+    await setVarnishConfig(
+      dbContainerId,
+      envVars.MYSQL_DATABASE || 'magento',
+      'nginx',
+      '80',
+      'localhost,127.0.0.1,nginx,php-fpm,php-fpm-admin,varnish',
+      '300',
     );
     await runMagentoCommand(adminContainerId, 'php bin/magento cache:enable');
     await runMagentoCommand(adminContainerId, 'php bin/magento cache:flush');
