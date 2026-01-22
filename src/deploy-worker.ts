@@ -549,6 +549,24 @@ async function setSearchEngine(containerId: string, dbName: string, engine: stri
   ]);
 }
 
+async function setBaseUrls(containerId: string, dbName: string, baseUrl: string) {
+  const safeDbName = dbName.replace(/`/g, '``');
+  const normalized = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
+  const statements = [
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'web/unsecure/base_url', '${normalized}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'web/secure/base_url', '${normalized}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'web/secure/use_in_frontend', '1') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'web/secure/use_in_adminhtml', '1') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+  ].join('; ');
+  await runCommand('docker', [
+    'exec',
+    containerId,
+    'sh',
+    '-c',
+    `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -D ${safeDbName} -e "${statements};"`,
+  ]);
+}
+
 async function setOpensearchSystemConfig(
   containerId: string,
   dbName: string,
@@ -694,6 +712,8 @@ async function processDeployment(recordPath: string) {
   };
 
   const secrets = envRecord?.environment_secrets ?? null;
+  const envHostname = String(envRecord?.environment_hostname || envRecord?.hostname || '').trim();
+  const baseUrl = envHostname ? `https://${envHostname.replace(/^https?:\/\//, '').replace(/\/+$/, '')}` : '';
   const dbSecretName = `mz_db_password_v${SECRET_VERSION}`;
   const dbRootSecretName = `mz_db_root_password_v${SECRET_VERSION}`;
   const rabbitSecretName = `mz_rabbitmq_password_v${SECRET_VERSION}`;
@@ -752,6 +772,10 @@ async function processDeployment(recordPath: string) {
     envVars.MYSQL_USER || 'magento'
   );
   log('database user synced');
+  if (baseUrl) {
+    await setBaseUrls(dbContainerId, envVars.MYSQL_DATABASE || 'magento', baseUrl);
+    log(`base URLs set to ${baseUrl}`);
+  }
 
   const adminContainerId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
   const webContainerId = await waitForContainer(stackName, 'php-fpm', 5 * 60 * 1000);
