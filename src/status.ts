@@ -109,6 +109,7 @@ type PlannerPayload = {
     primary_manager_node_id: string | null;
     database_node_id: string | null;
     search_node_id: string | null;
+    database_replica_node_id: string | null;
   };
   headroom: {
     free_cpu_cores: number;
@@ -664,9 +665,12 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
 
   const existingDb = pickNodeByLabel(nodes, 'database', 'true');
   const existingSearch = pickNodeByLabel(nodes, 'search', 'true');
+  const existingReplica = pickNodeByLabel(nodes, 'database_replica', 'true');
 
   let dbNode = existingDb;
   let searchNode = existingSearch;
+  const replicaLabelMissing = !existingReplica;
+  let replicaNode = existingReplica;
 
   if (!dbNode) {
     const candidates = nodes.length > 1
@@ -705,6 +709,30 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
     });
   }
 
+  if (readyNodes.length <= 1) {
+    replicaNode = null;
+  } else {
+    const replicaCandidates = readyNodes.filter((node) => node.id !== dbNode?.id);
+    const preferredReplica = pickHighestCapacity(replicaCandidates) || pickHighestCapacity(readyNodes);
+    if (!replicaNode && preferredReplica) {
+      recommendations.push({
+        type: 'label',
+        node_id: preferredReplica.id,
+        labels: { database_replica: 'true' },
+        message: `Recommend setting database_replica=true on ${preferredReplica.hostname || preferredReplica.id}`,
+      });
+      replicaNode = preferredReplica;
+    } else if (replicaNode && dbNode && replicaNode.id === dbNode.id && preferredReplica && preferredReplica.id !== dbNode.id) {
+      recommendations.push({
+        type: 'label',
+        node_id: preferredReplica.id,
+        labels: { database_replica: 'true' },
+        message: `Recommend moving database_replica=true to ${preferredReplica.hostname || preferredReplica.id}`,
+      });
+      replicaNode = preferredReplica;
+    }
+  }
+
   const totalCpu = capacity.totals.cpu_cores || 0;
   const totalMem = capacity.totals.memory_bytes || 0;
   const freeCpu = capacity.totals.free_cpu_cores || 0;
@@ -715,6 +743,15 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
   }
   if (readyNodes.length > 1 && dbNode && searchNode && dbNode.id === searchNode.id) {
     warnings.push('database and search are co-located; consider splitting across nodes');
+  }
+  if (readyNodes.length > 1 && dbNode && existingReplica && dbNode.id === existingReplica.id) {
+    warnings.push('database replica label is co-located with primary; consider moving it');
+  }
+  if (readyNodes.length > 1 && dbNode && replicaNode && dbNode.id === replicaNode.id) {
+    warnings.push('database primary and replica are co-located; consider separating replicas');
+  }
+  if (readyNodes.length > 1 && replicaLabelMissing) {
+    warnings.push('database replica label missing; add database_replica=true to enable');
   }
 
   const capacityNodes = nodes.map((node) => ({
@@ -745,6 +782,7 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
       primary_manager_node_id: primaryManager?.id || null,
       database_node_id: dbNode?.id || null,
       search_node_id: searchNode?.id || null,
+      database_replica_node_id: replicaNode?.id || null,
     },
     headroom: {
       free_cpu_cores: freeCpu,

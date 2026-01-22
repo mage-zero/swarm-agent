@@ -4,7 +4,7 @@ import path from 'path';
 import readline from 'readline';
 import { spawn } from 'child_process';
 import { presignS3Url } from './r2-presign.js';
-import { isSwarmManager, readConfig } from './status.js';
+import { buildCapacityPayload, isSwarmManager, readConfig } from './status.js';
 
 type DeployPayload = {
   artifact?: string;
@@ -540,6 +540,48 @@ async function syncDatabaseUser(containerId: string, dbName: string, dbUser: str
   ]);
 }
 
+async function syncReplicationUser(containerId: string, replicaUser: string) {
+  const safeReplicaUser = replicaUser.replace(/'/g, "''");
+  const grantStatement =
+    "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '" +
+    safeReplicaUser +
+    "'@'%'; FLUSH PRIVILEGES;";
+  const passRef = '${REPL_PASS}';
+  await runCommand('docker', [
+    'exec',
+    containerId,
+    'sh',
+    '-c',
+    [
+      'set -e',
+      'REPL_PASS="$(cat /run/secrets/db_replication_password)"',
+      'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+      `mariadb -uroot -p"$ROOT_PASS" -e "CREATE USER IF NOT EXISTS '${safeReplicaUser}'@'%' IDENTIFIED BY '${passRef}';"`,
+      `mariadb -uroot -p"$ROOT_PASS" -e "ALTER USER '${safeReplicaUser}'@'%' IDENTIFIED BY '${passRef}';"`,
+      `mariadb -uroot -p"$ROOT_PASS" -e "${grantStatement}"`,
+    ].join(' && '),
+  ]);
+}
+
+async function configureReplica(containerId: string, masterHost: string, replicaUser: string) {
+  const safeMasterHost = masterHost.replace(/'/g, "''");
+  const safeReplicaUser = replicaUser.replace(/'/g, "''");
+  const passRef = '${REPL_PASS}';
+  await runCommand('docker', [
+    'exec',
+    containerId,
+    'sh',
+    '-c',
+    [
+      'set -e',
+      'REPL_PASS="$(cat /run/secrets/db_replication_password)"',
+      'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+      `mariadb -uroot -p"$ROOT_PASS" -e "CHANGE MASTER TO MASTER_HOST='${safeMasterHost}', MASTER_PORT=3306, MASTER_USER='${safeReplicaUser}', MASTER_PASSWORD='${passRef}', MASTER_USE_GTID=slave_pos;"`,
+      'mariadb -uroot -p"$ROOT_PASS" -e "START SLAVE;"',
+    ].join(' && '),
+  ]);
+}
+
 async function setSearchEngine(containerId: string, dbName: string, engine: string) {
   const safeDbName = dbName.replace(/`/g, '``');
   await runCommand('docker', [
@@ -756,6 +798,22 @@ async function processDeployment(recordPath: string) {
   if (versions.redisVersion) overrideVersions.REDIS_VERSION = versions.redisVersion;
   if (versions.rabbitmqVersion) overrideVersions.RABBITMQ_VERSION = versions.rabbitmqVersion;
 
+  const replicaUser = 'replica';
+  let replicaHost = 'database';
+  try {
+    const capacity = await buildCapacityPayload();
+    const readyNodes = (capacity.nodes || []).filter(
+      (node) => node.status === 'ready' && node.availability === 'active',
+    );
+    const hasReplicaLabel = readyNodes.some((node) => node.labels?.database_replica === 'true');
+    if (hasReplicaLabel && readyNodes.length > 1) {
+      replicaHost = 'database-replica';
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log(`capacity unavailable; defaulting replica host to database (${message})`);
+  }
+
   const envVars: NodeJS.ProcessEnv = {
     ...process.env,
     ...defaultVersions,
@@ -767,6 +825,13 @@ async function processDeployment(recordPath: string) {
     MAGE_VERSION: mageVersion,
     MYSQL_DATABASE: process.env.MYSQL_DATABASE || 'magento',
     MYSQL_USER: process.env.MYSQL_USER || 'magento',
+    MZ_DB_HOST: 'proxysql',
+    MZ_DB_PORT: '6033',
+    MZ_PROXYSQL_DB_HOST: 'database',
+    MZ_PROXYSQL_DB_REPLICA_HOST: replicaHost,
+    MZ_PROXYSQL_DB_PORT: '3306',
+    MZ_MARIADB_MASTER_HOST: 'database',
+    MZ_REPLICATION_USER: replicaUser,
     MZ_SEARCH_ENGINE: searchEngine,
     MZ_OPENSEARCH_HOST: opensearchHost,
     MZ_OPENSEARCH_PORT: opensearchPort,
@@ -778,12 +843,14 @@ async function processDeployment(recordPath: string) {
   const envBaseUrl = envHostname ? `https://${envHostname.replace(/^https?:\/\//, '').replace(/\/+$/, '')}` : '';
   const dbSecretName = `mz_db_password_v${SECRET_VERSION}`;
   const dbRootSecretName = `mz_db_root_password_v${SECRET_VERSION}`;
+  const dbReplicationSecretName = `mz_db_replication_password_v${SECRET_VERSION}`;
   const rabbitSecretName = `mz_rabbitmq_password_v${SECRET_VERSION}`;
   const mageSecretName = `mz_mage_crypto_key_v${SECRET_VERSION}`;
 
   log('ensuring docker secrets');
   await ensureDockerSecret(dbSecretName, generateSecretHex(24), workDir);
   await ensureDockerSecret(dbRootSecretName, generateSecretHex(24), workDir);
+  await ensureDockerSecret(dbReplicationSecretName, generateSecretHex(24), workDir);
   await ensureDockerSecret(rabbitSecretName, generateSecretHex(24), workDir);
 
   if (!secrets?.crypt_key) {
@@ -835,9 +902,23 @@ async function processDeployment(recordPath: string) {
     envVars.MYSQL_USER || 'magento'
   );
   log('database user synced');
+  await syncReplicationUser(dbContainerId, replicaUser);
+  log('replication user synced');
   if (envBaseUrl) {
     await setBaseUrls(dbContainerId, envVars.MYSQL_DATABASE || 'magento', envBaseUrl);
     log(`base URLs set to ${envBaseUrl}`);
+  }
+
+  if (replicaHost === 'database-replica') {
+    try {
+      const replicaContainerId = await waitForContainer(stackName, 'database-replica', 5 * 60 * 1000);
+      await waitForDatabase(replicaContainerId, 5 * 60 * 1000);
+      await configureReplica(replicaContainerId, 'database', replicaUser);
+      log('replica configured');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`replica setup skipped: ${message}`);
+    }
   }
 
   const adminContainerId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
