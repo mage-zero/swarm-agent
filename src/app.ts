@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { getHealthStatus } from './health.js';
 import { handleDeployArtifact, handleDeployKey, handleR2Presign } from './deploy.js';
-import { buildStatusPayload, handleJoinTokenRequest } from './status.js';
+import { buildCapacityPayload, buildStatusPayload, handleJoinTokenRequest } from './status.js';
 
 export const createApp = () => {
   const app = new Hono();
@@ -29,12 +29,18 @@ export const createApp = () => {
     return c.json(result.body, result.status);
   });
 
+  app.get('/v1/capacity', async (c) => {
+    const payload = await buildCapacityPayload();
+    return c.json(payload);
+  });
+
   app.get('/', async (c) => {
     const host = (c.req.header('host') || '').split(':')[0];
     const wantsJson =
       c.req.query('format') === 'json' ||
       (c.req.header('accept') || '').includes('application/json');
-    const result = await buildStatusPayload(host, wantsJson);
+    const includeCapacity = (c.req.query('include') || '').split(',').includes('capacity');
+    const result = await buildStatusPayload(host, wantsJson, includeCapacity);
     return result.type === 'json' ? c.json(result.payload) : c.html(result.payload);
   });
 

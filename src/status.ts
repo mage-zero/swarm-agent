@@ -30,6 +30,52 @@ type SwarmSummary = {
   nodes: SwarmNode[];
 };
 
+type CapacityService = {
+  id?: string;
+  name?: string;
+  mode?: string;
+  constraints?: string[];
+  reservations?: {
+    cpu_cores: number;
+    memory_bytes: number;
+  };
+};
+
+type CapacityNode = {
+  id?: string;
+  hostname?: string;
+  role?: string;
+  status?: string;
+  availability?: string;
+  labels?: Record<string, string>;
+  address?: string;
+  resources?: {
+    cpu_cores: number;
+    memory_bytes: number;
+  };
+  reservations?: {
+    cpu_cores: number;
+    memory_bytes: number;
+  };
+  free?: {
+    cpu_cores: number;
+    memory_bytes: number;
+  };
+  tasks?: {
+    running: number;
+    services: string[];
+  };
+};
+
+type CapacityTotals = {
+  cpu_cores: number;
+  memory_bytes: number;
+  reserved_cpu_cores: number;
+  reserved_memory_bytes: number;
+  free_cpu_cores: number;
+  free_memory_bytes: number;
+};
+
 type LocalSwarmInfo = {
   localNodeState?: string;
   controlAvailable?: boolean;
@@ -117,6 +163,13 @@ async function getDockerApiVersion(): Promise<string> {
   }
 
   return normalizedFallback;
+}
+
+function toCpuCores(nanoCpus?: number): number {
+  if (!nanoCpus || Number.isNaN(nanoCpus)) {
+    return 0;
+  }
+  return nanoCpus / 1_000_000_000;
 }
 
 function normalizeLocalSwarmInfo(info: any): LocalSwarmInfo {
@@ -289,7 +342,59 @@ async function getSwarmSummary(controlAvailable?: boolean): Promise<SwarmSummary
   return summarizeNodes(nodes);
 }
 
-export async function buildStatusPayload(reqHost: string, wantsJson: boolean) {
+async function getSwarmNodes(controlAvailable?: boolean): Promise<any[]> {
+  if (process.env.MZ_DISABLE_DOCKER === '1') {
+    return [];
+  }
+  if (controlAvailable === false) {
+    return [];
+  }
+  try {
+    const apiVersion = await getDockerApiVersion();
+    const response = await dockerRequest(`/${apiVersion}/nodes`);
+    return Array.isArray(response) ? response : [];
+  } catch {
+    return [];
+  }
+}
+
+async function getSwarmTasks(controlAvailable?: boolean): Promise<any[]> {
+  if (process.env.MZ_DISABLE_DOCKER === '1') {
+    return [];
+  }
+  if (controlAvailable === false) {
+    return [];
+  }
+  try {
+    const apiVersion = await getDockerApiVersion();
+    const response = await dockerRequest(`/${apiVersion}/tasks`);
+    return Array.isArray(response) ? response : [];
+  } catch {
+    return [];
+  }
+}
+
+async function getSwarmServices(controlAvailable?: boolean): Promise<any[]> {
+  if (process.env.MZ_DISABLE_DOCKER === '1') {
+    return [];
+  }
+  if (controlAvailable === false) {
+    return [];
+  }
+  try {
+    const apiVersion = await getDockerApiVersion();
+    const response = await dockerRequest(`/${apiVersion}/services`);
+    return Array.isArray(response) ? response : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function buildStatusPayload(
+  reqHost: string,
+  wantsJson: boolean,
+  includeCapacity = false,
+) {
   const config = readConfig();
   const localSwarm = await getLocalSwarmInfo();
   const swarm = await getSwarmSummary(localSwarm.controlAvailable);
@@ -301,6 +406,8 @@ export async function buildStatusPayload(reqHost: string, wantsJson: boolean) {
     generated_at: new Date().toISOString(),
     swarm,
   };
+
+  const capacity = includeCapacity ? await buildCapacityPayload() : null;
 
   let nodeStatus: any = null;
   if (reqHost && reqHost !== config.stack_domain) {
@@ -315,6 +422,9 @@ export async function buildStatusPayload(reqHost: string, wantsJson: boolean) {
   }
 
   const payload = nodeStatus ? { ...summary, node: nodeStatus } : summary;
+  if (capacity) {
+    (payload as Record<string, unknown>).capacity = capacity;
+  }
 
   if (wantsJson) {
     return { type: 'json' as const, payload };
@@ -342,6 +452,115 @@ export async function buildStatusPayload(reqHost: string, wantsJson: boolean) {
   ].join('\n');
 
   return { type: 'html' as const, payload: html };
+}
+
+export async function buildCapacityPayload() {
+  const localSwarm = await getLocalSwarmInfo();
+  const swarmNodes = await getSwarmNodes(localSwarm.controlAvailable);
+  const tasks = await getSwarmTasks(localSwarm.controlAvailable);
+  const services = await getSwarmServices(localSwarm.controlAvailable);
+
+  const serviceSummaries: CapacityService[] = services.map((service) => {
+    const constraints = service?.Spec?.TaskTemplate?.Placement?.Constraints || [];
+    const reservations = service?.Spec?.TaskTemplate?.Resources?.Reservations || {};
+    return {
+      id: service?.ID,
+      name: service?.Spec?.Name,
+      mode: service?.Spec?.Mode?.Replicated ? 'replicated' : 'global',
+      constraints,
+      reservations: {
+        cpu_cores: toCpuCores(reservations?.NanoCPUs),
+        memory_bytes: reservations?.MemoryBytes || 0,
+      },
+    };
+  });
+
+  const serviceNameById = new Map(
+    services.map((service) => [service?.ID, service?.Spec?.Name].filter((entry) => Boolean(entry[0])) as [string, string])
+  );
+
+  const nodes: CapacityNode[] = swarmNodes.map((node) => {
+    const resources = node?.Description?.Resources || {};
+    const nodeId = node?.ID;
+    const nodeTasks = tasks.filter(
+      (task) =>
+        task?.NodeID === nodeId &&
+        task?.DesiredState === 'running' &&
+        task?.Status?.State !== 'shutdown',
+    );
+
+    let reservedCpu = 0;
+    let reservedMem = 0;
+    const servicesUsed = new Set<string>();
+    for (const task of nodeTasks) {
+      const reservations = task?.Spec?.Resources?.Reservations || {};
+      reservedCpu += toCpuCores(reservations?.NanoCPUs);
+      reservedMem += reservations?.MemoryBytes || 0;
+      const serviceId = task?.ServiceID;
+      if (serviceId) {
+        servicesUsed.add(serviceNameById.get(serviceId) || serviceId);
+      }
+    }
+
+    const totalCpu = toCpuCores(resources?.NanoCPUs);
+    const totalMem = resources?.MemoryBytes || 0;
+    const freeCpu = Math.max(0, totalCpu - reservedCpu);
+    const freeMem = Math.max(0, totalMem - reservedMem);
+
+    return {
+      id: nodeId,
+      hostname: node?.Description?.Hostname,
+      role: node?.Spec?.Role,
+      status: node?.Status?.State,
+      availability: node?.Spec?.Availability,
+      labels: node?.Spec?.Labels || {},
+      address: node?.Status?.Addr,
+      resources: {
+        cpu_cores: totalCpu,
+        memory_bytes: totalMem,
+      },
+      reservations: {
+        cpu_cores: reservedCpu,
+        memory_bytes: reservedMem,
+      },
+      free: {
+        cpu_cores: freeCpu,
+        memory_bytes: freeMem,
+      },
+      tasks: {
+        running: nodeTasks.length,
+        services: Array.from(servicesUsed).sort(),
+      },
+    };
+  });
+
+  const totals: CapacityTotals = nodes.reduce(
+    (acc, node) => {
+      acc.cpu_cores += node?.resources?.cpu_cores || 0;
+      acc.memory_bytes += node?.resources?.memory_bytes || 0;
+      acc.reserved_cpu_cores += node?.reservations?.cpu_cores || 0;
+      acc.reserved_memory_bytes += node?.reservations?.memory_bytes || 0;
+      acc.free_cpu_cores += node?.free?.cpu_cores || 0;
+      acc.free_memory_bytes += node?.free?.memory_bytes || 0;
+      return acc;
+    },
+    {
+      cpu_cores: 0,
+      memory_bytes: 0,
+      reserved_cpu_cores: 0,
+      reserved_memory_bytes: 0,
+      free_cpu_cores: 0,
+      free_memory_bytes: 0,
+    },
+  );
+
+  return {
+    generated_at: new Date().toISOString(),
+    control_available: Boolean(localSwarm.controlAvailable),
+    nodes,
+    services: serviceSummaries,
+    totals,
+  };
 }
 
 export async function pushStatus() {
