@@ -76,6 +76,37 @@ type CapacityTotals = {
   free_memory_bytes: number;
 };
 
+type PlannerRecommendation = {
+  type: string;
+  message: string;
+  node_id?: string;
+  labels?: Record<string, string>;
+};
+
+type PlannerPayload = {
+  generated_at: string;
+  control_available: boolean;
+  summary: {
+    node_count: number;
+    ready_count: number;
+    manager_count: number;
+    worker_count: number;
+  };
+  placements: {
+    primary_manager_node_id: string | null;
+    database_node_id: string | null;
+    search_node_id: string | null;
+  };
+  headroom: {
+    free_cpu_cores: number;
+    free_memory_bytes: number;
+    free_cpu_ratio: number;
+    free_memory_ratio: number;
+  };
+  warnings: string[];
+  recommendations: PlannerRecommendation[];
+};
+
 type LocalSwarmInfo = {
   localNodeState?: string;
   controlAvailable?: boolean;
@@ -394,6 +425,7 @@ export async function buildStatusPayload(
   reqHost: string,
   wantsJson: boolean,
   includeCapacity = false,
+  includePlanner = false,
 ) {
   const config = readConfig();
   const localSwarm = await getLocalSwarmInfo();
@@ -408,6 +440,7 @@ export async function buildStatusPayload(
   };
 
   const capacity = includeCapacity ? await buildCapacityPayload() : null;
+  const planner = includePlanner ? await buildPlannerPayload() : null;
 
   let nodeStatus: any = null;
   if (reqHost && reqHost !== config.stack_domain) {
@@ -424,6 +457,9 @@ export async function buildStatusPayload(
   const payload = nodeStatus ? { ...summary, node: nodeStatus } : summary;
   if (capacity) {
     (payload as Record<string, unknown>).capacity = capacity;
+  }
+  if (planner) {
+    (payload as Record<string, unknown>).planner = planner;
   }
 
   if (wantsJson) {
@@ -560,6 +596,117 @@ export async function buildCapacityPayload() {
     nodes,
     services: serviceSummaries,
     totals,
+  };
+}
+
+function pickNodeByLabel(nodes: CapacityNode[], label: string, value: string) {
+  return nodes.find((node) => node.labels?.[label] === value) || null;
+}
+
+function pickReadyNode(nodes: CapacityNode[]) {
+  return nodes.find((node) => node.status === 'ready' && node.availability === 'active') || null;
+}
+
+function pickManager(nodes: CapacityNode[]) {
+  const managers = nodes.filter(
+    (node) => node.role === 'manager' && node.status === 'ready' && node.availability === 'active',
+  );
+  return managers[0] || pickReadyNode(nodes);
+}
+
+function pickHighestFreeMemory(nodes: CapacityNode[]) {
+  return nodes
+    .filter((node) => node.status === 'ready' && node.availability === 'active')
+    .sort((a, b) => (b.free?.memory_bytes || 0) - (a.free?.memory_bytes || 0))[0] || null;
+}
+
+export async function buildPlannerPayload(): Promise<PlannerPayload> {
+  const capacity = await buildCapacityPayload();
+  const nodes = capacity.nodes || [];
+  const warnings: string[] = [];
+  const recommendations: PlannerRecommendation[] = [];
+  const readyNodes = nodes.filter(
+    (node) => node.status === 'ready' && node.availability === 'active',
+  );
+  const managerNodes = nodes.filter(
+    (node) => node.role === 'manager' && node.status === 'ready' && node.availability === 'active',
+  );
+
+  const primaryManager = pickManager(nodes);
+  if (!primaryManager) {
+    warnings.push('no ready node available for manager placement');
+  }
+
+  const existingDb = pickNodeByLabel(nodes, 'database', 'true');
+  const existingSearch = pickNodeByLabel(nodes, 'search', 'true');
+
+  let dbNode = existingDb;
+  let searchNode = existingSearch;
+
+  if (!dbNode) {
+    dbNode = nodes.length <= 1 ? primaryManager : pickHighestFreeMemory(nodes);
+    if (dbNode) {
+      recommendations.push({
+        type: 'label',
+        node_id: dbNode.id,
+        labels: { database: 'true' },
+        message: `Recommend setting database=true on ${dbNode.hostname || dbNode.id}`,
+      });
+    }
+  }
+
+  if (!searchNode) {
+    searchNode = nodes.length <= 1 ? primaryManager : pickHighestFreeMemory(nodes);
+    if (searchNode) {
+      recommendations.push({
+        type: 'label',
+        node_id: searchNode.id,
+        labels: { search: 'true' },
+        message: `Recommend setting search=true on ${searchNode.hostname || searchNode.id}`,
+      });
+    }
+  }
+
+  if (!pickNodeByLabel(nodes, 'mz.role', 'manager') && primaryManager) {
+    recommendations.push({
+      type: 'label',
+      node_id: primaryManager.id,
+      labels: { 'mz.role': 'manager' },
+      message: `Recommend setting mz.role=manager on ${primaryManager.hostname || primaryManager.id}`,
+    });
+  }
+
+  const totalCpu = capacity.totals.cpu_cores || 0;
+  const totalMem = capacity.totals.memory_bytes || 0;
+  const freeCpu = capacity.totals.free_cpu_cores || 0;
+  const freeMem = capacity.totals.free_memory_bytes || 0;
+
+  if (readyNodes.length === 0) {
+    warnings.push('no ready nodes available');
+  }
+
+  return {
+    generated_at: capacity.generated_at,
+    control_available: Boolean(capacity.control_available),
+    summary: {
+      node_count: nodes.length,
+      ready_count: readyNodes.length,
+      manager_count: managerNodes.length,
+      worker_count: nodes.length - managerNodes.length,
+    },
+    placements: {
+      primary_manager_node_id: primaryManager?.id || null,
+      database_node_id: dbNode?.id || null,
+      search_node_id: searchNode?.id || null,
+    },
+    headroom: {
+      free_cpu_cores: freeCpu,
+      free_memory_bytes: freeMem,
+      free_cpu_ratio: totalCpu > 0 ? freeCpu / totalCpu : 0,
+      free_memory_ratio: totalMem > 0 ? freeMem / totalMem : 0,
+    },
+    warnings,
+    recommendations,
   };
 }
 
