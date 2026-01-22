@@ -92,6 +92,19 @@ type PlannerPayload = {
     manager_count: number;
     worker_count: number;
   };
+  capacity: {
+    totals: {
+      cpu_cores: number;
+      memory_bytes: number;
+    };
+    nodes: Array<{
+      id?: string;
+      hostname?: string;
+      role?: string;
+      cpu_cores: number;
+      memory_bytes: number;
+    }>;
+  };
   placements: {
     primary_manager_node_id: string | null;
     database_node_id: string | null;
@@ -620,6 +633,18 @@ function pickHighestFreeMemory(nodes: CapacityNode[]) {
     .sort((a, b) => (b.free?.memory_bytes || 0) - (a.free?.memory_bytes || 0))[0] || null;
 }
 
+function pickHighestCapacity(nodes: CapacityNode[]) {
+  return nodes
+    .filter((node) => node.status === 'ready' && node.availability === 'active')
+    .sort((a, b) => {
+      const memDiff = (b.resources?.memory_bytes || 0) - (a.resources?.memory_bytes || 0);
+      if (memDiff !== 0) {
+        return memDiff;
+      }
+      return (b.resources?.cpu_cores || 0) - (a.resources?.cpu_cores || 0);
+    })[0] || null;
+}
+
 export async function buildPlannerPayload(): Promise<PlannerPayload> {
   const capacity = await buildCapacityPayload();
   const nodes = capacity.nodes || [];
@@ -644,7 +669,10 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
   let searchNode = existingSearch;
 
   if (!dbNode) {
-    dbNode = nodes.length <= 1 ? primaryManager : pickHighestFreeMemory(nodes);
+    const candidates = nodes.length > 1
+      ? readyNodes.filter((node) => node.id !== primaryManager?.id)
+      : readyNodes;
+    dbNode = pickHighestCapacity(candidates) || pickHighestCapacity(readyNodes) || primaryManager;
     if (dbNode) {
       recommendations.push({
         type: 'label',
@@ -656,7 +684,8 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
   }
 
   if (!searchNode) {
-    searchNode = nodes.length <= 1 ? primaryManager : pickHighestFreeMemory(nodes);
+    const candidates = readyNodes.filter((node) => node.id !== dbNode?.id);
+    searchNode = pickHighestCapacity(candidates) || pickHighestCapacity(readyNodes) || dbNode || primaryManager;
     if (searchNode) {
       recommendations.push({
         type: 'label',
@@ -684,6 +713,17 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
   if (readyNodes.length === 0) {
     warnings.push('no ready nodes available');
   }
+  if (readyNodes.length > 1 && dbNode && searchNode && dbNode.id === searchNode.id) {
+    warnings.push('database and search are co-located; consider splitting across nodes');
+  }
+
+  const capacityNodes = nodes.map((node) => ({
+    id: node.id,
+    hostname: node.hostname,
+    role: node.role,
+    cpu_cores: node.resources?.cpu_cores || 0,
+    memory_bytes: node.resources?.memory_bytes || 0,
+  }));
 
   return {
     generated_at: capacity.generated_at,
@@ -693,6 +733,13 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
       ready_count: readyNodes.length,
       manager_count: managerNodes.length,
       worker_count: nodes.length - managerNodes.length,
+    },
+    capacity: {
+      totals: {
+        cpu_cores: totalCpu,
+        memory_bytes: totalMem,
+      },
+      nodes: capacityNodes,
     },
     placements: {
       primary_manager_node_id: primaryManager?.id || null,
