@@ -131,7 +131,8 @@ type LocalSwarmInfo = {
 const CONFIG_PATH = process.env.STATUS_CONFIG_PATH || '/opt/status/data.json';
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
-const VERSION_PATH = process.env.MZ_SWARM_AGENT_VERSION_PATH || path.join(NODE_DIR, 'version');
+const VERSION_PATH = process.env.MZ_SWARM_AGENT_VERSION_PATH
+  || '/opt/mage-zero/agent/version';
 
 let cachedAgentVersion: string | null = null;
 
@@ -154,6 +155,15 @@ function readAgentVersion(): string {
   if (envVersion) {
     cachedAgentVersion = envVersion.trim();
     return cachedAgentVersion;
+  }
+  try {
+    const legacy = fs.readFileSync(path.join(NODE_DIR, 'version'), 'utf8').trim();
+    if (legacy) {
+      cachedAgentVersion = legacy;
+      return cachedAgentVersion;
+    }
+  } catch {
+    // ignore missing legacy file
   }
   try {
     const fileVersion = fs.readFileSync(VERSION_PATH, 'utf8').trim();
