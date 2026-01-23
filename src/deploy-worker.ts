@@ -804,6 +804,83 @@ async function runMagentoCommand(containerId: string, command: string) {
   await runCommand('docker', ['exec', containerId, 'sh', '-c', command]);
 }
 
+async function runMagentoCommandCapture(containerId: string, command: string) {
+  return await runCommandCapture('docker', ['exec', containerId, 'sh', '-c', command]);
+}
+
+function parseMagentoMode(output: string) {
+  const match = output.match(/Current application mode:\s*([a-z]+)/i);
+  return match ? match[1].toLowerCase() : null;
+}
+
+function parseDisabledCaches(output: string) {
+  const disabled: string[] = [];
+  const lines = output.split('\n');
+  for (const line of lines) {
+    const match = line.trim().match(/^([a-z0-9_]+):\s*([01])$/i);
+    if (!match) {
+      continue;
+    }
+    if (match[2] === '0') {
+      disabled.push(match[1]);
+    }
+  }
+  return disabled;
+}
+
+async function enforceMagentoPerformance(containerId: string, log: (message: string) => void) {
+  log('ensuring Magento production mode + caches');
+  await runMagentoCommandCapture(
+    containerId,
+    'php bin/magento deploy:mode:set production --skip-compilation',
+  );
+  await runMagentoCommandCapture(containerId, 'php bin/magento cache:enable');
+  await runMagentoCommandCapture(containerId, 'php bin/magento cache:flush');
+
+  const modeResult = await runMagentoCommandCapture(containerId, 'php bin/magento deploy:mode:show');
+  const mode = parseMagentoMode(modeResult.stdout || modeResult.stderr || '');
+  if (mode !== 'production') {
+    throw new Error(`Magento deploy mode is not production (${mode || 'unknown'})`);
+  }
+
+  const cacheResult = await runMagentoCommandCapture(containerId, 'php bin/magento cache:status');
+  const disabled = parseDisabledCaches(cacheResult.stdout || cacheResult.stderr || '');
+  if (disabled.length) {
+    throw new Error(`Magento caches still disabled: ${disabled.join(', ')}`);
+  }
+  log('Magento production mode + caches confirmed');
+}
+
+async function runSetupUpgradeWithRetry(
+  containerId: string,
+  stackName: string,
+  log: (message: string) => void,
+) {
+  const maxAttempts = 3;
+  let lastError: Error | null = null;
+  let adminContainerId = containerId;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await runMagentoCommandCapture(adminContainerId, 'php bin/magento setup:upgrade --keep-generated');
+      return { warning: false };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('OpenSearch') && message.includes('default website')) {
+        return { warning: true, message };
+      }
+      if (message.includes('Connection refused') || message.includes('is not running')) {
+        lastError = error instanceof Error ? error : new Error(message);
+        log(`setup:upgrade attempt ${attempt} failed: ${message}`);
+        await delay(5000);
+        adminContainerId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw lastError || new Error('setup:upgrade failed after retries');
+}
+
 async function reportDeploymentStatus(
   baseUrl: string,
   nodeId: string,
@@ -1086,28 +1163,17 @@ async function processDeployment(recordPath: string) {
   await setSearchEngine(dbContainerId, envVars.MYSQL_DATABASE || 'magento', 'mysql');
   await waitForProxySql(adminContainerId, 5 * 60 * 1000);
   try {
-    await runCommandCapture('docker', [
-      'exec',
-      adminContainerId,
-      'sh',
-      '-c',
-      'php bin/magento setup:upgrade --keep-generated',
-    ]);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!message.includes('OpenSearch') || !message.includes('default website')) {
-      throw error;
+    const upgradeResult = await runSetupUpgradeWithRetry(adminContainerId, stackName, log);
+    upgradeWarning = upgradeResult.warning;
+    if (upgradeWarning && upgradeResult.message) {
+      console.warn(`${logPrefix} setup:upgrade warning: ${upgradeResult.message}`);
     }
-    upgradeWarning = true;
-    console.warn(`${logPrefix} setup:upgrade warning: ${message}`);
+  } catch (error) {
+    throw error;
   } finally {
     await setSearchEngine(dbContainerId, envVars.MYSQL_DATABASE || 'magento', searchEngine);
   }
   if (!upgradeWarning) {
-    await runMagentoCommand(
-      adminContainerId,
-      'php bin/magento deploy:mode:set production --skip-compilation',
-    );
     await setFullPageCacheConfig(
       dbContainerId,
       envVars.MYSQL_DATABASE || 'magento',
@@ -1121,9 +1187,8 @@ async function processDeployment(recordPath: string) {
       'localhost,127.0.0.1,nginx,php-fpm,php-fpm-admin,varnish',
       '300',
     );
-    await runMagentoCommand(adminContainerId, 'php bin/magento cache:enable');
-    await runMagentoCommand(adminContainerId, 'php bin/magento cache:flush');
   }
+  await enforceMagentoPerformance(adminContainerId, log);
   log('magento upgrade complete');
 
   await reportDeploymentStatus(baseUrl, nodeId, nodeSecret, {
