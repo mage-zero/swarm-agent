@@ -4,7 +4,7 @@ import path from 'path';
 import readline from 'readline';
 import { spawn } from 'child_process';
 import { presignS3Url } from './r2-presign.js';
-import { buildCapacityPayload, isSwarmManager, readConfig } from './status.js';
+import { buildCapacityPayload, buildPlannerPayload, isSwarmManager, readConfig } from './status.js';
 
 type DeployPayload = {
   artifact?: string;
@@ -61,6 +61,19 @@ type EnvironmentRecord = {
   environment_secrets?: EnvironmentSecrets | null;
 };
 
+type PlannerResourceSpec = {
+  limits: {
+    cpu_cores: number;
+    memory_bytes: number;
+  };
+  reservations: {
+    cpu_cores: number;
+    memory_bytes: number;
+  };
+};
+
+type PlannerResources = Record<string, PlannerResourceSpec>;
+
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/deployments';
 const DEPLOY_WORK_DIR = process.env.MZ_DEPLOY_WORK_DIR || '/opt/mage-zero/deployments/work';
@@ -73,6 +86,23 @@ const DEFAULT_DB_BACKUP_OBJECT = process.env.MZ_DB_BACKUP_OBJECT || 'provisionin
 const SECRET_VERSION = process.env.MZ_SECRET_VERSION || '1';
 const DEPLOY_INTERVAL_MS = Number(process.env.MZ_DEPLOY_WORKER_INTERVAL_MS || 5000);
 const FETCH_TIMEOUT_MS = Number(process.env.MZ_FETCH_TIMEOUT_MS || 30000);
+const MIB = 1024 * 1024;
+const GIB = 1024 * 1024 * 1024;
+
+const RESOURCE_ENV_MAP = [
+  { service: 'varnish', prefix: 'MZ_VARNISH' },
+  { service: 'nginx', prefix: 'MZ_NGINX' },
+  { service: 'php-fpm', prefix: 'MZ_PHP_FPM' },
+  { service: 'php-fpm-admin', prefix: 'MZ_PHP_FPM_ADMIN' },
+  { service: 'cron', prefix: 'MZ_CRON' },
+  { service: 'database', prefix: 'MZ_DATABASE' },
+  { service: 'database-replica', prefix: 'MZ_DATABASE_REPLICA' },
+  { service: 'proxysql', prefix: 'MZ_PROXYSQL' },
+  { service: 'opensearch', prefix: 'MZ_OPENSEARCH' },
+  { service: 'redis-cache', prefix: 'MZ_REDIS_CACHE' },
+  { service: 'redis-session', prefix: 'MZ_REDIS_SESSION' },
+  { service: 'rabbitmq', prefix: 'MZ_RABBITMQ' },
+] as const;
 
 let processing = false;
 
@@ -230,6 +260,48 @@ function assertNoLatestImages(stackConfig: string) {
     throw new Error(`Stack config resolved to :latest images: ${latestLines.join(' | ')}`);
   }
 }
+
+function formatCpuCores(value: number) {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`Invalid CPU cores value: ${value}`);
+  }
+  return String(value);
+}
+
+function formatMemoryBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    throw new Error(`Invalid memory bytes value: ${bytes}`);
+  }
+  if (bytes % GIB === 0) {
+    return `${bytes / GIB}G`;
+  }
+  if (bytes % MIB === 0) {
+    return `${bytes / MIB}M`;
+  }
+  return String(Math.round(bytes));
+}
+
+function buildPlannerResourceEnv(resources: PlannerResources) {
+  const env: Record<string, string> = {};
+  for (const entry of RESOURCE_ENV_MAP) {
+    const resource = resources[entry.service];
+    if (!resource) {
+      throw new Error(`Planner missing resource sizing for ${entry.service}`);
+    }
+    env[`${entry.prefix}_LIMIT_CPUS`] = formatCpuCores(resource.limits.cpu_cores);
+    env[`${entry.prefix}_LIMIT_MEMORY`] = formatMemoryBytes(resource.limits.memory_bytes);
+    env[`${entry.prefix}_RESERVE_CPUS`] = formatCpuCores(resource.reservations.cpu_cores);
+    env[`${entry.prefix}_RESERVE_MEMORY`] = formatMemoryBytes(resource.reservations.memory_bytes);
+  }
+  return env;
+}
+
+const RESOURCE_ENV_KEYS = RESOURCE_ENV_MAP.flatMap((entry) => [
+  `${entry.prefix}_LIMIT_CPUS`,
+  `${entry.prefix}_LIMIT_MEMORY`,
+  `${entry.prefix}_RESERVE_CPUS`,
+  `${entry.prefix}_RESERVE_MEMORY`,
+]);
 
 async function ensureDockerSecret(secretName: string, value: string, workDir: string) {
   if (!value) {
@@ -833,6 +905,13 @@ async function processDeployment(recordPath: string) {
   if (versions.redisVersion) overrideVersions.REDIS_VERSION = versions.redisVersion;
   if (versions.rabbitmqVersion) overrideVersions.RABBITMQ_VERSION = versions.rabbitmqVersion;
 
+  const planner = await buildPlannerPayload();
+  const plannerResources = planner?.resources?.services;
+  if (!plannerResources) {
+    throw new Error('Planner did not provide resource sizing');
+  }
+  const plannerResourceEnv = buildPlannerResourceEnv(plannerResources);
+
   const replicaUser = 'replica';
   let replicaHost = 'database';
   try {
@@ -853,6 +932,7 @@ async function processDeployment(recordPath: string) {
     ...process.env,
     ...defaultVersions,
     ...overrideVersions,
+    ...plannerResourceEnv,
     REGISTRY_HOST: 'registry',
     REGISTRY_PUSH_HOST: '127.0.0.1',
     REGISTRY_PORT: '5000',
@@ -882,6 +962,7 @@ async function processDeployment(recordPath: string) {
     'RABBITMQ_VERSION',
     'PHP_VERSION',
     'NGINX_VERSION',
+    ...RESOURCE_ENV_KEYS,
   ]);
   const renderedStack = await runCommandCapture('docker', [
     'stack',

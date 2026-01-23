@@ -84,6 +84,21 @@ type PlannerRecommendation = {
   labels?: Record<string, string>;
 };
 
+type PlannerResourceSpec = {
+  limits: {
+    cpu_cores: number;
+    memory_bytes: number;
+  };
+  reservations: {
+    cpu_cores: number;
+    memory_bytes: number;
+  };
+};
+
+type PlannerResources = {
+  services: Record<string, PlannerResourceSpec>;
+};
+
 type PlannerPayload = {
   generated_at: string;
   control_available: boolean;
@@ -118,6 +133,7 @@ type PlannerPayload = {
     free_cpu_ratio: number;
     free_memory_ratio: number;
   };
+  resources: PlannerResources;
   warnings: string[];
   recommendations: PlannerRecommendation[];
 };
@@ -133,6 +149,8 @@ const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
 const VERSION_PATH = process.env.MZ_SWARM_AGENT_VERSION_PATH
   || '/opt/mage-zero/agent/version';
+const MIB = 1024 * 1024;
+const GIB = 1024 * 1024 * 1024;
 
 let cachedAgentVersion: string | null = null;
 
@@ -674,6 +692,61 @@ function pickHighestCapacity(nodes: CapacityNode[]) {
     })[0] || null;
 }
 
+function buildPlannerResourceDefaults(): PlannerResources {
+  return {
+    services: {
+      varnish: {
+        limits: { cpu_cores: 1, memory_bytes: 512 * MIB },
+        reservations: { cpu_cores: 0.25, memory_bytes: 256 * MIB },
+      },
+      nginx: {
+        limits: { cpu_cores: 0.5, memory_bytes: 256 * MIB },
+        reservations: { cpu_cores: 0.1, memory_bytes: 128 * MIB },
+      },
+      'php-fpm': {
+        limits: { cpu_cores: 2, memory_bytes: 2 * GIB },
+        reservations: { cpu_cores: 0.5, memory_bytes: 1 * GIB },
+      },
+      'php-fpm-admin': {
+        limits: { cpu_cores: 2, memory_bytes: 2 * GIB },
+        reservations: { cpu_cores: 0.5, memory_bytes: 1 * GIB },
+      },
+      cron: {
+        limits: { cpu_cores: 0.5, memory_bytes: 512 * MIB },
+        reservations: { cpu_cores: 0.1, memory_bytes: 256 * MIB },
+      },
+      database: {
+        limits: { cpu_cores: 2, memory_bytes: 1 * GIB },
+        reservations: { cpu_cores: 0.5, memory_bytes: 512 * MIB },
+      },
+      'database-replica': {
+        limits: { cpu_cores: 2, memory_bytes: 1 * GIB },
+        reservations: { cpu_cores: 0.5, memory_bytes: 512 * MIB },
+      },
+      proxysql: {
+        limits: { cpu_cores: 0.5, memory_bytes: 512 * MIB },
+        reservations: { cpu_cores: 0.1, memory_bytes: 256 * MIB },
+      },
+      opensearch: {
+        limits: { cpu_cores: 2, memory_bytes: 1 * GIB },
+        reservations: { cpu_cores: 0.5, memory_bytes: 512 * MIB },
+      },
+      'redis-cache': {
+        limits: { cpu_cores: 0.5, memory_bytes: 512 * MIB },
+        reservations: { cpu_cores: 0.1, memory_bytes: 256 * MIB },
+      },
+      'redis-session': {
+        limits: { cpu_cores: 0.5, memory_bytes: 512 * MIB },
+        reservations: { cpu_cores: 0.1, memory_bytes: 256 * MIB },
+      },
+      rabbitmq: {
+        limits: { cpu_cores: 1, memory_bytes: 512 * MIB },
+        reservations: { cpu_cores: 0.25, memory_bytes: 256 * MIB },
+      },
+    },
+  };
+}
+
 export async function buildPlannerPayload(): Promise<PlannerPayload> {
   const capacity = await buildCapacityPayload();
   const nodes = capacity.nodes || [];
@@ -790,6 +863,8 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
     memory_bytes: node.resources?.memory_bytes || 0,
   }));
 
+  const resources = buildPlannerResourceDefaults();
+
   return {
     generated_at: capacity.generated_at,
     control_available: Boolean(capacity.control_available),
@@ -818,6 +893,7 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
       free_cpu_ratio: totalCpu > 0 ? freeCpu / totalCpu : 0,
       free_memory_ratio: totalMem > 0 ? freeMem / totalMem : 0,
     },
+    resources,
     warnings,
     recommendations,
   };
