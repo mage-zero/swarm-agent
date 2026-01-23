@@ -593,6 +593,25 @@ async function waitForProxySql(containerId: string, timeoutMs: number) {
   throw new Error('ProxySQL did not become ready in time');
 }
 
+async function waitForRedisCache(containerId: string, timeoutMs: number) {
+  const start = Date.now();
+  const probe = [
+    '$host="redis-cache";',
+    '$port=6379;',
+    '$fp=@fsockopen($host,$port,$errno,$errstr,1);',
+    'if(!$fp){fwrite(STDERR,$errstr ?: "connect failed"); exit(1);} fclose($fp);',
+  ].join(' ');
+  while (Date.now() - start < timeoutMs) {
+    try {
+      await runCommandCapture('docker', ['exec', containerId, 'php', '-r', probe]);
+      return;
+    } catch {
+      await delay(2000);
+    }
+  }
+  throw new Error('Redis cache did not become ready in time');
+}
+
 async function restoreDatabase(
   containerId: string,
   encryptedPath: string,
@@ -868,11 +887,17 @@ async function runSetupUpgradeWithRetry(
       if (message.includes('OpenSearch') && message.includes('default website')) {
         return { warning: true, message };
       }
-      if (message.includes('Connection refused') || message.includes('is not running')) {
+      if (
+        message.includes('Connection refused')
+        || message.includes('is not running')
+        || message.includes('Connection to Redis')
+        || message.includes('redis-cache')
+      ) {
         lastError = error instanceof Error ? error : new Error(message);
         log(`setup:upgrade attempt ${attempt} failed: ${message}`);
         await delay(5000);
         adminContainerId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
+        await waitForRedisCache(adminContainerId, 5 * 60 * 1000);
         continue;
       }
       throw error;
@@ -1162,6 +1187,7 @@ async function processDeployment(recordPath: string) {
   );
   await setSearchEngine(dbContainerId, envVars.MYSQL_DATABASE || 'magento', 'mysql');
   await waitForProxySql(adminContainerId, 5 * 60 * 1000);
+  await waitForRedisCache(adminContainerId, 5 * 60 * 1000);
   try {
     const upgradeResult = await runSetupUpgradeWithRetry(adminContainerId, stackName, log);
     upgradeWarning = upgradeResult.warning;
