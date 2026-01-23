@@ -819,12 +819,38 @@ async function setOpensearchSystemConfig(
   ]);
 }
 
-async function runMagentoCommand(containerId: string, command: string) {
-  await runCommand('docker', ['exec', containerId, 'sh', '-c', command]);
+const MAGENTO_DB_OVERRIDE_ENV = {
+  MZ_DB_HOST: 'database',
+  MZ_DB_PORT: '3306',
+};
+
+function buildDockerEnvArgs(env: Record<string, string> | undefined) {
+  if (!env) {
+    return [] as string[];
+  }
+  const args: string[] = [];
+  for (const [key, value] of Object.entries(env)) {
+    args.push('-e', `${key}=${value}`);
+  }
+  return args;
 }
 
-async function runMagentoCommandCapture(containerId: string, command: string) {
-  return await runCommandCapture('docker', ['exec', containerId, 'sh', '-c', command]);
+async function runMagentoCommand(
+  containerId: string,
+  command: string,
+  env: Record<string, string> = MAGENTO_DB_OVERRIDE_ENV,
+) {
+  const envArgs = buildDockerEnvArgs(env);
+  await runCommand('docker', ['exec', ...envArgs, containerId, 'sh', '-c', command]);
+}
+
+async function runMagentoCommandCapture(
+  containerId: string,
+  command: string,
+  env: Record<string, string> = MAGENTO_DB_OVERRIDE_ENV,
+) {
+  const envArgs = buildDockerEnvArgs(env);
+  return await runCommandCapture('docker', ['exec', ...envArgs, containerId, 'sh', '-c', command]);
 }
 
 function parseMagentoMode(output: string) {
