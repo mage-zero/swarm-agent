@@ -837,7 +837,7 @@ function buildDockerEnvArgs(env: Record<string, string> | undefined) {
 
 async function ensureMagentoEnvWrapper(containerId: string) {
   const command = [
-    'set -e',
+    'set -e;',
     'if [ -f /var/www/html/magento/app/etc/env.php ]; then',
     '  cp /var/www/html/magento/app/etc/env.php /var/www/html/magento/app/etc/env.base.php;',
     '  cp /usr/local/share/mz-env.php /var/www/html/magento/app/etc/env.php;',
