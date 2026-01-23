@@ -921,7 +921,11 @@ async function runMagentoCommandWithStatus(
   return await runCommandCaptureWithStatus('docker', ['exec', ...envArgs, containerId, 'sh', '-c', command]);
 }
 
-async function enforceMagentoPerformance(containerId: string, log: (message: string) => void) {
+async function enforceMagentoPerformance(
+  containerId: string,
+  stackName: string,
+  log: (message: string) => void,
+) {
   log('ensuring Magento production mode + caches');
   const checkScript = [
     '$env=require "/var/www/html/magento/app/etc/env.php";',
@@ -933,12 +937,24 @@ async function enforceMagentoPerformance(containerId: string, log: (message: str
     'if(!empty($disabled)){ fwrite(STDERR, "disabled caches: ".implode(",", $disabled)); exit(1); }',
     'echo "ok";',
   ].join(' ');
-  const result = await runMagentoCommandWithStatus(containerId, `php -r '${checkScript}'`);
-  if (result.code !== 0) {
+  let currentId = containerId;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    currentId = await ensureMagentoEnvWrapperWithRetry(currentId, stackName, log);
+    const result = await runMagentoCommandWithStatus(currentId, `php -r '${checkScript}'`);
+    if (result.code === 0) {
+      log('Magento production mode + caches confirmed');
+      return;
+    }
     const output = (result.stderr || result.stdout || '').trim();
-    throw new Error(`Magento performance config not set: ${output || 'unknown error'}`);
+    if (!output || output.includes('No such container') || output.includes('is not running')) {
+      log(`performance check retry ${attempt}: ${output || `exit ${result.code}`}`);
+      currentId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
+      await delay(3000);
+      continue;
+    }
+    throw new Error(`Magento performance config not set: ${output}`);
   }
-  log('Magento production mode + caches confirmed');
+  throw new Error('Magento performance config not set: unknown error');
 }
 
 async function runSetupUpgradeWithRetry(
@@ -1305,7 +1321,7 @@ async function processDeployment(recordPath: string) {
     );
   }
   adminContainerId = await ensureMagentoEnvWrapperWithRetry(adminContainerId, stackName, log);
-  await enforceMagentoPerformance(adminContainerId, log);
+  await enforceMagentoPerformance(adminContainerId, stackName, log);
   log('magento upgrade complete');
 
   await reportDeploymentStatus(baseUrl, nodeId, nodeSecret, {
