@@ -880,15 +880,6 @@ async function ensureMagentoEnvWrapper(containerId: string) {
   await runCommand('docker', ['exec', containerId, 'sh', '-c', command]);
 }
 
-async function runMagentoCommand(
-  containerId: string,
-  command: string,
-  env: Record<string, string> = MAGENTO_DB_OVERRIDE_ENV,
-) {
-  const envArgs = buildDockerEnvArgs(env);
-  await runCommand('docker', ['exec', ...envArgs, containerId, 'sh', '-c', command]);
-}
-
 async function runMagentoCommandCapture(
   containerId: string,
   command: string,
@@ -907,45 +898,22 @@ async function runMagentoCommandWithStatus(
   return await runCommandCaptureWithStatus('docker', ['exec', ...envArgs, containerId, 'sh', '-c', command]);
 }
 
-function parseMagentoMode(output: string) {
-  const match = output.match(/Current application mode:\s*([a-z]+)/i);
-  return match ? match[1].toLowerCase() : null;
-}
-
-function parseDisabledCaches(output: string) {
-  const disabled: string[] = [];
-  const lines = output.split('\n');
-  for (const line of lines) {
-    const match = line.trim().match(/^([a-z0-9_]+):\s*([01])$/i);
-    if (!match) {
-      continue;
-    }
-    if (match[2] === '0') {
-      disabled.push(match[1]);
-    }
-  }
-  return disabled;
-}
-
 async function enforceMagentoPerformance(containerId: string, log: (message: string) => void) {
   log('ensuring Magento production mode + caches');
-  await runMagentoCommandCapture(
-    containerId,
-    'php bin/magento deploy:mode:set production --skip-compilation',
-  );
-  await runMagentoCommandCapture(containerId, 'php bin/magento cache:enable');
-  await runMagentoCommandCapture(containerId, 'php bin/magento cache:flush');
-
-  const modeResult = await runMagentoCommandCapture(containerId, 'php bin/magento deploy:mode:show');
-  const mode = parseMagentoMode(modeResult.stdout || modeResult.stderr || '');
-  if (mode !== 'production') {
-    throw new Error(`Magento deploy mode is not production (${mode || 'unknown'})`);
-  }
-
-  const cacheResult = await runMagentoCommandCapture(containerId, 'php bin/magento cache:status');
-  const disabled = parseDisabledCaches(cacheResult.stdout || cacheResult.stderr || '');
-  if (disabled.length) {
-    throw new Error(`Magento caches still disabled: ${disabled.join(', ')}`);
+  const checkScript = [
+    '$env=require "/var/www/html/magento/app/etc/env.php";',
+    '$mode=strtolower((string)($env["MAGE_MODE"] ?? ""));',
+    '$cache=$env["cache_types"] ?? [];',
+    '$disabled=[];',
+    'foreach($cache as $key=>$value){ if((int)$value !== 1){ $disabled[]=$key; } }',
+    'if($mode !== "production"){ fwrite(STDERR, "MAGE_MODE=".$mode); exit(1); }',
+    'if(!empty($disabled)){ fwrite(STDERR, "disabled caches: ".implode(",", $disabled)); exit(1); }',
+    'echo "ok";',
+  ].join(' ');
+  const result = await runMagentoCommandWithStatus(containerId, `php -r '${checkScript}'`);
+  if (result.code !== 0) {
+    const output = (result.stderr || result.stdout || '').trim();
+    throw new Error(`Magento performance config not set: ${output || 'unknown error'}`);
   }
   log('Magento production mode + caches confirmed');
 }
