@@ -835,6 +835,18 @@ function buildDockerEnvArgs(env: Record<string, string> | undefined) {
   return args;
 }
 
+async function ensureMagentoEnvWrapper(containerId: string) {
+  const command = [
+    'set -e',
+    'if [ -f /var/www/html/magento/app/etc/env.php ]; then',
+    '  cp /var/www/html/magento/app/etc/env.php /var/www/html/magento/app/etc/env.base.php;',
+    '  cp /usr/local/share/mz-env.php /var/www/html/magento/app/etc/env.php;',
+    '  chown www-data:www-data /var/www/html/magento/app/etc/env.php /var/www/html/magento/app/etc/env.base.php;',
+    'fi',
+  ].join(' ');
+  await runCommand('docker', ['exec', containerId, 'sh', '-c', command]);
+}
+
 async function runMagentoCommand(
   containerId: string,
   command: string,
@@ -906,6 +918,7 @@ async function runSetupUpgradeWithRetry(
   let adminContainerId = containerId;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
+      await ensureMagentoEnvWrapper(adminContainerId);
       await runMagentoCommandCapture(adminContainerId, 'php bin/magento setup:upgrade --keep-generated');
       return { warning: false };
     } catch (error) {
@@ -1214,6 +1227,7 @@ async function processDeployment(recordPath: string) {
   await setSearchEngine(dbContainerId, envVars.MYSQL_DATABASE || 'magento', 'mysql');
   await waitForProxySql(adminContainerId, 5 * 60 * 1000);
   await waitForRedisCache(adminContainerId, 5 * 60 * 1000);
+  await ensureMagentoEnvWrapper(adminContainerId);
   try {
     const upgradeResult = await runSetupUpgradeWithRetry(adminContainerId, stackName, log);
     upgradeWarning = upgradeResult.warning;
@@ -1240,6 +1254,7 @@ async function processDeployment(recordPath: string) {
       '300',
     );
   }
+  await ensureMagentoEnvWrapper(adminContainerId);
   await enforceMagentoPerformance(adminContainerId, log);
   log('magento upgrade complete');
 
