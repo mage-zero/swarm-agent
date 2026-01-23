@@ -940,7 +940,10 @@ async function enforceMagentoPerformance(
   let currentId = containerId;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     currentId = await ensureMagentoEnvWrapperWithRetry(currentId, stackName, log);
-    const result = await runMagentoCommandWithStatus(currentId, `php -r '${checkScript}'`);
+    const result = await runMagentoCommandWithStatus(
+      currentId,
+      `php -d opcache.enable_cli=0 -d opcache.enable=0 -d opcache.jit=0 -r '${checkScript}'`,
+    );
     if (result.code === 0) {
       log('Magento production mode + caches confirmed');
       return;
