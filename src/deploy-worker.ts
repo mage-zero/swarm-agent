@@ -880,6 +880,29 @@ async function ensureMagentoEnvWrapper(containerId: string) {
   await runCommand('docker', ['exec', containerId, 'sh', '-c', command]);
 }
 
+async function ensureMagentoEnvWrapperWithRetry(
+  containerId: string,
+  stackName: string,
+  log: (message: string) => void,
+) {
+  let currentId = containerId;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      await ensureMagentoEnvWrapper(currentId);
+      return currentId;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('is not running') || message.includes('No such container') || message.includes('exited with code 128')) {
+        log(`env.php wrapper retry ${attempt}: ${message}`);
+        currentId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
+        continue;
+      }
+      throw error;
+    }
+  }
+  return currentId;
+}
+
 async function runMagentoCommandCapture(
   containerId: string,
   command: string,
@@ -928,7 +951,7 @@ async function runSetupUpgradeWithRetry(
   let adminContainerId = containerId;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      await ensureMagentoEnvWrapper(adminContainerId);
+      adminContainerId = await ensureMagentoEnvWrapperWithRetry(adminContainerId, stackName, log);
       const result = await runMagentoCommandWithStatus(
         adminContainerId,
         'php bin/magento setup:upgrade --keep-generated',
@@ -1216,7 +1239,7 @@ async function processDeployment(recordPath: string) {
     }
   }
 
-  const adminContainerId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
+  let adminContainerId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
   const webContainerId = await findLocalContainer(stackName, 'php-fpm');
   await runCommand('docker', [
     'exec',
@@ -1254,7 +1277,7 @@ async function processDeployment(recordPath: string) {
   await setSearchEngine(dbContainerId, envVars.MYSQL_DATABASE || 'magento', 'mysql');
   await waitForProxySql(adminContainerId, 5 * 60 * 1000);
   await waitForRedisCache(adminContainerId, 5 * 60 * 1000);
-  await ensureMagentoEnvWrapper(adminContainerId);
+  adminContainerId = await ensureMagentoEnvWrapperWithRetry(adminContainerId, stackName, log);
   try {
     const upgradeResult = await runSetupUpgradeWithRetry(adminContainerId, stackName, log);
     upgradeWarning = upgradeResult.warning;
@@ -1281,7 +1304,7 @@ async function processDeployment(recordPath: string) {
       '300',
     );
   }
-  await ensureMagentoEnvWrapper(adminContainerId);
+  adminContainerId = await ensureMagentoEnvWrapperWithRetry(adminContainerId, stackName, log);
   await enforceMagentoPerformance(adminContainerId, log);
   log('magento upgrade complete');
 
