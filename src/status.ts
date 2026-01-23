@@ -708,7 +708,7 @@ function buildPlannerResourceDefaults(): PlannerResources {
         reservations: { cpu_cores: 0.5, memory_bytes: 1 * GIB },
       },
       'php-fpm-admin': {
-        limits: { cpu_cores: 2, memory_bytes: 3 * GIB },
+        limits: { cpu_cores: 2, memory_bytes: 4 * GIB },
         reservations: { cpu_cores: 0.5, memory_bytes: 1 * GIB },
       },
       cron: {
