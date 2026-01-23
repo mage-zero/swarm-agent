@@ -105,6 +105,11 @@ const RESOURCE_ENV_MAP = [
 ] as const;
 
 let processing = false;
+let currentDeploymentPath: string | null = null;
+
+function getProcessingDir() {
+  return path.join(DEPLOY_QUEUE_DIR, 'processing');
+}
 
 function readNodeFile(name: string): string {
   try {
@@ -137,7 +142,7 @@ function claimNextDeployment(): string | null {
   }
 
   ensureDir(DEPLOY_QUEUE_DIR);
-  const processingDir = path.join(DEPLOY_QUEUE_DIR, 'processing');
+  const processingDir = getProcessingDir();
   ensureDir(processingDir);
 
   const source = files[0];
@@ -147,6 +152,41 @@ function claimNextDeployment(): string | null {
     return target;
   } catch {
     return null;
+  }
+}
+
+function recoverProcessingQueue() {
+  const processingDir = getProcessingDir();
+  if (!fs.existsSync(processingDir)) {
+    return;
+  }
+  const entries = fs.readdirSync(processingDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+    .map((entry) => entry.name);
+  for (const entry of entries) {
+    const source = path.join(processingDir, entry);
+    const target = path.join(DEPLOY_QUEUE_DIR, entry);
+    try {
+      fs.renameSync(source, target);
+      console.warn(`requeued deployment ${entry} after restart`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`failed to requeue ${entry}: ${message}`);
+    }
+  }
+}
+
+function requeueCurrentDeployment() {
+  if (!currentDeploymentPath) {
+    return;
+  }
+  try {
+    const target = path.join(DEPLOY_QUEUE_DIR, path.basename(currentDeploymentPath));
+    if (fs.existsSync(currentDeploymentPath)) {
+      fs.renameSync(currentDeploymentPath, target);
+    }
+  } catch {
+    // best effort; recoverProcessingQueue will retry on next boot
   }
 }
 
@@ -1394,10 +1434,12 @@ async function tick() {
     return;
   }
   processing = true;
+  currentDeploymentPath = next;
   try {
     await handleDeploymentFile(next);
   } finally {
     processing = false;
+    currentDeploymentPath = null;
   }
 }
 
@@ -1407,6 +1449,15 @@ export function startDeploymentWorker() {
   }
   ensureDir(DEPLOY_QUEUE_DIR);
   ensureDir(DEPLOY_WORK_DIR);
+  recoverProcessingQueue();
+  process.on('SIGTERM', () => {
+    requeueCurrentDeployment();
+    process.exit(0);
+  });
+  process.on('SIGINT', () => {
+    requeueCurrentDeployment();
+    process.exit(0);
+  });
   void tick();
   setInterval(() => {
     void tick();
