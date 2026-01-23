@@ -555,6 +555,17 @@ async function waitForContainer(stackName: string, serviceName: string, timeoutM
   throw new Error(`Timed out waiting for ${serviceName} container`);
 }
 
+async function findLocalContainer(stackName: string, serviceName: string) {
+  const { stdout } = await runCommandCapture('docker', [
+    'ps',
+    '--filter',
+    `name=${stackName}_${serviceName}`,
+    '--format',
+    '{{.ID}}',
+  ]);
+  return stdout.trim().split('\n')[0] || '';
+}
+
 async function waitForDatabase(containerId: string, timeoutMs: number) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -1197,7 +1208,7 @@ async function processDeployment(recordPath: string) {
   }
 
   const adminContainerId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
-  const webContainerId = await waitForContainer(stackName, 'php-fpm', 5 * 60 * 1000);
+  const webContainerId = await findLocalContainer(stackName, 'php-fpm');
   await runCommand('docker', [
     'exec',
     '--user',
@@ -1207,15 +1218,22 @@ async function processDeployment(recordPath: string) {
     '-c',
     'mkdir -p /var/www/html/magento/var/log /var/www/html/magento/var/report /var/www/html/magento/var/session /var/www/html/magento/var/cache /var/www/html/magento/var/page_cache /var/www/html/magento/var/tmp /var/www/html/magento/var/export /var/www/html/magento/var/import /var/www/html/magento/pub/media && chmod -R 0777 /var/www/html/magento/var/log /var/www/html/magento/var/report /var/www/html/magento/var/session /var/www/html/magento/var/cache /var/www/html/magento/var/page_cache /var/www/html/magento/var/tmp /var/www/html/magento/var/export /var/www/html/magento/var/import /var/www/html/magento/pub/media',
   ]);
-  await runCommand('docker', [
-    'exec',
-    '--user',
-    'root',
-    webContainerId,
-    'sh',
-    '-c',
-    'mkdir -p /var/www/html/magento/var/log /var/www/html/magento/var/report /var/www/html/magento/var/session /var/www/html/magento/var/cache /var/www/html/magento/var/page_cache /var/www/html/magento/var/tmp /var/www/html/magento/var/export /var/www/html/magento/var/import /var/www/html/magento/pub/media && chmod -R 0777 /var/www/html/magento/var/log /var/www/html/magento/var/report /var/www/html/magento/var/session /var/www/html/magento/var/cache /var/www/html/magento/var/page_cache /var/www/html/magento/var/tmp /var/www/html/magento/var/export /var/www/html/magento/var/import /var/www/html/magento/pub/media',
-  ]);
+  if (!webContainerId) {
+    log('php-fpm container not on manager; skipping write path setup');
+  } else {
+    await runCommand('docker', [
+      'exec',
+      '--user',
+      'root',
+      webContainerId,
+      'sh',
+      '-c',
+      'mkdir -p /var/www/html/magento/var/log /var/www/html/magento/var/report /var/www/html/magento/var/session /var/www/html/magento/var/cache /var/www/html/magento/var/page_cache /var/www/html/magento/var/tmp /var/www/html/magento/var/export /var/www/html/magento/var/import /var/www/html/magento/pub/media && chmod -R 0777 /var/www/html/magento/var/log /var/www/html/magento/var/report /var/www/html/magento/var/session /var/www/html/magento/var/cache /var/www/html/magento/var/page_cache /var/www/html/magento/var/tmp /var/www/html/magento/var/export /var/www/html/magento/var/import /var/www/html/magento/pub/media',
+    ]).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`php-fpm write path setup skipped: ${message}`);
+    });
+  }
   let upgradeWarning = false;
   await setOpensearchSystemConfig(
     dbContainerId,
