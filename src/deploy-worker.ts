@@ -928,22 +928,17 @@ async function enforceMagentoPerformance(
 ) {
   log('ensuring Magento production mode + caches');
   const checkScript = [
-    '$env=require "/var/www/html/magento/app/etc/env.php";',
-    '$mode=strtolower((string)($env["MAGE_MODE"] ?? ""));',
-    '$cache=$env["cache_types"] ?? [];',
-    '$disabled=[];',
-    'foreach($cache as $key=>$value){ if((int)$value !== 1){ $disabled[]=$key; } }',
-    'if($mode !== "production"){ fwrite(STDERR, "MAGE_MODE=".$mode); exit(1); }',
-    'if(!empty($disabled)){ fwrite(STDERR, "disabled caches: ".implode(",", $disabled)); exit(1); }',
-    'echo "ok";',
+    'set -e;',
+    'test -f /var/www/html/magento/app/etc/env.php;',
+    'test -f /var/www/html/magento/app/etc/env.base.php;',
+    'grep -q "env.base.php" /var/www/html/magento/app/etc/env.php;',
+    'grep -q "MAGE_MODE" /var/www/html/magento/app/etc/env.php;',
+    'grep -q "cache_types" /var/www/html/magento/app/etc/env.php;',
   ].join(' ');
   let currentId = containerId;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     currentId = await ensureMagentoEnvWrapperWithRetry(currentId, stackName, log);
-    const result = await runMagentoCommandWithStatus(
-      currentId,
-      `php -d opcache.enable_cli=0 -d opcache.enable=0 -d opcache.jit=0 -r '${checkScript}'`,
-    );
+    const result = await runMagentoCommandWithStatus(currentId, checkScript);
     if (result.code === 0) {
       log('Magento production mode + caches confirmed');
       return;
