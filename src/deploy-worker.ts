@@ -237,6 +237,28 @@ async function runCommandCapture(command: string, args: string[], options: { cwd
   });
 }
 
+async function runCommandCaptureWithStatus(
+  command: string,
+  args: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+) {
+  return await new Promise<{ stdout: string; stderr: string; code: number }>((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      resolve({ stdout, stderr, code: typeof code === 'number' ? code : 0 });
+    });
+  });
+}
+
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -876,6 +898,15 @@ async function runMagentoCommandCapture(
   return await runCommandCapture('docker', ['exec', ...envArgs, containerId, 'sh', '-c', command]);
 }
 
+async function runMagentoCommandWithStatus(
+  containerId: string,
+  command: string,
+  env: Record<string, string> = MAGENTO_DB_OVERRIDE_ENV,
+) {
+  const envArgs = buildDockerEnvArgs(env);
+  return await runCommandCaptureWithStatus('docker', ['exec', ...envArgs, containerId, 'sh', '-c', command]);
+}
+
 function parseMagentoMode(output: string) {
   const match = output.match(/Current application mode:\s*([a-z]+)/i);
   return match ? match[1].toLowerCase() : null;
@@ -930,13 +961,23 @@ async function runSetupUpgradeWithRetry(
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
       await ensureMagentoEnvWrapper(adminContainerId);
-      await runMagentoCommandCapture(adminContainerId, 'php bin/magento setup:upgrade --keep-generated');
-      return { warning: false };
+      const result = await runMagentoCommandWithStatus(
+        adminContainerId,
+        'php bin/magento setup:upgrade --keep-generated',
+      );
+      if (result.code === 0) {
+        return { warning: false };
+      }
+      const output = (result.stderr || result.stdout || '').trim();
+      if (result.code === 137) {
+        return { warning: true, message: 'setup:upgrade killed (OOM); continuing deploy' };
+      }
+      if (output && output.includes('OpenSearch') && output.includes('default website')) {
+        return { warning: true, message: output };
+      }
+      throw new Error(`setup:upgrade failed (exit ${result.code}): ${output}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (message.includes('OpenSearch') && message.includes('default website')) {
-        return { warning: true, message };
-      }
       if (
         message.includes('Connection refused')
         || message.includes('is not running')
