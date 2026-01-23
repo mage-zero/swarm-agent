@@ -215,6 +215,22 @@ function generateSecretHex(bytes: number) {
   return crypto.randomBytes(bytes).toString('hex');
 }
 
+function assertRequiredEnv(env: NodeJS.ProcessEnv, keys: string[]) {
+  const missing = keys.filter((key) => !env[key]);
+  if (missing.length) {
+    throw new Error(`Missing required environment values: ${missing.join(', ')}`);
+  }
+}
+
+function assertNoLatestImages(stackConfig: string) {
+  const latestLines = stackConfig
+    .split('\n')
+    .filter((line) => line.trim().startsWith('image:') && line.includes(':latest'));
+  if (latestLines.length) {
+    throw new Error(`Stack config resolved to :latest images: ${latestLines.join(' | ')}`);
+  }
+}
+
 async function ensureDockerSecret(secretName: string, value: string, workDir: string) {
   if (!value) {
     throw new Error(`Missing secret value for ${secretName}`);
@@ -856,6 +872,24 @@ async function processDeployment(recordPath: string) {
     MZ_OPENSEARCH_PORT: opensearchPort,
     MZ_OPENSEARCH_TIMEOUT: opensearchTimeout,
   };
+  assertRequiredEnv(envVars, [
+    'MAGE_VERSION',
+    'VARNISH_VERSION',
+    'MARIADB_VERSION',
+    'PROXYSQL_VERSION',
+    'OPENSEARCH_VERSION',
+    'REDIS_VERSION',
+    'RABBITMQ_VERSION',
+    'PHP_VERSION',
+    'NGINX_VERSION',
+  ]);
+  const renderedStack = await runCommandCapture('docker', [
+    'stack',
+    'config',
+    '-c',
+    path.join(CLOUD_SWARM_DIR, 'stacks/magento.yml'),
+  ], { env: envVars });
+  assertNoLatestImages(renderedStack.stdout);
 
   const secrets = envRecord?.environment_secrets ?? null;
   const envHostname = String(envRecord?.environment_hostname || envRecord?.hostname || '').trim();
