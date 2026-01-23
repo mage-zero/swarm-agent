@@ -157,15 +157,6 @@ function readAgentVersion(): string {
     return cachedAgentVersion;
   }
   try {
-    const legacy = fs.readFileSync(path.join(NODE_DIR, 'version'), 'utf8').trim();
-    if (legacy) {
-      cachedAgentVersion = legacy;
-      return cachedAgentVersion;
-    }
-  } catch {
-    // ignore missing legacy file
-  }
-  try {
     const fileVersion = fs.readFileSync(VERSION_PATH, 'utf8').trim();
     if (fileVersion) {
       cachedAgentVersion = fileVersion;
