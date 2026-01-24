@@ -959,7 +959,7 @@ async function ensureMagentoEnvWrapper(containerId: string) {
     '    cp /var/www/html/magento/app/etc/env.php /var/www/html/magento/app/etc/env.base.php;',
     '  elif ! grep -q "env.base.php" /var/www/html/magento/app/etc/env.php; then',
     '    cp /var/www/html/magento/app/etc/env.php /var/www/html/magento/app/etc/env.base.php;',
-    '  fi',
+    '  fi;',
     '  cp /usr/local/share/mz-env.php /var/www/html/magento/app/etc/env.php;',
     '  chown www-data:www-data /var/www/html/magento/app/etc/env.php /var/www/html/magento/app/etc/env.base.php;',
     'fi',
