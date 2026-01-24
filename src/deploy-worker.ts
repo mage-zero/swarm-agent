@@ -964,7 +964,11 @@ async function ensureMagentoEnvWrapper(containerId: string) {
     '  chown www-data:www-data /var/www/html/magento/app/etc/env.php /var/www/html/magento/app/etc/env.base.php;',
     'fi',
   ].join(' ');
-  await runCommand('docker', ['exec', containerId, 'sh', '-c', command]);
+  const result = await runCommandCaptureWithStatus('docker', ['exec', '--user', 'root', containerId, 'sh', '-c', command]);
+  if (result.code !== 0) {
+    const output = (result.stderr || result.stdout || '').trim();
+    throw new Error(`env.php wrapper failed (exit ${result.code}): ${output || 'unknown error'}`);
+  }
 }
 
 async function ensureMagentoEnvWrapperWithRetry(
