@@ -138,6 +138,44 @@ type PlannerPayload = {
   recommendations: PlannerRecommendation[];
 };
 
+type ServiceHealthCounts = {
+  healthy: number;
+  unhealthy: number;
+  starting: number;
+  none: number;
+};
+
+type ServiceStateCounts = {
+  running: number;
+  pending: number;
+  failed: number;
+  rejected: number;
+  shutdown: number;
+};
+
+type ServiceStatus = {
+  id?: string;
+  name?: string;
+  service?: string;
+  environment_id?: number;
+  mode?: string;
+  desired_replicas: number;
+  running_replicas: number;
+  health: ServiceHealthCounts;
+  state_counts: ServiceStateCounts;
+  nodes: Array<{ id?: string; hostname?: string }>;
+  restart_count: number;
+  last_error?: string;
+  last_error_at?: string;
+  status: 'healthy' | 'degraded' | 'down' | 'unknown';
+};
+
+type ServiceStatusPayload = {
+  generated_at: string;
+  control_available: boolean;
+  services: ServiceStatus[];
+};
+
 type LocalSwarmInfo = {
   localNodeState?: string;
   controlAvailable?: boolean;
@@ -485,6 +523,7 @@ export async function buildStatusPayload(
   wantsJson: boolean,
   includeCapacity = false,
   includePlanner = false,
+  includeServices = false,
 ) {
   const config = readConfig();
   const localSwarm = await getLocalSwarmInfo();
@@ -501,6 +540,7 @@ export async function buildStatusPayload(
 
   const capacity = includeCapacity ? await buildCapacityPayload() : null;
   const planner = includePlanner ? await buildPlannerPayload() : null;
+  const services = includeServices ? await buildServiceStatusPayload() : null;
 
   let nodeStatus: any = null;
   if (reqHost && reqHost !== config.stack_domain) {
@@ -520,6 +560,9 @@ export async function buildStatusPayload(
   }
   if (planner) {
     (payload as Record<string, unknown>).planner = planner;
+  }
+  if (services) {
+    (payload as Record<string, unknown>).services = services;
   }
 
   if (wantsJson) {
@@ -656,6 +699,151 @@ export async function buildCapacityPayload() {
     nodes,
     services: serviceSummaries,
     totals,
+  };
+}
+
+function parseEnvironmentServiceName(name: string) {
+  const match = name.match(/^mz-env-(\d+)_(.+)$/i);
+  if (!match) {
+    return { service: name };
+  }
+  return {
+    environmentId: Number.parseInt(match[1], 10),
+    service: match[2],
+  };
+}
+
+export async function buildServiceStatusPayload(environmentId?: number): Promise<ServiceStatusPayload> {
+  const localSwarm = await getLocalSwarmInfo();
+  const swarmNodes = await getSwarmNodes(localSwarm.controlAvailable);
+  const tasks = await getSwarmTasks(localSwarm.controlAvailable);
+  const services = await getSwarmServices(localSwarm.controlAvailable);
+
+  const readyNodes = swarmNodes.filter(
+    (node) => node?.Status?.State === 'ready' && node?.Spec?.Availability === 'active',
+  );
+  const nodeLookup = new Map(
+    swarmNodes
+      .map((node) => [node?.ID, node] as const)
+      .filter((entry) => Boolean(entry[0])),
+  );
+
+  const servicesStatus: ServiceStatus[] = [];
+  for (const service of services) {
+    const name = String(service?.Spec?.Name || '');
+    if (!name) {
+      continue;
+    }
+    const parsed = parseEnvironmentServiceName(name);
+    if (environmentId && parsed.environmentId !== environmentId) {
+      continue;
+    }
+
+    const mode = service?.Spec?.Mode?.Replicated ? 'replicated' : 'global';
+    const desiredReplicas = mode === 'replicated'
+      ? Number(service?.Spec?.Mode?.Replicated?.Replicas || 0)
+      : readyNodes.length;
+
+    const stateCounts: ServiceStateCounts = {
+      running: 0,
+      pending: 0,
+      failed: 0,
+      rejected: 0,
+      shutdown: 0,
+    };
+    const healthCounts: ServiceHealthCounts = {
+      healthy: 0,
+      unhealthy: 0,
+      starting: 0,
+      none: 0,
+    };
+    let runningReplicas = 0;
+    let restartCount = 0;
+    let lastError = '';
+    let lastErrorAt = '';
+    let lastErrorTime = 0;
+
+    const nodeNames = new Map<string, string>();
+    const serviceTasks = tasks.filter(
+      (task) => task?.ServiceID === service?.ID && task?.DesiredState === 'running',
+    );
+    for (const task of serviceTasks) {
+      const state = String(task?.Status?.State || '').toLowerCase();
+      if (state && state in stateCounts) {
+        stateCounts[state as keyof ServiceStateCounts] += 1;
+      }
+
+      if (task?.DesiredState === 'running' && task?.Status?.State === 'running') {
+        runningReplicas += 1;
+        const nodeId = task?.NodeID;
+        if (nodeId) {
+          const node = nodeLookup.get(nodeId);
+          nodeNames.set(nodeId, node?.Description?.Hostname || nodeId);
+        }
+      }
+
+      const health = String(task?.Status?.ContainerStatus?.Health?.Status || '').toLowerCase();
+      if (health === 'healthy') {
+        healthCounts.healthy += 1;
+      } else if (health === 'unhealthy') {
+        healthCounts.unhealthy += 1;
+      } else if (health === 'starting') {
+        healthCounts.starting += 1;
+      } else {
+        healthCounts.none += 1;
+      }
+
+      const restarts = Number(task?.Status?.ContainerStatus?.RestartCount || 0);
+      restartCount += Number.isFinite(restarts) ? restarts : 0;
+
+      const errorMessage = String(task?.Status?.Err || task?.Status?.Message || '').trim();
+      if (errorMessage) {
+        const timestamp = String(task?.Status?.Timestamp || '');
+        const timeValue = timestamp ? Date.parse(timestamp) : 0;
+        if (timeValue >= lastErrorTime) {
+          lastErrorTime = timeValue;
+          lastError = errorMessage;
+          lastErrorAt = timestamp;
+        }
+      }
+    }
+
+    const hasIssues = healthCounts.unhealthy > 0 || stateCounts.failed > 0 || stateCounts.rejected > 0;
+    let status: ServiceStatus['status'] = 'unknown';
+    if (desiredReplicas > 0) {
+      if (runningReplicas >= desiredReplicas && !hasIssues) {
+        status = 'healthy';
+      } else if (runningReplicas > 0) {
+        status = 'degraded';
+      } else {
+        status = 'down';
+      }
+    }
+
+    servicesStatus.push({
+      id: service?.ID,
+      name,
+      service: parsed.service,
+      environment_id: parsed.environmentId,
+      mode,
+      desired_replicas: desiredReplicas,
+      running_replicas: runningReplicas,
+      health: healthCounts,
+      state_counts: stateCounts,
+      nodes: Array.from(nodeNames.entries()).map(([id, hostname]) => ({ id, hostname })),
+      restart_count: restartCount,
+      last_error: lastError || undefined,
+      last_error_at: lastErrorAt || undefined,
+      status,
+    });
+  }
+
+  servicesStatus.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+  return {
+    generated_at: new Date().toISOString(),
+    control_available: Boolean(localSwarm.controlAvailable),
+    services: servicesStatus,
   };
 }
 

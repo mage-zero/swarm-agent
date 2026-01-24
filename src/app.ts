@@ -1,7 +1,13 @@
 import { Hono } from 'hono';
 import { getHealthStatus } from './health.js';
 import { handleDeployArtifact, handleDeployKey, handleR2Presign } from './deploy.js';
-import { buildCapacityPayload, buildPlannerPayload, buildStatusPayload, handleJoinTokenRequest } from './status.js';
+import {
+  buildCapacityPayload,
+  buildPlannerPayload,
+  buildServiceStatusPayload,
+  buildStatusPayload,
+  handleJoinTokenRequest,
+} from './status.js';
 
 export const createApp = () => {
   const app = new Hono();
@@ -39,6 +45,12 @@ export const createApp = () => {
     return c.json(payload);
   });
 
+  app.get('/v1/services', async (c) => {
+    const environmentId = Number(c.req.query('environment_id') || 0);
+    const payload = await buildServiceStatusPayload(environmentId || undefined);
+    return c.json(payload);
+  });
+
   app.get('/', async (c) => {
     const host = (c.req.header('host') || '').split(':')[0];
     const wantsJson =
@@ -47,7 +59,14 @@ export const createApp = () => {
     const includes = (c.req.query('include') || '').split(',');
     const includeCapacity = includes.includes('capacity');
     const includePlanner = includes.includes('planner');
-    const result = await buildStatusPayload(host, wantsJson, includeCapacity, includePlanner);
+    const includeServices = includes.includes('services');
+    const result = await buildStatusPayload(
+      host,
+      wantsJson,
+      includeCapacity,
+      includePlanner,
+      includeServices,
+    );
     return result.type === 'json' ? c.json(result.payload) : c.html(result.payload);
   });
 
