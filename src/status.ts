@@ -163,7 +163,7 @@ type ServiceStatus = {
   running_replicas: number;
   health: ServiceHealthCounts;
   state_counts: ServiceStateCounts;
-  nodes: Array<{ id?: string; hostname?: string }>;
+  nodes: Array<{ id?: string; hostname?: string; count: number }>;
   restart_count: number;
   last_error?: string;
   last_error_at?: string;
@@ -763,7 +763,7 @@ export async function buildServiceStatusPayload(environmentId?: number): Promise
     let lastErrorAt = '';
     let lastErrorTime = 0;
 
-    const nodeNames = new Map<string, string>();
+    const nodeCounts = new Map<string, { hostname: string; count: number }>();
     const serviceTasks = tasks.filter(
       (task) => task?.ServiceID === service?.ID && task?.DesiredState === 'running',
     );
@@ -773,13 +773,20 @@ export async function buildServiceStatusPayload(environmentId?: number): Promise
         stateCounts[state as keyof ServiceStateCounts] += 1;
       }
 
+      const nodeId = task?.NodeID;
+      if (nodeId) {
+        const node = nodeLookup.get(nodeId);
+        const hostname = node?.Description?.Hostname || nodeId;
+        const existing = nodeCounts.get(nodeId);
+        if (existing) {
+          existing.count += 1;
+        } else {
+          nodeCounts.set(nodeId, { hostname, count: 1 });
+        }
+      }
+
       if (task?.DesiredState === 'running' && task?.Status?.State === 'running') {
         runningReplicas += 1;
-        const nodeId = task?.NodeID;
-        if (nodeId) {
-          const node = nodeLookup.get(nodeId);
-          nodeNames.set(nodeId, node?.Description?.Hostname || nodeId);
-        }
       }
 
       const health = String(task?.Status?.ContainerStatus?.Health?.Status || '').toLowerCase();
@@ -830,7 +837,11 @@ export async function buildServiceStatusPayload(environmentId?: number): Promise
       running_replicas: runningReplicas,
       health: healthCounts,
       state_counts: stateCounts,
-      nodes: Array.from(nodeNames.entries()).map(([id, hostname]) => ({ id, hostname })),
+      nodes: Array.from(nodeCounts.entries()).map(([id, entry]) => ({
+        id,
+        hostname: entry.hostname,
+        count: entry.count,
+      })),
       restart_count: restartCount,
       last_error: lastError || undefined,
       last_error_at: lastErrorAt || undefined,
