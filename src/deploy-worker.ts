@@ -77,6 +77,7 @@ type PlannerResources = Record<string, PlannerResourceSpec>;
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/deployments';
 const DEPLOY_WORK_DIR = process.env.MZ_DEPLOY_WORK_DIR || '/opt/mage-zero/deployments/work';
+const SHUTDOWN_GRACE_MS = Number(process.env.MZ_SHUTDOWN_GRACE_MS || 10 * 60 * 1000);
 const CLOUD_SWARM_DIR = process.env.MZ_CLOUD_SWARM_DIR || '/opt/mage-zero/cloud-swarm';
 const CLOUD_SWARM_REPO = process.env.MZ_CLOUD_SWARM_REPO || 'git@github.com:mage-zero/cloud-swarm.git';
 const CLOUD_SWARM_KEY_PATH = process.env.MZ_CLOUD_SWARM_KEY_PATH || '/opt/mage-zero/keys/cloud-swarm-deploy';
@@ -106,6 +107,25 @@ const RESOURCE_ENV_MAP = [
 
 let processing = false;
 let currentDeploymentPath: string | null = null;
+let shutdownRequested = false;
+let shutdownTimer: NodeJS.Timeout | null = null;
+let processingWaiters: Array<() => void> = [];
+
+function waitForProcessingDone() {
+  if (!processing) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    processingWaiters.push(resolve);
+  });
+}
+
+function notifyProcessingDone() {
+  for (const resolve of processingWaiters) {
+    resolve();
+  }
+  processingWaiters = [];
+}
 
 function getProcessingDir() {
   return path.join(DEPLOY_QUEUE_DIR, 'processing');
@@ -188,6 +208,29 @@ function requeueCurrentDeployment() {
   } catch {
     // best effort; recoverProcessingQueue will retry on next boot
   }
+}
+
+async function initiateShutdown(signal: string) {
+  if (shutdownRequested) {
+    return;
+  }
+  shutdownRequested = true;
+  console.warn(`shutdown requested (${signal}); draining deploy worker`);
+  if (!processing) {
+    process.exit(0);
+    return;
+  }
+  shutdownTimer = setTimeout(() => {
+    console.warn('shutdown timeout reached; requeueing active deployment');
+    requeueCurrentDeployment();
+    process.exit(0);
+  }, Number.isFinite(SHUTDOWN_GRACE_MS) && SHUTDOWN_GRACE_MS > 0 ? SHUTDOWN_GRACE_MS : 0);
+  await waitForProcessingDone();
+  if (shutdownTimer) {
+    clearTimeout(shutdownTimer);
+    shutdownTimer = null;
+  }
+  process.exit(0);
 }
 
 async function runCommand(command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) {
@@ -1426,6 +1469,9 @@ async function tick() {
   if (processing) {
     return;
   }
+  if (shutdownRequested) {
+    return;
+  }
   if (!(await isSwarmManager())) {
     return;
   }
@@ -1440,6 +1486,7 @@ async function tick() {
   } finally {
     processing = false;
     currentDeploymentPath = null;
+    notifyProcessingDone();
   }
 }
 
@@ -1451,12 +1498,10 @@ export function startDeploymentWorker() {
   ensureDir(DEPLOY_WORK_DIR);
   recoverProcessingQueue();
   process.on('SIGTERM', () => {
-    requeueCurrentDeployment();
-    process.exit(0);
+    void initiateShutdown('SIGTERM');
   });
   process.on('SIGINT', () => {
-    requeueCurrentDeployment();
-    process.exit(0);
+    void initiateShutdown('SIGINT');
   });
   void tick();
   setInterval(() => {
