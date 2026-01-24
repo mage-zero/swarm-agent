@@ -55,6 +55,7 @@ type EnvironmentRecord = {
   stack_id?: number;
   hostname?: string;
   environment_hostname?: string;
+  environment_type?: string;
   db_backup_bucket?: string;
   db_backup_object?: string;
   application_selections?: ApplicationSelections;
@@ -1203,13 +1204,19 @@ async function processDeployment(recordPath: string) {
 
   const replicaUser = 'replica';
   let replicaHost = 'database';
+  let replicaEnabled = false;
+  const envTypeRaw = String(envRecord?.environment_type || '').trim().toLowerCase();
+  const envEligible = envTypeRaw === ''
+    ? true
+    : ['production', 'performance', 'staging'].includes(envTypeRaw);
   try {
     const capacity = await buildCapacityPayload();
     const readyNodes = (capacity.nodes || []).filter(
       (node) => node.status === 'ready' && node.availability === 'active',
     );
     const hasReplicaLabel = readyNodes.some((node) => node.labels?.database_replica === 'true');
-    if (hasReplicaLabel && readyNodes.length > 1) {
+    replicaEnabled = envEligible && hasReplicaLabel && readyNodes.length > 1;
+    if (replicaEnabled) {
       replicaHost = 'database-replica';
     }
   } catch (error) {
@@ -1236,6 +1243,7 @@ async function processDeployment(recordPath: string) {
     MZ_PROXYSQL_DB_PORT: '3306',
     MZ_MARIADB_MASTER_HOST: 'database',
     MZ_REPLICATION_USER: replicaUser,
+    MZ_DATABASE_REPLICA_REPLICAS: replicaEnabled ? '1' : '0',
     MZ_SEARCH_ENGINE: searchEngine,
     MZ_OPENSEARCH_HOST: opensearchHost,
     MZ_OPENSEARCH_PORT: opensearchPort,
