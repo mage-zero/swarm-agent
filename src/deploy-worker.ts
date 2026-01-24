@@ -825,15 +825,37 @@ async function configureReplica(containerId: string, masterHost: string, replica
   ]);
 }
 
-async function setSearchEngine(containerId: string, dbName: string, engine: string) {
+async function runDatabaseCommandWithRetry(
+  stackName: string,
+  containerId: string,
+  command: string,
+  timeoutMs = 60 * 1000
+): Promise<string> {
+  try {
+    await runCommand('docker', ['exec', containerId, 'sh', '-c', command]);
+    return containerId;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`db command failed on ${containerId}: ${message}`);
+  }
+
+  const refreshedId = await waitForContainer(stackName, 'database', timeoutMs);
+  if (refreshedId !== containerId) {
+    await waitForDatabase(refreshedId, timeoutMs);
+  }
+  await runCommand('docker', ['exec', refreshedId, 'sh', '-c', command]);
+  return refreshedId;
+}
+
+async function setSearchEngine(
+  stackName: string,
+  containerId: string,
+  dbName: string,
+  engine: string
+): Promise<string> {
   const safeDbName = dbName.replace(/`/g, '``');
-  await runCommand('docker', [
-    'exec',
-    containerId,
-    'sh',
-    '-c',
-    `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -D ${safeDbName} -e "INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/engine', '${engine}') ON DUPLICATE KEY UPDATE value=VALUES(value);"`,
-  ]);
+  const command = `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -D ${safeDbName} -e "INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/engine', '${engine}') ON DUPLICATE KEY UPDATE value=VALUES(value);"`;
+  return runDatabaseCommandWithRetry(stackName, containerId, command);
 }
 
 function escapeSqlValue(value: string): string {
@@ -1314,7 +1336,7 @@ async function processDeployment(recordPath: string) {
   ], { env: envVars, logDir, label: 'stack-deploy' });
   log('stack deployed');
 
-  const dbContainerId = await waitForContainer(stackName, 'database', 5 * 60 * 1000);
+  let dbContainerId = await waitForContainer(stackName, 'database', 5 * 60 * 1000);
   await waitForDatabase(dbContainerId, 5 * 60 * 1000);
 
   const dbName = envVars.MYSQL_DATABASE || 'magento';
@@ -1412,7 +1434,7 @@ async function processDeployment(recordPath: string) {
     opensearchPort,
     opensearchTimeout
   );
-  await setSearchEngine(dbContainerId, envVars.MYSQL_DATABASE || 'magento', 'mysql');
+  dbContainerId = await setSearchEngine(stackName, dbContainerId, envVars.MYSQL_DATABASE || 'magento', 'mysql');
   await waitForProxySql(adminContainerId, 5 * 60 * 1000);
   await waitForRedisCache(adminContainerId, 5 * 60 * 1000);
   adminContainerId = await ensureMagentoEnvWrapperWithRetry(adminContainerId, stackName, log);
@@ -1425,7 +1447,7 @@ async function processDeployment(recordPath: string) {
   } catch (error) {
     throw error;
   } finally {
-    await setSearchEngine(dbContainerId, envVars.MYSQL_DATABASE || 'magento', searchEngine);
+    dbContainerId = await setSearchEngine(stackName, dbContainerId, envVars.MYSQL_DATABASE || 'magento', searchEngine);
   }
   if (!upgradeWarning) {
     await setFullPageCacheConfig(
