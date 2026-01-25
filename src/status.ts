@@ -15,6 +15,7 @@ import type {
 import {
   applyAiAdjustments,
   buildCandidateProfile,
+  buildTuningPayloadFromStorage,
   buildTuningProfiles,
   cloneTuningProfile,
   createBaseProfile,
@@ -1602,7 +1603,7 @@ function aggregateInspectionHistory(
 }
 
 async function buildInspectionForTuning(): Promise<PlannerInspectionPayload> {
-  const latest = await buildInspectionPayload();
+  const now = new Date().toISOString();
   const nowMs = Date.now();
   const history = pruneInspectionHistory(readInspectionHistory(), nowMs);
   const windowEntries = history.filter((entry) => {
@@ -1612,15 +1613,21 @@ async function buildInspectionForTuning(): Promise<PlannerInspectionPayload> {
     }
     return nowMs - capturedAt <= TUNING_INTERVAL_MS;
   });
-  const samples = [
-    ...windowEntries,
-    { captured_at: latest.generated_at, inspection: latest },
-  ];
-  const aggregated = samples.length > 1
-    ? aggregateInspectionHistory(samples, latest)
-    : latest;
+  if (windowEntries.length === 0) {
+    return {
+      generated_at: now,
+      services: [],
+      window_minutes: Math.round(TUNING_INTERVAL_MS / 60000),
+      sample_count: 0,
+    };
+  }
+  const latestEntry = windowEntries[windowEntries.length - 1];
+  const latestInspection = latestEntry?.inspection || { generated_at: now, services: [] };
+  const aggregated = windowEntries.length > 1
+    ? aggregateInspectionHistory(windowEntries, latestInspection)
+    : latestInspection;
   aggregated.window_minutes = Math.round(TUNING_INTERVAL_MS / 60000);
-  aggregated.sample_count = samples.length;
+  aggregated.sample_count = windowEntries.length;
   return aggregated;
 }
 
@@ -1820,27 +1827,35 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
 
   const baseResources = buildPlannerResourceDefaults();
   const inspection = await buildInspectionForTuning();
-  const candidate = buildCandidateProfile(inspection, baseResources, capacity);
-  const shouldUpdateRecommendation = isRecommendationDue();
-  if (shouldUpdateRecommendation) {
-    const aiProfile = await fetchAiTuningProfile(inspection, capacity, candidate.profile.resources);
-    if (aiProfile) {
-      applyAiAdjustments(
-        aiProfile,
-        candidate.profile,
-        candidate.profile.resources,
-        baseResources,
-        inspection,
-        capacity,
-      );
+
+  let tuningResult: { payload: PlannerTuningPayload; active: PlannerTuningProfile };
+  if (!inspection.services.length || (inspection.sample_count ?? 0) === 0) {
+    warnings.push('no inspection samples available yet; recommendations pending');
+    tuningResult = buildTuningPayloadFromStorage(baseResources, inspection);
+  } else {
+    const candidate = buildCandidateProfile(inspection, baseResources, capacity);
+    const shouldUpdateRecommendation = isRecommendationDue();
+    if (shouldUpdateRecommendation) {
+      const aiProfile = await fetchAiTuningProfile(inspection, capacity, candidate.profile.resources);
+      if (aiProfile) {
+        applyAiAdjustments(
+          aiProfile,
+          candidate.profile,
+          candidate.profile.resources,
+          baseResources,
+          inspection,
+          capacity,
+        );
+      }
     }
+    tuningResult = await buildTuningProfiles(
+      candidate.profile,
+      candidate.signals,
+      baseResources,
+      inspection,
+    );
   }
-  const tuningResult = await buildTuningProfiles(
-    candidate.profile,
-    candidate.signals,
-    baseResources,
-    inspection,
-  );
+
   const resources = tuningResult.active.resources;
 
   return {

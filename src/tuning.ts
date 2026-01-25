@@ -382,6 +382,44 @@ export function isRecommendationDue(nowMs = Date.now()): boolean {
   return state.shouldUpdate;
 }
 
+export function buildTuningPayloadFromStorage(
+  baseResources: PlannerResources,
+  inspection: PlannerInspectionPayload,
+): { payload: PlannerTuningPayload; active: PlannerTuningProfile } {
+  const now = new Date().toISOString();
+  const nowMs = Date.now();
+  const stored = loadTuningProfiles();
+  const baseProfile = stored?.base || createBaseProfile(baseResources, now);
+  baseProfile.resources = clonePlannerResources(baseResources);
+  baseProfile.updated_at = now;
+
+  let recommendedProfile = stored?.recommended;
+  if (recommendedProfile && !isProfileFresh(recommendedProfile, nowMs)) {
+    recommendedProfile = undefined;
+  }
+
+  const approvedProfiles = pruneApprovedProfiles(stored?.approved || [], nowMs);
+  const activeProfile = selectActiveProfile(baseProfile, approvedProfiles);
+
+  const payload: PlannerTuningPayload = {
+    generated_at: inspection.generated_at,
+    services: [],
+    base_profile: baseProfile,
+    recommended_profile: recommendedProfile,
+    approved_profiles: approvedProfiles,
+    active_profile_id: activeProfile.id,
+  };
+
+  saveTuningProfiles({
+    base: baseProfile,
+    recommended: recommendedProfile,
+    approved: approvedProfiles,
+    last_recommended_at: stored?.last_recommended_at,
+  });
+
+  return { payload, active: activeProfile };
+}
+
 export function buildPlacementHints(
   inspection: PlannerInspectionPayload,
   resources: PlannerResources,
