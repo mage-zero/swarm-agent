@@ -1946,6 +1946,182 @@ export async function handleTuningApprovalRequest(request: Request) {
   } as const;
 }
 
+type NodeRemovalRequest = {
+  node_id?: number;
+  hostname?: string;
+  drain_timeout_sec?: number;
+  force?: boolean;
+};
+
+function findSwarmNode(nodes: any[], nodeId: number, hostname: string): any | null {
+  if (!nodes.length) {
+    return null;
+  }
+  const normalizedHost = hostname.trim().toLowerCase();
+  const matched = nodes.find((node) => {
+    const labels = (node?.Spec?.Labels || {}) as Record<string, string>;
+    const labelId = labels['mz.node_id'] || '';
+    const labelHost = labels['mz.node_hostname'] || '';
+    const nodeHost = String(node?.Description?.Hostname || node?.Spec?.Name || '').trim();
+    const nodeIdMatch = nodeId ? labelId === String(nodeId) : false;
+    const hostMatch = normalizedHost !== '' && (
+      nodeHost.toLowerCase() === normalizedHost || labelHost.toLowerCase() === normalizedHost
+    );
+    return nodeIdMatch || hostMatch;
+  });
+  return matched || null;
+}
+
+function findBlockingConstraints(
+  services: any[],
+  nodeId: number,
+  hostname: string
+): Array<{ service: string; constraint: string }> {
+  const matches: Array<{ service: string; constraint: string }> = [];
+  const idMatch = nodeId ? `mz.node_id==${nodeId}` : '';
+  const hostMatch = hostname ? `mz.node_hostname==${hostname}` : '';
+  const hostnameMatch = hostname ? `node.hostname==${hostname}` : '';
+
+  for (const service of services) {
+    const name = String(service?.Spec?.Name || service?.ID || '');
+    const constraints: string[] = service?.Spec?.TaskTemplate?.Placement?.Constraints || [];
+    for (const raw of constraints) {
+      const constraint = String(raw || '').trim();
+      if (!constraint) {
+        continue;
+      }
+      if (idMatch && constraint.includes(idMatch)) {
+        matches.push({ service: name, constraint });
+      } else if (hostMatch && constraint.includes(hostMatch)) {
+        matches.push({ service: name, constraint });
+      } else if (hostnameMatch && constraint.includes(hostnameMatch)) {
+        matches.push({ service: name, constraint });
+      }
+    }
+  }
+  return matches;
+}
+
+async function updateNodeAvailability(node: any, availability: string): Promise<void> {
+  const apiVersion = await getDockerApiVersion();
+  const version = node?.Version?.Index;
+  if (!version) {
+    throw new Error('Node version missing');
+  }
+  const spec = {
+    ...(node?.Spec || {}),
+    Availability: availability,
+  };
+  await dockerRequestWithOptions(`/${apiVersion}/nodes/${node.ID}/update?version=${version}`, {
+    method: 'POST',
+    body: JSON.stringify(spec),
+    headers: { 'Content-Type': 'application/json' },
+    parseJson: false,
+    timeoutMs: 10000,
+  });
+}
+
+async function removeSwarmNode(nodeId: string): Promise<void> {
+  const apiVersion = await getDockerApiVersion();
+  await dockerRequestWithOptions(`/${apiVersion}/nodes/${nodeId}?force=1`, {
+    method: 'DELETE',
+    parseJson: false,
+    timeoutMs: 10000,
+  });
+}
+
+async function waitForDrain(nodeId: string, timeoutMs: number): Promise<number> {
+  const start = Date.now();
+  let remaining = -1;
+  while (Date.now() - start < timeoutMs) {
+    const tasks = await getSwarmTasks(true);
+    const activeTasks = tasks.filter((task) => task?.NodeID === nodeId && task?.DesiredState === 'running');
+    remaining = activeTasks.length;
+    if (remaining === 0) {
+      return 0;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+  }
+  return remaining;
+}
+
+export async function handleNodeRemovalRequest(request: Request) {
+  const authorized = await validateNodeRequest(request);
+  if (!authorized) {
+    return { status: 401, body: { error: 'Unauthorized' } } as const;
+  }
+
+  if (!await isSwarmManager()) {
+    return { status: 403, body: { error: 'not_manager' } } as const;
+  }
+
+  const body = await request.json<NodeRemovalRequest>().catch(() => ({}));
+  const nodeId = Number(body?.node_id || 0);
+  const hostname = typeof body?.hostname === 'string' ? body.hostname.trim() : '';
+  if (!nodeId && !hostname) {
+    return { status: 400, body: { error: 'missing_target' } } as const;
+  }
+
+  const nodes = await getSwarmNodes(true);
+  const target = findSwarmNode(nodes, nodeId, hostname);
+  if (!target) {
+    return { status: 404, body: { error: 'node_not_found' } } as const;
+  }
+
+  const role = String(target?.Spec?.Role || '').toLowerCase();
+  if (role === 'manager') {
+    return { status: 409, body: { error: 'manager_removal_not_allowed' } } as const;
+  }
+
+  const services = await getSwarmServices(true);
+  const blockers = findBlockingConstraints(services, nodeId, hostname);
+  if (blockers.length) {
+    return {
+      status: 409,
+      body: {
+        error: 'blocked_by_constraints',
+        blockers,
+      },
+    } as const;
+  }
+
+  try {
+    await updateNodeAvailability(target, 'drain');
+  } catch (error) {
+    return {
+      status: 502,
+      body: { error: `drain_failed:${error instanceof Error ? error.message : String(error)}` },
+    } as const;
+  }
+
+  const timeoutSec = Number(body?.drain_timeout_sec || 300);
+  const remaining = await waitForDrain(target.ID, Math.max(30, timeoutSec) * 1000);
+  if (remaining > 0 && body?.force !== true) {
+    return {
+      status: 409,
+      body: { error: 'drain_timeout', remaining_tasks: remaining },
+    } as const;
+  }
+
+  try {
+    await removeSwarmNode(target.ID);
+  } catch (error) {
+    return {
+      status: 502,
+      body: { error: `remove_failed:${error instanceof Error ? error.message : String(error)}` },
+    } as const;
+  }
+
+  return {
+    status: 200,
+    body: {
+      node_id: nodeId || null,
+      hostname: hostname || target?.Description?.Hostname || '',
+      removed: true,
+    },
+  } as const;
+}
+
 export async function pushStatus() {
   const config = readConfig();
   const mzControlBaseUrl = config.mz_control_base_url || process.env.MZ_CONTROL_BASE_URL || '';

@@ -7,6 +7,7 @@ import {
   buildServiceStatusPayload,
   buildStatusPayload,
   handleJoinTokenRequest,
+  handleNodeRemovalRequest,
   handleTuningApprovalRequest,
 } from './status.js';
 import { handleMeshJoinRequest } from './mesh.js';
@@ -56,6 +57,12 @@ export const createApp = () => {
   app.post('/v1/tuning/approve', async (c) => {
     const request = c.req.raw ?? (c.req as unknown as Request);
     const result = await handleTuningApprovalRequest(request);
+    return c.json(result.body, result.status);
+  });
+
+  app.post('/v1/swarm/nodes/remove', async (c) => {
+    const request = c.req.raw ?? (c.req as unknown as Request);
+    const result = await handleNodeRemovalRequest(request);
     return c.json(result.body, result.status);
   });
 
