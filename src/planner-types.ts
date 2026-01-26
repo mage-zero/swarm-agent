@@ -98,6 +98,56 @@ export type PlannerTuningPayload = {
   active_profile_id: string;
 };
 
+export type PlannerCapacitySummary = {
+  cpu_cores: number;
+  memory_bytes: number;
+  node_count: number;
+};
+
+export type PlannerCapacityChangeSku = {
+  sku: string;
+  plan: string;
+  count: number;
+  vcpu: number;
+  ram_gb: number;
+  disk_gb?: number;
+  disk_type?: string;
+};
+
+export type PlannerCapacityChangeNodeRemoval = {
+  node_id: string;
+  hostname?: string;
+  reason: string;
+};
+
+export type PlannerCapacityChangeProfile = {
+  id: string;
+  status: 'base' | 'recommended' | 'approved';
+  strategy: string;
+  change: 'none' | 'increase' | 'decrease';
+  created_at: string;
+  updated_at: string;
+  capacity: PlannerCapacitySummary;
+  required?: {
+    cpu_cores: number;
+    memory_bytes: number;
+  };
+  target_capacity?: PlannerCapacitySummary;
+  skus?: PlannerCapacityChangeSku[];
+  remove_nodes?: PlannerCapacityChangeNodeRemoval[];
+  notes?: string[];
+  summary?: string;
+  ready?: boolean;
+};
+
+export type PlannerCapacityChangePayload = {
+  generated_at: string;
+  base_profile: PlannerCapacityChangeProfile;
+  recommended_profile?: PlannerCapacityChangeProfile;
+  approved_profiles: PlannerCapacityChangeProfile[];
+  active_profile_id: string;
+};
+
 export type CapacityNode = {
   id?: string;
   hostname?: string;

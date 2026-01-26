@@ -9,6 +9,7 @@ import {
   handleJoinTokenRequest,
   handleTuningApprovalRequest,
 } from './status.js';
+import { handleMeshJoinRequest } from './mesh.js';
 
 export const createApp = () => {
   const app = new Hono();
@@ -44,6 +45,12 @@ export const createApp = () => {
   app.get('/v1/planner', async (c) => {
     const payload = await buildPlannerPayload();
     return c.json(payload);
+  });
+
+  app.post('/v1/mesh/join', async (c) => {
+    const request = c.req.raw ?? (c.req as unknown as Request);
+    const result = await handleMeshJoinRequest(request);
+    return c.json(result.body, result.status);
   });
 
   app.post('/v1/tuning/approve', async (c) => {

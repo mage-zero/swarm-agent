@@ -4,12 +4,14 @@ import { ensureCloudSwarmDeployKey } from './deploy.js';
 import { startDeploymentWorker } from './deploy-worker.js';
 import { startEnvironmentSync } from './env-sync.js';
 import { startInspectionScheduler, startStatusReporter, startTuningScheduler } from './status.js';
+import { startMeshSyncScheduler } from './mesh.js';
 
 const port = Number(process.env.PORT ?? 8080);
 
 startStatusReporter();
 startTuningScheduler();
 startInspectionScheduler();
+startMeshSyncScheduler();
 startEnvironmentSync();
 void ensureCloudSwarmDeployKey();
 startDeploymentWorker();

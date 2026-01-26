@@ -6,12 +6,15 @@ import path from 'path';
 import type {
   CapacityNode,
   InspectionMetricValue,
+  PlannerCapacityChangePayload,
   PlannerInspectionPayload,
   PlannerInspectionService,
   PlannerResources,
   PlannerTuningPayload,
   PlannerTuningProfile,
 } from './planner-types.js';
+import { approveCapacityChangeProfile, buildCapacityChangePayload, fetchVpsCatalog } from './capacity-change.js';
+import { buildNodeHeaders, buildSignature } from './node-hmac.js';
 import {
   applyAiAdjustments,
   buildCandidateProfile,
@@ -120,10 +123,12 @@ type PlannerPayload = {
   tuning: PlannerTuningPayload;
   warnings: string[];
   recommendations: PlannerRecommendation[];
+  capacity_change: PlannerCapacityChangePayload;
 };
 
 type TuningApprovalRequest = {
   profile_id?: string;
+  profile_type?: string;
 };
 
 type InspectionHistoryEntry = {
@@ -505,7 +510,7 @@ function escapeHtml(value: string) {
     .replace(/>/g, '&gt;');
 }
 
-function readNodeFile(filename: string) {
+export function readNodeFile(filename: string) {
   try {
     return fs.readFileSync(`${NODE_DIR}/${filename}`, 'utf8').trim();
   } catch {
@@ -539,33 +544,6 @@ function readCloudInitStatus() {
   } catch {
     return null;
   }
-}
-
-function buildSignature(method: string, path: string, query: string, timestamp: string, nonce: string, body: string, secret: string) {
-  const bodyHash = crypto.createHash('sha256').update(body).digest('hex');
-  const stringToSign = [
-    method.toUpperCase(),
-    path,
-    query,
-    timestamp,
-    nonce,
-    bodyHash,
-  ].join('\n');
-
-  return crypto.createHmac('sha256', secret).update(stringToSign).digest('base64');
-}
-
-function buildNodeHeaders(method: string, path: string, query: string, body: string, nodeId: string, secret: string) {
-  const timestamp = String(Math.floor(Date.now() / 1000));
-  const nonce = crypto.randomUUID();
-  const signature = buildSignature(method, path, query, timestamp, nonce, body, secret);
-
-  return {
-    'X-MZ-Node-Id': nodeId,
-    'X-MZ-Timestamp': timestamp,
-    'X-MZ-Nonce': nonce,
-    'X-MZ-Signature': signature,
-  };
 }
 
 function timingSafeEquals(a: string, b: string): boolean {
@@ -1857,6 +1835,18 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
   }
 
   const resources = tuningResult.active.resources;
+  const planningResources = tuningResult.payload.recommended_profile?.resources || resources;
+  const config = readConfig();
+  const mzControlBaseUrl = config.mz_control_base_url || process.env.MZ_CONTROL_BASE_URL || '';
+  const nodeId = readNodeFile('node-id') || '';
+  const nodeSecret = readNodeFile('node-secret') || '';
+  const catalog = await fetchVpsCatalog(mzControlBaseUrl, String(nodeId), String(nodeSecret));
+  const capacityChange = buildCapacityChangePayload({
+    capacity,
+    inspection,
+    resources: planningResources,
+    catalog,
+  });
 
   return {
     generated_at: capacity.generated_at,
@@ -1889,6 +1879,7 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
     resources,
     inspection,
     tuning: tuningResult.payload,
+    capacity_change: capacityChange,
     warnings,
     recommendations,
   };
@@ -1904,6 +1895,10 @@ export async function handleTuningApprovalRequest(request: Request) {
   const expectedId = typeof body?.profile_id === 'string' ? body.profile_id.trim() : '';
   if (!expectedId) {
     return { status: 400, body: { error: 'Missing profile_id' } } as const;
+  }
+  const profileType = typeof body?.profile_type === 'string' ? body.profile_type.trim() : 'tuning';
+  if (profileType === 'capacity_change') {
+    return approveCapacityChangeProfile(expectedId);
   }
 
   const stored = loadTuningProfiles();
