@@ -74,7 +74,7 @@ export type PlannerTuningPlacement = {
 
 export type PlannerTuningProfile = {
   id: string;
-  status: 'base' | 'recommended' | 'approved';
+  status: 'base' | 'recommended' | 'incremental' | 'approved';
   strategy: string;
   resources: PlannerResources;
   adjustments: Record<string, PlannerTuningAdjustment>;
@@ -94,6 +94,7 @@ export type PlannerTuningPayload = {
   services: PlannerTuningService[];
   base_profile: PlannerTuningProfile;
   recommended_profile?: PlannerTuningProfile;
+  incremental_profile?: PlannerTuningProfile;
   approved_profiles: PlannerTuningProfile[];
   active_profile_id: string;
 };

@@ -3,6 +3,7 @@ import path from 'path';
 import type {
   CapacityNode,
   PlannerInspectionPayload,
+  PlannerResourceSpec,
   PlannerResources,
   PlannerTuningAdjustment,
   PlannerTuningPayload,
@@ -42,6 +43,7 @@ export const TUNING_INTERVAL_MS = Number(process.env.MZ_TUNING_INTERVAL_MS || 6 
 const TUNING_RETENTION_DAYS = Number(process.env.MZ_TUNING_RETENTION_DAYS || 365);
 const TUNING_STABLE_VARIANCE = Number(process.env.MZ_TUNING_STABLE_VARIANCE || 0.1);
 const TUNING_STABLE_STREAK_TARGET = Number(process.env.MZ_TUNING_STABLE_STREAK || 3);
+const TUNING_INCREMENTAL_FACTOR = Number(process.env.MZ_TUNING_INCREMENTAL_FACTOR || 0.5);
 
 const DEFAULT_TUNING_POLICY: ServiceTuningPolicy = {
   limit_up_threshold: 0.85,
@@ -131,6 +133,83 @@ export function cloneTuningProfile(
     sample_count: profile.sample_count,
     stability_streak: profile.stability_streak,
     summary: profile.summary,
+  };
+}
+
+function clampFactor(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0.5;
+  }
+  return Math.min(0.9, Math.max(0.1, value));
+}
+
+function blendSpec(base: PlannerResourceSpec, target: PlannerResourceSpec, factor: number): PlannerResourceSpec {
+  return {
+    limits: {
+      cpu_cores: base.limits.cpu_cores + (target.limits.cpu_cores - base.limits.cpu_cores) * factor,
+      memory_bytes: base.limits.memory_bytes + (target.limits.memory_bytes - base.limits.memory_bytes) * factor,
+    },
+    reservations: {
+      cpu_cores: base.reservations.cpu_cores + (target.reservations.cpu_cores - base.reservations.cpu_cores) * factor,
+      memory_bytes: base.reservations.memory_bytes + (target.reservations.memory_bytes - base.reservations.memory_bytes) * factor,
+    },
+  };
+}
+
+function blendResources(
+  base: PlannerResources,
+  target: PlannerResources,
+  factor: number,
+): PlannerResources {
+  const blended: PlannerResources = { services: {} };
+  const keys = new Set([...Object.keys(base.services), ...Object.keys(target.services)]);
+  for (const key of keys) {
+    const baseSpec = base.services[key];
+    const targetSpec = target.services[key];
+    if (!baseSpec && targetSpec) {
+      blended.services[key] = clonePlannerResources({ services: { [key]: targetSpec } }).services[key];
+      continue;
+    }
+    if (baseSpec && !targetSpec) {
+      blended.services[key] = clonePlannerResources({ services: { [key]: baseSpec } }).services[key];
+      continue;
+    }
+    if (!baseSpec || !targetSpec) {
+      continue;
+    }
+    blended.services[key] = blendSpec(baseSpec, targetSpec, factor);
+  }
+  return blended;
+}
+
+export function buildIncrementalProfile(
+  baseResources: PlannerResources,
+  recommended: PlannerTuningProfile,
+  now: string,
+): PlannerTuningProfile {
+  const factor = clampFactor(TUNING_INCREMENTAL_FACTOR);
+  const incrementalResources = blendResources(baseResources, recommended.resources, factor);
+  const adjustments = calculateAdjustments(baseResources, incrementalResources, 'incremental');
+  const summaryParts: string[] = [];
+  if (recommended.summary) {
+    summaryParts.push(recommended.summary);
+  }
+  summaryParts.push(`Incremental (${Math.round(factor * 100)}% of recommended)`);
+  return {
+    id: 'incremental',
+    status: 'incremental',
+    strategy: `${recommended.strategy}+incremental`,
+    resources: incrementalResources,
+    adjustments,
+    placements: recommended.placements,
+    summary: summaryParts.join(' ').trim(),
+    created_at: recommended.created_at || now,
+    updated_at: now,
+    sample_count: recommended.sample_count,
+    stability_streak: recommended.stability_streak,
+    deterministic_confidence: recommended.deterministic_confidence,
+    ai_confidence: recommended.ai_confidence,
+    confidence: recommended.confidence,
   };
 }
 
@@ -360,6 +439,9 @@ function resolveRecommendationState(stored: StoredTuningProfiles | null, nowMs: 
   if (recommendedProfile && !isProfileFresh(recommendedProfile, nowMs)) {
     recommendedProfile = undefined;
   }
+  const incrementalProfile = recommendedProfile
+    ? buildIncrementalProfile(baseResources, recommendedProfile, now)
+    : undefined;
 
   const lastRecommendedAt = stored?.last_recommended_at
     ? Date.parse(stored.last_recommended_at)
@@ -406,6 +488,7 @@ export function buildTuningPayloadFromStorage(
     services: [],
     base_profile: baseProfile,
     recommended_profile: recommendedProfile,
+    incremental_profile: incrementalProfile,
     approved_profiles: approvedProfiles,
     active_profile_id: activeProfile.id,
   };
@@ -738,6 +821,9 @@ export async function buildTuningProfiles(
   if (state.shouldUpdate) {
     recommendedProfile = buildRecommendedProfile(candidate, baseResources, recommendedProfile, now);
   }
+  const incrementalProfile = recommendedProfile
+    ? buildIncrementalProfile(baseResources, recommendedProfile, now)
+    : undefined;
 
   const approvedProfiles = pruneApprovedProfiles(stored?.approved || [], nowMs);
   const activeProfile = selectActiveProfile(baseProfile, approvedProfiles);
@@ -747,6 +833,7 @@ export async function buildTuningProfiles(
     services: signals,
     base_profile: baseProfile,
     recommended_profile: recommendedProfile,
+    incremental_profile: incrementalProfile,
     approved_profiles: approvedProfiles,
     active_profile_id: activeProfile.id,
   };

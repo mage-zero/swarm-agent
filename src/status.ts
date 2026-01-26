@@ -18,6 +18,7 @@ import { buildNodeHeaders, buildSignature } from './node-hmac.js';
 import {
   applyAiAdjustments,
   buildCandidateProfile,
+  buildIncrementalProfile,
   buildTuningPayloadFromStorage,
   buildTuningProfiles,
   cloneTuningProfile,
@@ -1907,24 +1908,33 @@ export async function handleTuningApprovalRequest(request: Request) {
     return { status: 404, body: { error: 'No recommended profile available' } } as const;
   }
 
-  if (expectedId !== recommended.id) {
+  const now = new Date().toISOString();
+  const baseProfile = stored?.base || createBaseProfile(buildPlannerResourceDefaults(), now);
+  const incremental = buildIncrementalProfile(baseProfile.resources, recommended, now);
+
+  let selected: PlannerTuningProfile | null = null;
+  if (expectedId === recommended.id) {
+    selected = recommended;
+  } else if (expectedId === incremental.id) {
+    selected = incremental;
+  }
+
+  if (!selected) {
     return {
       status: 409,
       body: {
         error: 'recommended_profile_mismatch',
         recommended_id: recommended.id,
+        incremental_id: incremental.id,
         recommended_updated_at: recommended.updated_at,
       },
     } as const;
   }
 
-  const now = new Date().toISOString();
   const approvedId = `approved-${crypto.randomUUID()}`;
-  const approvedProfile = cloneTuningProfile(recommended, 'approved', approvedId, now);
+  const approvedProfile = cloneTuningProfile(selected, 'approved', approvedId, now);
   approvedProfile.created_at = now;
   approvedProfile.updated_at = now;
-
-  const baseProfile = stored?.base || createBaseProfile(buildPlannerResourceDefaults(), now);
   const approvedProfiles = pruneApprovedProfiles(
     [...(stored?.approved || []), approvedProfile],
     Date.now(),
