@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import type {
   CapacityNode,
+  PlannerConfigChange,
   PlannerInspectionPayload,
   PlannerResourceSpec,
   PlannerResources,
@@ -11,6 +12,7 @@ import type {
   PlannerTuningProfile,
   PlannerTuningService,
 } from './planner-types.js';
+import { buildConfigChanges } from './config-advisor.js';
 
 type StoredTuningProfiles = {
   base: PlannerTuningProfile;
@@ -118,6 +120,14 @@ export function cloneTuningProfile(
     };
   }
   const placements = (profile.placements || []).map((placement) => ({ ...placement }));
+  const configChanges: PlannerConfigChange[] | undefined = profile.config_changes
+    ? profile.config_changes.map((change) => ({
+      service: change.service,
+      changes: { ...change.changes },
+      notes: change.notes ? [...change.notes] : undefined,
+      evidence: change.evidence ? { ...change.evidence } : undefined,
+    }))
+    : undefined;
   return {
     id,
     status,
@@ -133,6 +143,7 @@ export function cloneTuningProfile(
     sample_count: profile.sample_count,
     stability_streak: profile.stability_streak,
     summary: profile.summary,
+    config_changes: configChanges,
   };
 }
 
@@ -210,6 +221,7 @@ export function buildIncrementalProfile(
     deterministic_confidence: recommended.deterministic_confidence,
     ai_confidence: recommended.ai_confidence,
     confidence: recommended.confidence,
+    config_changes: recommended.config_changes,
   };
 }
 
@@ -409,6 +421,7 @@ function buildRecommendedProfile(
     deterministic_confidence: deterministicConfidence,
     ai_confidence: aiConfidence ?? undefined,
     confidence,
+    config_changes: candidate.config_changes,
   };
 }
 
@@ -787,6 +800,7 @@ export function buildCandidateProfile(
   }
 
   const placements = buildPlacementHints(inspection, tunedResources, capacity.nodes || []);
+  const configChanges = buildConfigChanges(inspection, tunedResources);
 
   const profile: PlannerTuningProfile = {
     id: `candidate-${inspection.generated_at}`,
@@ -797,6 +811,7 @@ export function buildCandidateProfile(
     placements,
     created_at: inspection.generated_at,
     updated_at: inspection.generated_at,
+    config_changes: configChanges,
   };
 
   return { profile, signals: services };

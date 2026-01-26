@@ -75,6 +75,24 @@ type PlannerResourceSpec = {
 
 type PlannerResources = Record<string, PlannerResourceSpec>;
 
+type PlannerConfigChange = {
+  service: string;
+  changes: Record<string, number | string>;
+};
+
+type PlannerTuningProfileLike = {
+  id?: string;
+  config_changes?: PlannerConfigChange[];
+};
+
+type PlannerTuningPayloadLike = {
+  active_profile_id?: string;
+  base_profile?: PlannerTuningProfileLike;
+  recommended_profile?: PlannerTuningProfileLike;
+  incremental_profile?: PlannerTuningProfileLike;
+  approved_profiles?: PlannerTuningProfileLike[];
+};
+
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/deployments';
 const DEPLOY_WORK_DIR = process.env.MZ_DEPLOY_WORK_DIR || '/opt/mage-zero/deployments/work';
@@ -399,6 +417,141 @@ function buildPlannerResourceEnv(resources: PlannerResources) {
     env[`${entry.prefix}_RESERVE_CPUS`] = formatCpuCores(resource.reservations.cpu_cores);
     env[`${entry.prefix}_RESERVE_MEMORY`] = formatMemoryBytes(resource.reservations.memory_bytes);
   }
+  return env;
+}
+
+function formatMemoryMiB(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    throw new Error(`Invalid memory bytes value: ${bytes}`);
+  }
+  return String(Math.max(1, Math.round(bytes / MIB)));
+}
+
+function resolveActiveProfile(tuning: PlannerTuningPayloadLike | null | undefined): PlannerTuningProfileLike | null {
+  if (!tuning) {
+    return null;
+  }
+  const activeId = tuning.active_profile_id;
+  const approved = Array.isArray(tuning.approved_profiles) ? tuning.approved_profiles : [];
+  if (activeId) {
+    const fromApproved = approved.find((profile) => profile?.id === activeId);
+    if (fromApproved) {
+      return fromApproved;
+    }
+    if (tuning.recommended_profile?.id === activeId) {
+      return tuning.recommended_profile;
+    }
+    if (tuning.incremental_profile?.id === activeId) {
+      return tuning.incremental_profile;
+    }
+    if (tuning.base_profile?.id === activeId) {
+      return tuning.base_profile;
+    }
+  }
+  return tuning.base_profile || approved[0] || tuning.recommended_profile || null;
+}
+
+function buildConfigEnv(configChanges: PlannerConfigChange[]): Record<string, string> {
+  const env: Record<string, string> = {};
+  const seen = new Set<string>();
+
+  const setEnv = (key: string, value: string) => {
+    if (!seen.has(key)) {
+      env[key] = value;
+      seen.add(key);
+    }
+  };
+
+  for (const change of configChanges) {
+    const service = String(change?.service || '');
+    const changes = change?.changes || {};
+    for (const [key, rawValue] of Object.entries(changes)) {
+      if (rawValue === null || rawValue === undefined) {
+        continue;
+      }
+      if (service === 'php-fpm' || service === 'php-fpm-admin') {
+        switch (key) {
+          case 'php.memory_limit':
+            if (Number(rawValue) > 0) {
+              setEnv('MZ_PHP_MEMORY_LIMIT', formatMemoryBytes(Number(rawValue)));
+            }
+            break;
+          case 'opcache.memory_consumption':
+            if (Number(rawValue) > 0) {
+              setEnv('MZ_OPCACHE_MEMORY_CONSUMPTION', formatMemoryMiB(Number(rawValue)));
+            }
+            break;
+          case 'opcache.interned_strings_buffer':
+            if (Number(rawValue) > 0) {
+              setEnv('MZ_OPCACHE_INTERNED_STRINGS_BUFFER', formatMemoryMiB(Number(rawValue)));
+            }
+            break;
+          case 'opcache.max_accelerated_files':
+            setEnv('MZ_OPCACHE_MAX_ACCELERATED_FILES', String(rawValue));
+            break;
+          case 'fpm.pm.max_children':
+            setEnv('MZ_FPM_PM_MAX_CHILDREN', String(rawValue));
+            break;
+          case 'fpm.pm.start_servers':
+            setEnv('MZ_FPM_PM_START_SERVERS', String(rawValue));
+            break;
+          case 'fpm.pm.min_spare_servers':
+            setEnv('MZ_FPM_PM_MIN_SPARE_SERVERS', String(rawValue));
+            break;
+          case 'fpm.pm.max_spare_servers':
+            setEnv('MZ_FPM_PM_MAX_SPARE_SERVERS', String(rawValue));
+            break;
+          case 'fpm.pm.max_requests':
+            setEnv('MZ_FPM_PM_MAX_REQUESTS', String(rawValue));
+            break;
+          case 'fpm.request_terminate_timeout':
+            setEnv('MZ_FPM_REQUEST_TERMINATE_TIMEOUT', String(rawValue));
+            break;
+          default:
+            break;
+        }
+      } else if (service === 'database' || service === 'database-replica') {
+        switch (key) {
+          case 'innodb_buffer_pool_size':
+            if (Number(rawValue) > 0) {
+              setEnv('MZ_DB_INNODB_BUFFER_POOL_SIZE', formatMemoryBytes(Number(rawValue)));
+            }
+            break;
+          case 'innodb_log_file_size':
+            if (Number(rawValue) > 0) {
+              setEnv('MZ_DB_INNODB_LOG_FILE_SIZE', formatMemoryBytes(Number(rawValue)));
+            }
+            break;
+          case 'max_connections':
+            setEnv('MZ_DB_MAX_CONNECTIONS', String(rawValue));
+            break;
+          case 'tmp_table_size':
+            if (Number(rawValue) > 0) {
+              setEnv('MZ_DB_TMP_TABLE_SIZE', formatMemoryBytes(Number(rawValue)));
+            }
+            break;
+          case 'max_heap_table_size':
+            if (Number(rawValue) > 0) {
+              setEnv('MZ_DB_MAX_HEAP_TABLE_SIZE', formatMemoryBytes(Number(rawValue)));
+            }
+            break;
+          case 'thread_cache_size':
+            setEnv('MZ_DB_THREAD_CACHE_SIZE', String(rawValue));
+            break;
+          case 'query_cache_size':
+            if (Number(rawValue) > 0) {
+              setEnv('MZ_DB_QUERY_CACHE_SIZE', formatMemoryBytes(Number(rawValue)));
+            } else {
+              setEnv('MZ_DB_QUERY_CACHE_SIZE', '0');
+            }
+            break;
+          default:
+            break;
+        }
+      }
+    }
+  }
+
   return env;
 }
 
@@ -1223,6 +1376,9 @@ async function processDeployment(recordPath: string) {
     throw new Error('Planner did not provide resource sizing');
   }
   const plannerResourceEnv = buildPlannerResourceEnv(plannerResources);
+  const tuningPayload = planner?.tuning as PlannerTuningPayloadLike | undefined;
+  const activeProfile = resolveActiveProfile(tuningPayload);
+  const configEnv = buildConfigEnv(activeProfile?.config_changes || []);
 
   const replicaUser = 'replica';
   let replicaHost = 'database';
@@ -1251,6 +1407,7 @@ async function processDeployment(recordPath: string) {
     ...defaultVersions,
     ...overrideVersions,
     ...plannerResourceEnv,
+    ...configEnv,
     REGISTRY_HOST: 'registry',
     REGISTRY_PUSH_HOST: '127.0.0.1',
     REGISTRY_PORT: '5000',

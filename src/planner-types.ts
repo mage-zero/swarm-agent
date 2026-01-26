@@ -64,6 +64,13 @@ export type PlannerTuningAdjustment = {
   notes?: string[];
 };
 
+export type PlannerConfigChange = {
+  service: string;
+  changes: Record<string, number | string>;
+  notes?: string[];
+  evidence?: Record<string, number | string>;
+};
+
 export type PlannerTuningPlacement = {
   name: string;
   service: string;
@@ -87,6 +94,7 @@ export type PlannerTuningProfile = {
   sample_count?: number;
   stability_streak?: number;
   summary?: string;
+  config_changes?: PlannerConfigChange[];
 };
 
 export type PlannerTuningPayload = {
