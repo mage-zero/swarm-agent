@@ -1949,25 +1949,34 @@ export async function handleTuningApprovalRequest(request: Request) {
 type NodeRemovalRequest = {
   node_id?: number;
   hostname?: string;
+  address?: string;
+  ip_address?: string;
   drain_timeout_sec?: number;
   force?: boolean;
 };
 
-function findSwarmNode(nodes: any[], nodeId: number, hostname: string): any | null {
+function findSwarmNode(nodes: any[], nodeId: number, hostname: string, address: string): any | null {
   if (!nodes.length) {
     return null;
   }
   const normalizedHost = hostname.trim().toLowerCase();
+  const normalizedAddr = address.trim();
   const matched = nodes.find((node) => {
     const labels = (node?.Spec?.Labels || {}) as Record<string, string>;
     const labelId = labels['mz.node_id'] || '';
     const labelHost = labels['mz.node_hostname'] || '';
     const nodeHost = String(node?.Description?.Hostname || node?.Spec?.Name || '').trim();
+    const nodeAddr = String(node?.Status?.Addr || '').trim();
+    const managerAddrRaw = String(node?.ManagerStatus?.Addr || '').trim();
+    const managerAddr = managerAddrRaw.split(':')[0];
     const nodeIdMatch = nodeId ? labelId === String(nodeId) : false;
     const hostMatch = normalizedHost !== '' && (
       nodeHost.toLowerCase() === normalizedHost || labelHost.toLowerCase() === normalizedHost
     );
-    return nodeIdMatch || hostMatch;
+    const addrMatch = normalizedAddr !== '' && (
+      nodeAddr === normalizedAddr || managerAddr === normalizedAddr || managerAddrRaw === normalizedAddr
+    );
+    return nodeIdMatch || hostMatch || addrMatch;
   });
   return matched || null;
 }
@@ -2058,12 +2067,17 @@ export async function handleNodeRemovalRequest(request: Request) {
   const body = await request.json<NodeRemovalRequest>().catch(() => ({}));
   const nodeId = Number(body?.node_id || 0);
   const hostname = typeof body?.hostname === 'string' ? body.hostname.trim() : '';
-  if (!nodeId && !hostname) {
+  const address = typeof body?.address === 'string'
+    ? body.address.trim()
+    : typeof body?.ip_address === 'string'
+      ? body.ip_address.trim()
+      : '';
+  if (!nodeId && !hostname && !address) {
     return { status: 400, body: { error: 'missing_target' } } as const;
   }
 
   const nodes = await getSwarmNodes(true);
-  const target = findSwarmNode(nodes, nodeId, hostname);
+  const target = findSwarmNode(nodes, nodeId, hostname, address);
   if (!target) {
     return { status: 404, body: { error: 'node_not_found' } } as const;
   }
