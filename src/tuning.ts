@@ -439,10 +439,6 @@ function resolveRecommendationState(stored: StoredTuningProfiles | null, nowMs: 
   if (recommendedProfile && !isProfileFresh(recommendedProfile, nowMs)) {
     recommendedProfile = undefined;
   }
-  const incrementalProfile = recommendedProfile
-    ? buildIncrementalProfile(baseResources, recommendedProfile, now)
-    : undefined;
-
   const lastRecommendedAt = stored?.last_recommended_at
     ? Date.parse(stored.last_recommended_at)
     : 0;
@@ -479,6 +475,9 @@ export function buildTuningPayloadFromStorage(
   if (recommendedProfile && !isProfileFresh(recommendedProfile, nowMs)) {
     recommendedProfile = undefined;
   }
+  const incrementalProfile = recommendedProfile
+    ? buildIncrementalProfile(baseResources, recommendedProfile, now)
+    : undefined;
 
   const approvedProfiles = pruneApprovedProfiles(stored?.approved || [], nowMs);
   const activeProfile = selectActiveProfile(baseProfile, approvedProfiles);
