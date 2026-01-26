@@ -1892,7 +1892,7 @@ export async function handleTuningApprovalRequest(request: Request) {
     return { status: 401, body: { error: 'Unauthorized' } } as const;
   }
 
-  const body = await request.json<TuningApprovalRequest>().catch(() => ({}));
+  const body = await request.json().catch(() => ({})) as TuningApprovalRequest;
   const expectedId = typeof body?.profile_id === 'string' ? body.profile_id.trim() : '';
   if (!expectedId) {
     return { status: 400, body: { error: 'Missing profile_id' } } as const;

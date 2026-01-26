@@ -34,10 +34,12 @@ export function buildNodeHeaders(
   const nonce = crypto.randomUUID();
   const signature = buildSignature(method, path, query, timestamp, nonce, body, secret);
 
-  return {
+  const headers: Record<string, string> = {
     'X-MZ-Node-Id': nodeId,
     'X-MZ-Timestamp': timestamp,
     'X-MZ-Nonce': nonce,
     'X-MZ-Signature': signature,
   };
+
+  return headers;
 }
