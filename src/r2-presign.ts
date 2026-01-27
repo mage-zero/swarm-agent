@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 
 export function presignS3Url(params: {
-  method: 'PUT' | 'GET';
+  method: 'PUT' | 'GET' | 'DELETE';
   endpoint: string;
   bucket: string;
   key: string;

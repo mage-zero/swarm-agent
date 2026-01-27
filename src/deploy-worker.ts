@@ -93,9 +93,27 @@ type PlannerTuningPayloadLike = {
   approved_profiles?: PlannerTuningProfileLike[];
 };
 
+type DeployHistoryEntry = {
+  artifacts: string[];
+  imageTags: string[];
+  updated_at?: string;
+};
+
+type DeployHistory = Record<string, DeployHistoryEntry>;
+
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/deployments';
 const DEPLOY_WORK_DIR = process.env.MZ_DEPLOY_WORK_DIR || '/opt/mage-zero/deployments/work';
+const DEPLOY_HISTORY_FILE = process.env.MZ_DEPLOY_HISTORY_FILE || path.join(DEPLOY_QUEUE_DIR, 'history.json');
+const DEPLOY_RETAIN_COUNT = Math.max(1, Number(process.env.MZ_DEPLOY_RETAIN_COUNT || 2));
+const DEPLOY_CLEANUP_ENABLED = (process.env.MZ_DEPLOY_CLEANUP_ENABLED || '1') !== '0';
+const REGISTRY_CLEANUP_ENABLED = (process.env.MZ_REGISTRY_CLEANUP_ENABLED || '1') !== '0';
+const REGISTRY_CLEANUP_HOST = process.env.MZ_REGISTRY_CLEANUP_HOST || process.env.REGISTRY_PUSH_HOST || '127.0.0.1';
+const REGISTRY_CLEANUP_PORT = process.env.MZ_REGISTRY_CLEANUP_PORT || process.env.REGISTRY_PORT || '5000';
+const DEPLOY_MIN_FREE_GB = Number(process.env.MZ_DEPLOY_MIN_FREE_GB || 15);
+const REGISTRY_GC_ENABLED = (process.env.MZ_REGISTRY_GC_ENABLED || '0') === '1';
+const REGISTRY_GC_SCRIPT = process.env.MZ_REGISTRY_GC_SCRIPT
+  || path.join(process.env.MZ_CLOUD_SWARM_DIR || '/opt/mage-zero/cloud-swarm', 'scripts/registry-gc.sh');
 const SHUTDOWN_GRACE_MS = Number(process.env.MZ_SHUTDOWN_GRACE_MS || 10 * 60 * 1000);
 const CLOUD_SWARM_DIR = process.env.MZ_CLOUD_SWARM_DIR || '/opt/mage-zero/cloud-swarm';
 const CLOUD_SWARM_REPO = process.env.MZ_CLOUD_SWARM_REPO || 'git@github.com:mage-zero/cloud-swarm.git';
@@ -161,6 +179,302 @@ function readNodeFile(name: string): string {
 function ensureDir(target: string) {
   if (!fs.existsSync(target)) {
     fs.mkdirSync(target, { recursive: true });
+  }
+}
+
+function inferRepositoryFromArtifactKey(artifactKey: string) {
+  const normalized = artifactKey.replace(/^\/+/, '');
+  const parts = normalized.split('/');
+  const buildsIndex = parts.indexOf('builds');
+  if (buildsIndex >= 0 && parts.length > buildsIndex + 2) {
+    return `${parts[buildsIndex + 1]}/${parts[buildsIndex + 2]}`;
+  }
+  return '';
+}
+
+function readDeploymentHistory(): DeployHistory {
+  try {
+    const raw = fs.readFileSync(DEPLOY_HISTORY_FILE, 'utf8');
+    const parsed = JSON.parse(raw) as DeployHistory;
+    return parsed || {};
+  } catch {
+    return {};
+  }
+}
+
+function writeDeploymentHistory(history: DeployHistory) {
+  ensureDir(path.dirname(DEPLOY_HISTORY_FILE));
+  fs.writeFileSync(DEPLOY_HISTORY_FILE, JSON.stringify(history, null, 2));
+}
+
+function updateDeploymentHistory(
+  history: DeployHistory,
+  key: string,
+  artifactKey: string,
+  imageTag: string
+) {
+  const existing = history[key] || { artifacts: [], imageTags: [] };
+  const artifacts = [artifactKey, ...existing.artifacts.filter((item) => item !== artifactKey)];
+  const imageTags = [imageTag, ...existing.imageTags.filter((item) => item !== imageTag)];
+  const keepArtifacts = artifacts.slice(0, DEPLOY_RETAIN_COUNT);
+  const keepImageTags = imageTags.slice(0, DEPLOY_RETAIN_COUNT);
+  const removedArtifacts = artifacts.slice(DEPLOY_RETAIN_COUNT);
+  const removedImageTags = imageTags.slice(DEPLOY_RETAIN_COUNT);
+  history[key] = {
+    artifacts: keepArtifacts,
+    imageTags: keepImageTags,
+    updated_at: new Date().toISOString(),
+  };
+  return { keepArtifacts, keepImageTags, removedArtifacts, removedImageTags };
+}
+
+function parseImageReference(reference: string) {
+  const withoutDigest = reference.split('@')[0];
+  const lastSlash = withoutDigest.lastIndexOf('/');
+  const lastColon = withoutDigest.lastIndexOf(':');
+  if (lastColon > lastSlash) {
+    return {
+      repository: withoutDigest.slice(0, lastColon),
+      tag: withoutDigest.slice(lastColon + 1),
+    };
+  }
+  return { repository: withoutDigest, tag: '' };
+}
+
+function stripRegistryHost(repository: string) {
+  const parts = repository.split('/');
+  if (parts.length > 1 && (parts[0].includes('.') || parts[0].includes(':') || parts[0] === 'registry' || parts[0] === 'localhost')) {
+    return parts.slice(1).join('/');
+  }
+  return repository;
+}
+
+function getRegistryHost(repository: string) {
+  const parts = repository.split('/');
+  if (parts.length > 1 && (parts[0].includes('.') || parts[0].includes(':') || parts[0] === 'registry' || parts[0] === 'localhost')) {
+    return parts[0];
+  }
+  return '';
+}
+
+async function getFreeSpaceGb(target: string) {
+  try {
+    const { stdout } = await runCommandCapture('df', ['-Pm', target]);
+    const lines = stdout.trim().split('\n');
+    if (lines.length < 2) {
+      return null;
+    }
+    const parts = lines[1].trim().split(/\s+/);
+    if (parts.length < 4) {
+      return null;
+    }
+    const availableMb = Number(parts[3]);
+    if (!Number.isFinite(availableMb)) {
+      return null;
+    }
+    return availableMb / 1024;
+  } catch {
+    return null;
+  }
+}
+
+async function listStackImageTags(stackName: string) {
+  const { stdout } = await runCommandCapture('docker', [
+    'service',
+    'ls',
+    '--filter',
+    `label=com.docker.stack.namespace=${stackName}`,
+    '--format',
+    '{{.Image}}',
+  ]);
+  const tags = new Set<string>();
+  const repos = new Set<string>();
+  for (const line of stdout.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const parsed = parseImageReference(trimmed);
+    if (parsed.tag) {
+      tags.add(parsed.tag);
+    }
+    if (parsed.repository) {
+      repos.add(parsed.repository);
+    }
+  }
+  return { tags, repositories: repos };
+}
+
+async function cleanupWorkDirs(keepArtifactBases: Set<string>) {
+  if (!fs.existsSync(DEPLOY_WORK_DIR)) {
+    return;
+  }
+  const entries = fs.readdirSync(DEPLOY_WORK_DIR, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => path.join(DEPLOY_WORK_DIR, entry.name));
+  for (const dir of entries) {
+    let files: string[] = [];
+    try {
+      files = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    const buildArtifacts = files.filter((file) => file.startsWith('build-') && file.endsWith('.tar.zst'));
+    if (!buildArtifacts.length) {
+      continue;
+    }
+    const hasKeep = buildArtifacts.some((file) => keepArtifactBases.has(file));
+    if (!hasKeep) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+async function deleteR2Object(creds: R2Credentials, objectKey: string) {
+  const normalizedKey = objectKey.replace(/^\/+/, '');
+  const url = presignS3Url({
+    method: 'DELETE',
+    endpoint: creds.endpoint,
+    bucket: creds.bucket,
+    key: normalizedKey,
+    accessKeyId: creds.accessKeyId,
+    secretAccessKey: creds.secretAccessKey,
+    region: creds.region || 'auto',
+    expiresIn: 3600,
+  });
+  await runCommand('curl', ['-fsSL', '-X', 'DELETE', url]);
+}
+
+async function cleanupLocalImages(
+  environmentId: number,
+  keepImageTags: Set<string>,
+  stackName: string
+) {
+  const prefix = `env-${environmentId}-`;
+  const running = await listStackImageTags(stackName);
+  for (const tag of running.tags) {
+    keepImageTags.add(tag);
+  }
+  const { stdout } = await runCommandCapture('docker', ['image', 'ls', '--format', '{{.Repository}} {{.Tag}}']);
+  const removals: Array<{ repo: string; tag: string }> = [];
+  for (const line of stdout.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const [repo, tag] = trimmed.split(/\s+/);
+    if (!repo || !tag || tag === '<none>') continue;
+    if (!tag.startsWith(prefix)) continue;
+    if (keepImageTags.has(tag)) continue;
+    removals.push({ repo, tag });
+  }
+  for (const removal of removals) {
+    try {
+      await runCommand('docker', ['image', 'rm', '-f', `${removal.repo}:${removal.tag}`]);
+    } catch {
+      // ignore
+    }
+  }
+  return removals;
+}
+
+async function cleanupRegistryImages(removals: Array<{ repo: string; tag: string }>) {
+  if (!REGISTRY_CLEANUP_ENABLED || !removals.length) {
+    return;
+  }
+  const registryBase = `http://${REGISTRY_CLEANUP_HOST}:${REGISTRY_CLEANUP_PORT}`;
+  for (const removal of removals) {
+    const repoHost = getRegistryHost(removal.repo);
+    if (repoHost && ![REGISTRY_CLEANUP_HOST, 'registry', 'localhost', '127.0.0.1'].includes(repoHost)) {
+      continue;
+    }
+    const repoName = stripRegistryHost(removal.repo);
+    if (!repoName) continue;
+    try {
+      const { stdout } = await runCommandCapture('curl', [
+        '-fsSI',
+        '-H',
+        'Accept: application/vnd.docker.distribution.manifest.v2+json',
+        `${registryBase}/v2/${repoName}/manifests/${removal.tag}`,
+      ]);
+      const digestLine = stdout.split('\n').find((line) => line.toLowerCase().startsWith('docker-content-digest:'));
+      if (!digestLine) continue;
+      const digest = digestLine.split(':').slice(1).join(':').trim();
+      if (!digest) continue;
+      await runCommand('curl', ['-fsSL', '-X', 'DELETE', `${registryBase}/v2/${repoName}/manifests/${digest}`]);
+    } catch {
+      // ignore registry cleanup failures
+    }
+  }
+}
+
+async function runRegistryGc() {
+  if (!REGISTRY_GC_ENABLED) {
+    return;
+  }
+  if (!fs.existsSync(REGISTRY_GC_SCRIPT)) {
+    console.warn(`registry gc script not found: ${REGISTRY_GC_SCRIPT}`);
+    return;
+  }
+  try {
+    await runCommand('bash', [REGISTRY_GC_SCRIPT]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`registry gc failed: ${message}`);
+  }
+}
+
+async function cleanupDeploymentResources(params: {
+  environmentId: number;
+  repository: string;
+  artifactKey: string;
+  mageVersion: string;
+  stackName: string;
+  r2: R2CredFile;
+}) {
+  const history = readDeploymentHistory();
+  const normalizedArtifactKey = params.artifactKey.replace(/^\/+/, '');
+  const repo = params.repository || inferRepositoryFromArtifactKey(normalizedArtifactKey) || 'unknown';
+  const key = `env:${params.environmentId}:${repo}`;
+  const { keepArtifacts, keepImageTags, removedArtifacts, removedImageTags } = updateDeploymentHistory(
+    history,
+    key,
+    normalizedArtifactKey,
+    params.mageVersion
+  );
+  writeDeploymentHistory(history);
+
+  if (!DEPLOY_CLEANUP_ENABLED) {
+    return;
+  }
+
+  const keepArtifactBases = new Set(keepArtifacts.map((item) => path.basename(item)));
+  await cleanupWorkDirs(keepArtifactBases);
+
+  if (params.r2?.backups) {
+    for (const objectKey of removedArtifacts) {
+      try {
+        await deleteR2Object(params.r2.backups, objectKey);
+      } catch {
+        // ignore cleanup errors
+      }
+    }
+  }
+
+  if (DEPLOY_MIN_FREE_GB > 0) {
+    const freeGb = (await getFreeSpaceGb('/var/lib/docker')) ?? (await getFreeSpaceGb('/')) ?? null;
+    if (freeGb !== null && freeGb >= DEPLOY_MIN_FREE_GB) {
+      return;
+    }
+  }
+
+  const keepImageTagSet = new Set(keepImageTags);
+  const removedImageTagSet = new Set(removedImageTags);
+  const removals = await cleanupLocalImages(params.environmentId, keepImageTagSet, params.stackName);
+  if (removedImageTagSet.size) {
+    const filtered = removals.filter((item) => removedImageTagSet.has(item.tag));
+    await cleanupRegistryImages(filtered);
+    await runRegistryGc();
   }
 }
 
@@ -1627,6 +1941,21 @@ async function processDeployment(recordPath: string) {
     environment_id: environmentId,
     status: 'active',
   });
+
+  try {
+    await cleanupDeploymentResources({
+      environmentId,
+      repository: String(payload.repository || ''),
+      artifactKey,
+      mageVersion,
+      stackName,
+      r2,
+    });
+    log('cleanup complete');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log(`cleanup skipped: ${message}`);
+  }
 }
 
 async function handleDeploymentFile(recordPath: string) {
