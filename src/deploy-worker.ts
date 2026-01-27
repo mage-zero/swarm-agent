@@ -1090,25 +1090,21 @@ async function setBaseUrls(containerId: string, dbName: string, baseUrl: string)
 }
 
 async function setOpensearchSystemConfig(
+  stackName: string,
   containerId: string,
   dbName: string,
   host: string,
   port: string,
   timeout: string
-) {
+): Promise<string> {
   const safeDbName = dbName.replace(/`/g, '``');
   const statements = [
     `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/opensearch_server_hostname', '${host}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
     `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/opensearch_server_port', '${port}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
     `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/opensearch_server_timeout', '${timeout}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
   ].join('; ');
-  await runCommand('docker', [
-    'exec',
-    containerId,
-    'sh',
-    '-c',
-    `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -D ${safeDbName} -e "${statements};"`,
-  ]);
+  const command = `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -D ${safeDbName} -e "${statements};"`;
+  return runDatabaseCommandWithRetry(stackName, containerId, command);
 }
 
 const MAGENTO_DB_OVERRIDE_ENV = {
@@ -1584,7 +1580,8 @@ async function processDeployment(recordPath: string) {
     });
   }
   let upgradeWarning = false;
-  await setOpensearchSystemConfig(
+  dbContainerId = await setOpensearchSystemConfig(
+    stackName,
     dbContainerId,
     envVars.MYSQL_DATABASE || 'magento',
     opensearchHost,
