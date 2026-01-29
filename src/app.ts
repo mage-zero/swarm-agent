@@ -12,6 +12,7 @@ import {
   handleTuningApprovalRequest,
 } from './status.js';
 import { handleMeshJoinRequest } from './mesh.js';
+import { executeRunbook, listRunbooks } from './support-runbooks.js';
 
 export const createApp = () => {
   const app = new Hono();
@@ -65,6 +66,20 @@ export const createApp = () => {
     const request = c.req.raw ?? (c.req as unknown as Request);
     const result = await handleNodeRemovalRequest(request);
     return c.json(result.body, result.status as StatusCode);
+  });
+
+  app.get('/v1/support/runbooks', async (c) => {
+    const runbooks = await listRunbooks();
+    return c.json({ runbooks });
+  });
+
+  app.post('/v1/support/runbook', async (c) => {
+    const request = c.req.raw ?? (c.req as unknown as Request);
+    const result = await executeRunbook(request);
+    if ('error' in result) {
+      return c.json({ error: result.error }, result.status as StatusCode);
+    }
+    return c.json(result);
   });
 
   app.get('/v1/services', async (c) => {
