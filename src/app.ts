@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import type { StatusCode } from 'hono/utils/http-status';
+import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { getHealthStatus } from './health.js';
 import { handleDeployArtifact, handleDeployKey, handleR2Presign } from './deploy.js';
 import {
@@ -22,22 +22,22 @@ export const createApp = () => {
   app.get('/join-token', async (c) => {
     const secret = c.req.header('x-mz-join-secret');
     const result = await handleJoinTokenRequest(secret);
-    return c.json(result.body, result.status as StatusCode);
+    return c.json(result.body, result.status as ContentfulStatusCode);
   });
 
   app.post('/deploy/artifact', async (c) => {
     const result = await handleDeployArtifact(c);
-    return c.json(result.body, result.status as StatusCode);
+    return c.json(result.body, result.status as ContentfulStatusCode);
   });
 
   app.post('/deploy/cloud-swarm-key', async (c) => {
     const result = await handleDeployKey(c);
-    return c.json(result.body, result.status as StatusCode);
+    return c.json(result.body, result.status as ContentfulStatusCode);
   });
 
   app.post('/r2/presign', async (c) => {
     const result = await handleR2Presign(c);
-    return c.json(result.body, result.status as StatusCode);
+    return c.json(result.body, result.status as ContentfulStatusCode);
   });
 
   app.get('/v1/capacity', async (c) => {
@@ -53,19 +53,19 @@ export const createApp = () => {
   app.post('/v1/mesh/join', async (c) => {
     const request = c.req.raw ?? (c.req as unknown as Request);
     const result = await handleMeshJoinRequest(request);
-    return c.json(result.body, result.status as StatusCode);
+    return c.json(result.body, result.status as ContentfulStatusCode);
   });
 
   app.post('/v1/tuning/approve', async (c) => {
     const request = c.req.raw ?? (c.req as unknown as Request);
     const result = await handleTuningApprovalRequest(request);
-    return c.json(result.body, result.status as StatusCode);
+    return c.json(result.body, result.status as ContentfulStatusCode);
   });
 
   app.post('/v1/swarm/nodes/remove', async (c) => {
     const request = c.req.raw ?? (c.req as unknown as Request);
     const result = await handleNodeRemovalRequest(request);
-    return c.json(result.body, result.status as StatusCode);
+    return c.json(result.body, result.status as ContentfulStatusCode);
   });
 
   app.get('/v1/support/runbooks', async (c) => {
@@ -77,7 +77,7 @@ export const createApp = () => {
     const request = c.req.raw ?? (c.req as unknown as Request);
     const result = await executeRunbook(request);
     if ('error' in result) {
-      return c.json({ error: result.error }, result.status as StatusCode);
+      return c.json({ error: result.error }, result.status as ContentfulStatusCode);
     }
     return c.json(result);
   });

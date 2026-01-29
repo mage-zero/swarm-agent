@@ -2074,7 +2074,7 @@ export async function handleNodeRemovalRequest(request: Request) {
     return { status: 403, body: { error: 'not_manager' } } as const;
   }
 
-  const body = await request.json<NodeRemovalRequest>().catch(() => ({}));
+  const body = await request.json().catch(() => ({})) as NodeRemovalRequest;
   const nodeId = Number(body?.node_id || 0);
   const hostname = typeof body?.hostname === 'string' ? body.hostname.trim() : '';
   const address = typeof body?.address === 'string'
