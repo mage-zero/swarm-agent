@@ -62,6 +62,20 @@ const RUNBOOKS: RunbookDefinition[] = [
     safe: true,
     supports_remediation: false,
   },
+  {
+    id: 'proxysql_restart',
+    name: 'Restart ProxySQL service',
+    description: 'Restart the ProxySQL service for the environment.',
+    safe: false,
+    supports_remediation: true,
+  },
+  {
+    id: 'cloudflared_restart',
+    name: 'Restart Cloudflared service',
+    description: 'Restart the Cloudflared service for the environment.',
+    safe: false,
+    supports_remediation: true,
+  },
 ];
 
 function readNodeFile(filename: string): string {
@@ -144,9 +158,28 @@ async function listEnvironmentContainers(environmentId: number) {
   return entries;
 }
 
+async function listEnvironmentServices(environmentId: number) {
+  const result = await runCommand('docker', ['service', 'ls', '--format', '{{.ID}}|{{.Name}}|{{.Replicas}}']);
+  const entries = result.stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [id, name, replicas] = line.split('|');
+      return { id, name, replicas };
+    })
+    .filter((entry) => entry.name.includes(`mz-env-${environmentId}_`));
+  return entries;
+}
+
 async function findContainer(environmentId: number, includes: string) {
   const containers = await listEnvironmentContainers(environmentId);
   return containers.find((entry) => entry.name.includes(includes));
+}
+
+async function findService(environmentId: number, includes: string) {
+  const services = await listEnvironmentServices(environmentId);
+  return services.find((entry) => entry.name.includes(includes));
 }
 
 function deriveHealth(status: string) {
@@ -294,6 +327,47 @@ async function runRestartSummary(environmentId: number): Promise<RunbookResult> 
   };
 }
 
+async function runServiceRestart(
+  environmentId: number,
+  includes: string | string[],
+  runbookId: string,
+  label: string
+): Promise<RunbookResult> {
+  const patterns = Array.isArray(includes) ? includes : [includes];
+  let service = null as Awaited<ReturnType<typeof findService>> | null;
+  for (const pattern of patterns) {
+    service = await findService(environmentId, pattern);
+    if (service) break;
+  }
+  if (!service) {
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: `${label} service not found.`,
+      observations: [`No ${label} service matched for this environment.`],
+      remediation: { attempted: false, actions: [] },
+    };
+  }
+  const actions: string[] = [];
+  const result = await runCommand('docker', ['service', 'update', '--force', service.id]);
+  if (result.code === 0) {
+    actions.push(`Forced update for ${service.name}`);
+  } else {
+    actions.push(`Failed to update ${service.name}`);
+  }
+  return {
+    runbook_id: runbookId,
+    status: result.code === 0 ? 'ok' : 'warning',
+    summary: result.code === 0 ? `${label} restart triggered.` : `${label} restart failed.`,
+    observations: [
+      `Service: ${service.name} (${service.replicas || 'replicas unknown'})`,
+      result.stderr ? `stderr: ${result.stderr.trim()}` : '',
+    ].filter(Boolean),
+    data: { service },
+    remediation: { attempted: true, actions },
+  };
+}
+
 export async function listRunbooks() {
   return RUNBOOKS;
 }
@@ -323,6 +397,10 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
       return runCloudflared(environmentId);
     case 'container_restart_summary':
       return runRestartSummary(environmentId);
+    case 'proxysql_restart':
+      return runServiceRestart(environmentId, '_proxysql', 'proxysql_restart', 'ProxySQL');
+    case 'cloudflared_restart':
+      return runServiceRestart(environmentId, ['cloudflared', '_tunnel'], 'cloudflared_restart', 'Cloudflared');
     default:
       return { error: 'unknown_runbook', status: 404 };
   }
