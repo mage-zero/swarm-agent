@@ -406,6 +406,31 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
   }
 }
 
+export async function handleServiceRestart(request: Request): Promise<{ error?: string; status?: number; success?: boolean; service?: string; message?: string }> {
+  const authorized = await validateNodeRequest(request);
+  if (!authorized) {
+    return { error: 'unauthorized', status: 401 };
+  }
+  const body = await request.json().catch(() => null) as {
+    service_name?: string;
+    environment_id?: number;
+  } | null;
+  const serviceName = String(body?.service_name || '').trim();
+  const environmentId = Number(body?.environment_id || 0);
+  if (!serviceName || !environmentId) {
+    return { error: 'missing service_name or environment_id', status: 400 };
+  }
+  const service = await findService(environmentId, serviceName);
+  if (!service) {
+    return { error: `Service matching "${serviceName}" not found for environment ${environmentId}.`, status: 404 };
+  }
+  const result = await runCommand('docker', ['service', 'update', '--force', service.id]);
+  if (result.code !== 0) {
+    return { error: `Failed to restart ${service.name}: ${result.stderr?.trim() || 'unknown error'}`, status: 500 };
+  }
+  return { success: true, service: service.name, message: `Restart triggered for ${service.name}.` };
+}
+
 export function createRunbookToken(): string {
   return crypto.randomUUID();
 }

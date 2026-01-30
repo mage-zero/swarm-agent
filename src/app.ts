@@ -12,7 +12,7 @@ import {
   handleTuningApprovalRequest,
 } from './status.js';
 import { handleMeshJoinRequest } from './mesh.js';
-import { executeRunbook, listRunbooks } from './support-runbooks.js';
+import { executeRunbook, handleServiceRestart, listRunbooks } from './support-runbooks.js';
 
 export const createApp = () => {
   const app = new Hono();
@@ -78,6 +78,15 @@ export const createApp = () => {
     const result = await executeRunbook(request);
     if ('error' in result) {
       return c.json({ error: result.error }, result.status as ContentfulStatusCode);
+    }
+    return c.json(result);
+  });
+
+  app.post('/v1/service/restart', async (c) => {
+    const request = c.req.raw ?? (c.req as unknown as Request);
+    const result = await handleServiceRestart(request);
+    if (result.error) {
+      return c.json({ error: result.error }, (result.status || 500) as ContentfulStatusCode);
     }
     return c.json(result);
   });
