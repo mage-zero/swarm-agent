@@ -154,14 +154,21 @@ function clampFactor(value: number): number {
   return Math.min(0.9, Math.max(0.1, value));
 }
 
+function roundCores(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.round(value * 100) / 100;
+}
+
 function blendSpec(base: PlannerResourceSpec, target: PlannerResourceSpec, factor: number): PlannerResourceSpec {
   return {
     limits: {
-      cpu_cores: base.limits.cpu_cores + (target.limits.cpu_cores - base.limits.cpu_cores) * factor,
+      cpu_cores: roundCores(base.limits.cpu_cores + (target.limits.cpu_cores - base.limits.cpu_cores) * factor),
       memory_bytes: base.limits.memory_bytes + (target.limits.memory_bytes - base.limits.memory_bytes) * factor,
     },
     reservations: {
-      cpu_cores: base.reservations.cpu_cores + (target.reservations.cpu_cores - base.reservations.cpu_cores) * factor,
+      cpu_cores: roundCores(base.reservations.cpu_cores + (target.reservations.cpu_cores - base.reservations.cpu_cores) * factor),
       memory_bytes: base.reservations.memory_bytes + (target.reservations.memory_bytes - base.reservations.memory_bytes) * factor,
     },
   };
@@ -279,14 +286,34 @@ function calculateAdjustments(
     if (!targetSpec) {
       continue;
     }
-    const limitChanged = targetSpec.limits.memory_bytes !== baseSpec.limits.memory_bytes;
-    const reserveChanged = targetSpec.reservations.memory_bytes !== baseSpec.reservations.memory_bytes;
+    const limitChanged = targetSpec.limits.memory_bytes !== baseSpec.limits.memory_bytes
+      || targetSpec.limits.cpu_cores !== baseSpec.limits.cpu_cores;
+    const reserveChanged = targetSpec.reservations.memory_bytes !== baseSpec.reservations.memory_bytes
+      || targetSpec.reservations.cpu_cores !== baseSpec.reservations.cpu_cores;
     if (!limitChanged && !reserveChanged) {
       continue;
     }
     adjustments[service] = {
-      limits: limitChanged ? { memory_bytes: targetSpec.limits.memory_bytes } : undefined,
-      reservations: reserveChanged ? { memory_bytes: targetSpec.reservations.memory_bytes } : undefined,
+      limits: limitChanged
+        ? {
+          memory_bytes: targetSpec.limits.memory_bytes !== baseSpec.limits.memory_bytes
+            ? targetSpec.limits.memory_bytes
+            : undefined,
+          cpu_cores: targetSpec.limits.cpu_cores !== baseSpec.limits.cpu_cores
+            ? targetSpec.limits.cpu_cores
+            : undefined,
+        }
+        : undefined,
+      reservations: reserveChanged
+        ? {
+          memory_bytes: targetSpec.reservations.memory_bytes !== baseSpec.reservations.memory_bytes
+            ? targetSpec.reservations.memory_bytes
+            : undefined,
+          cpu_cores: targetSpec.reservations.cpu_cores !== baseSpec.reservations.cpu_cores
+            ? targetSpec.reservations.cpu_cores
+            : undefined,
+        }
+        : undefined,
       source,
     };
   }
@@ -310,8 +337,16 @@ function blendRecommendedResources(
     const nextReserve = Math.round(
       (prevSpec.reservations.memory_bytes * weight + candidateSpec.reservations.memory_bytes) / (weight + 1),
     );
+    const nextCpuLimit = roundCores(
+      (prevSpec.limits.cpu_cores * weight + candidateSpec.limits.cpu_cores) / (weight + 1),
+    );
+    const nextCpuReserve = roundCores(
+      (prevSpec.reservations.cpu_cores * weight + candidateSpec.reservations.cpu_cores) / (weight + 1),
+    );
     blended.services[service].limits.memory_bytes = nextLimit;
     blended.services[service].reservations.memory_bytes = nextReserve;
+    blended.services[service].limits.cpu_cores = nextCpuLimit;
+    blended.services[service].reservations.cpu_cores = nextCpuReserve;
   }
   return blended;
 }
@@ -365,13 +400,19 @@ function calculateProfileDistance(previous: PlannerResources, next: PlannerResou
     if (!prev || !curr) {
       continue;
     }
+    const limitCpuDelta = prev.limits.cpu_cores > 0
+      ? Math.abs(curr.limits.cpu_cores - prev.limits.cpu_cores) / prev.limits.cpu_cores
+      : 0;
+    const reserveCpuDelta = prev.reservations.cpu_cores > 0
+      ? Math.abs(curr.reservations.cpu_cores - prev.reservations.cpu_cores) / prev.reservations.cpu_cores
+      : 0;
     const limitDelta = prev.limits.memory_bytes > 0
       ? Math.abs(curr.limits.memory_bytes - prev.limits.memory_bytes) / prev.limits.memory_bytes
       : 0;
     const reserveDelta = prev.reservations.memory_bytes > 0
       ? Math.abs(curr.reservations.memory_bytes - prev.reservations.memory_bytes) / prev.reservations.memory_bytes
       : 0;
-    total += Math.max(limitDelta, reserveDelta);
+    total += Math.max(limitCpuDelta, reserveCpuDelta, limitDelta, reserveDelta);
     count += 1;
   }
   return count > 0 ? total / count : 1;
@@ -576,17 +617,22 @@ export function applyAiAdjustments(
   resources: PlannerResources,
   baseResources: PlannerResources,
   inspection: PlannerInspectionPayload,
-  capacity: { totals: { memory_bytes?: number }; nodes?: CapacityNode[] },
+  capacity: { totals: { memory_bytes?: number; cpu_cores?: number }; nodes?: CapacityNode[] },
 ) {
   const adjustments = profile.adjustments || {};
   const hasAdjustments = adjustments && Object.keys(adjustments).length > 0;
 
   const totalMem = capacity.totals.memory_bytes || 0;
+  const totalCpu = capacity.totals.cpu_cores || 0;
   const maxLimitTotal = totalMem > 0 ? totalMem * 0.9 : 0;
   const maxReserveTotal = totalMem > 0 ? totalMem * 0.8 : 0;
+  const maxCpuLimitTotal = totalCpu > 0 ? totalCpu * 0.9 : 0;
+  const maxCpuReserveTotal = totalCpu > 0 ? totalCpu * 0.8 : 0;
 
   let currentLimitTotal = 0;
   let currentReserveTotal = 0;
+  let currentCpuLimitTotal = 0;
+  let currentCpuReserveTotal = 0;
   const replicasByService = new Map<string, number>();
   const constraintsByService = new Map<string, string[]>();
   for (const entry of inspection.services) {
@@ -601,6 +647,8 @@ export function applyAiAdjustments(
     const replicas = Math.max(1, entry.replicas || 0);
     currentLimitTotal += resource.limits.memory_bytes * replicas;
     currentReserveTotal += resource.reservations.memory_bytes * replicas;
+    currentCpuLimitTotal += resource.limits.cpu_cores * replicas;
+    currentCpuReserveTotal += resource.reservations.cpu_cores * replicas;
   }
 
   if (hasAdjustments) {
@@ -612,8 +660,15 @@ export function applyAiAdjustments(
       }
       const policy = getTuningPolicy(service);
       const replicas = replicasByService.get(service) || 1;
-      let newLimit = resource.limits.memory_bytes;
-      let newReserve = resource.reservations.memory_bytes;
+      const oldMemLimit = resource.limits.memory_bytes;
+      const oldMemReserve = resource.reservations.memory_bytes;
+      const oldCpuLimit = resource.limits.cpu_cores;
+      const oldCpuReserve = resource.reservations.cpu_cores;
+
+      let newLimit = oldMemLimit;
+      let newReserve = oldMemReserve;
+      let newCpuLimit = oldCpuLimit;
+      let newCpuReserve = oldCpuReserve;
       if (change.limits?.memory_bytes && change.limits.memory_bytes > resource.limits.memory_bytes) {
         const cappedLimit = Math.min(
           change.limits.memory_bytes,
@@ -628,8 +683,23 @@ export function applyAiAdjustments(
         );
         newReserve = cappedReserve;
       }
+      if (typeof change.limits?.cpu_cores === 'number' && change.limits.cpu_cores > oldCpuLimit) {
+        const maxCpu = baseResource.limits.cpu_cores > 0
+          ? baseResource.limits.cpu_cores * policy.max_limit_multiplier
+          : oldCpuLimit * policy.max_limit_multiplier;
+        newCpuLimit = Math.min(roundCores(change.limits.cpu_cores), roundCores(maxCpu));
+      }
+      if (typeof change.reservations?.cpu_cores === 'number' && change.reservations.cpu_cores > oldCpuReserve) {
+        const maxCpu = baseResource.reservations.cpu_cores > 0
+          ? baseResource.reservations.cpu_cores * policy.max_reserve_multiplier
+          : oldCpuReserve * policy.max_reserve_multiplier;
+        newCpuReserve = Math.min(roundCores(change.reservations.cpu_cores), roundCores(maxCpu));
+      }
       if (newReserve > newLimit) {
         newLimit = newReserve;
+      }
+      if (newCpuReserve > newCpuLimit) {
+        newCpuLimit = newCpuReserve;
       }
 
       const limitDelta = (newLimit - resource.limits.memory_bytes) * replicas;
@@ -641,19 +711,57 @@ export function applyAiAdjustments(
         continue;
       }
 
-      if (newLimit !== resource.limits.memory_bytes || newReserve !== resource.reservations.memory_bytes) {
-        currentLimitTotal += (newLimit - resource.limits.memory_bytes) * replicas;
-        currentReserveTotal += (newReserve - resource.reservations.memory_bytes) * replicas;
+      const cpuLimitDelta = (newCpuLimit - oldCpuLimit) * replicas;
+      if (cpuLimitDelta > 0 && maxCpuLimitTotal > 0 && currentCpuLimitTotal + cpuLimitDelta > maxCpuLimitTotal) {
+        newCpuLimit = oldCpuLimit;
+        newCpuReserve = oldCpuReserve;
+      }
+      if (newCpuReserve > newCpuLimit) {
+        newCpuReserve = oldCpuReserve;
+      }
+      const cpuReserveDelta = (newCpuReserve - oldCpuReserve) * replicas;
+      if (cpuReserveDelta > 0 && maxCpuReserveTotal > 0 && currentCpuReserveTotal + cpuReserveDelta > maxCpuReserveTotal) {
+        newCpuReserve = oldCpuReserve;
+      }
+
+      if (
+        newLimit !== oldMemLimit
+        || newReserve !== oldMemReserve
+        || newCpuLimit !== oldCpuLimit
+        || newCpuReserve !== oldCpuReserve
+      ) {
+        currentLimitTotal += (newLimit - oldMemLimit) * replicas;
+        currentReserveTotal += (newReserve - oldMemReserve) * replicas;
+        currentCpuLimitTotal += (newCpuLimit - oldCpuLimit) * replicas;
+        currentCpuReserveTotal += (newCpuReserve - oldCpuReserve) * replicas;
+
         resource.limits.memory_bytes = newLimit;
         resource.reservations.memory_bytes = newReserve;
+        resource.limits.cpu_cores = newCpuLimit;
+        resource.reservations.cpu_cores = newCpuReserve;
+
         const existing = tuningProfile.adjustments[service];
         const mergedNotes = [
           ...(existing?.notes || []),
           ...(change.notes || []),
         ];
+        const nextLimits: NonNullable<PlannerTuningAdjustment['limits']> = {};
+        const nextReservations: NonNullable<PlannerTuningAdjustment['reservations']> = {};
+        if (resource.limits.memory_bytes !== baseResource.limits.memory_bytes) {
+          nextLimits.memory_bytes = resource.limits.memory_bytes;
+        }
+        if (resource.limits.cpu_cores !== baseResource.limits.cpu_cores) {
+          nextLimits.cpu_cores = resource.limits.cpu_cores;
+        }
+        if (resource.reservations.memory_bytes !== baseResource.reservations.memory_bytes) {
+          nextReservations.memory_bytes = resource.reservations.memory_bytes;
+        }
+        if (resource.reservations.cpu_cores !== baseResource.reservations.cpu_cores) {
+          nextReservations.cpu_cores = resource.reservations.cpu_cores;
+        }
         tuningProfile.adjustments[service] = {
-          limits: newLimit !== baseResource.limits.memory_bytes ? { memory_bytes: newLimit } : undefined,
-          reservations: newReserve !== baseResource.reservations.memory_bytes ? { memory_bytes: newReserve } : undefined,
+          limits: Object.keys(nextLimits).length > 0 ? nextLimits : undefined,
+          reservations: Object.keys(nextReservations).length > 0 ? nextReservations : undefined,
           source: existing?.source ? `${existing.source}+ai` : 'ai',
           notes: mergedNotes.length > 0 ? mergedNotes : undefined,
         };
@@ -690,26 +798,33 @@ export function applyAiAdjustments(
 export function buildCandidateProfile(
   inspection: PlannerInspectionPayload,
   baseResources: PlannerResources,
-  capacity: { totals: { memory_bytes?: number }; nodes?: CapacityNode[] },
+  capacity: { totals: { memory_bytes?: number; cpu_cores?: number }; nodes?: CapacityNode[] },
 ): { profile: PlannerTuningProfile; signals: PlannerTuningService[] } {
   const services: PlannerTuningService[] = [];
   const adjustments: Record<string, PlannerTuningAdjustment> = {};
   const tunedResources = clonePlannerResources(baseResources);
 
   const totalMem = capacity.totals.memory_bytes || 0;
-  const maxLimitTotal = totalMem > 0 ? totalMem * 0.9 : 0;
-  const maxReserveTotal = totalMem > 0 ? totalMem * 0.8 : 0;
+  const totalCpu = capacity.totals.cpu_cores || 0;
+  const maxMemLimitTotal = totalMem > 0 ? totalMem * 0.9 : 0;
+  const maxMemReserveTotal = totalMem > 0 ? totalMem * 0.8 : 0;
+  const maxCpuLimitTotal = totalCpu > 0 ? totalCpu * 0.9 : 0;
+  const maxCpuReserveTotal = totalCpu > 0 ? totalCpu * 0.8 : 0;
 
-  let currentLimitTotal = 0;
-  let currentReserveTotal = 0;
+  let currentMemLimitTotal = 0;
+  let currentMemReserveTotal = 0;
+  let currentCpuLimitTotal = 0;
+  let currentCpuReserveTotal = 0;
   for (const entry of inspection.services) {
     const resource = tunedResources.services[entry.service];
     if (!resource) {
       continue;
     }
     const replicas = Math.max(1, entry.replicas || 0);
-    currentLimitTotal += resource.limits.memory_bytes * replicas;
-    currentReserveTotal += resource.reservations.memory_bytes * replicas;
+    currentMemLimitTotal += resource.limits.memory_bytes * replicas;
+    currentMemReserveTotal += resource.reservations.memory_bytes * replicas;
+    currentCpuLimitTotal += resource.limits.cpu_cores * replicas;
+    currentCpuReserveTotal += resource.reservations.cpu_cores * replicas;
   }
 
   for (const entry of inspection.services) {
@@ -733,61 +848,138 @@ export function buildCandidateProfile(
     }
     const policy = getTuningPolicy(entry.service);
     const replicas = Math.max(1, entry.replicas || 0);
-    let newLimit = resource.limits.memory_bytes;
-    let newReserve = resource.reservations.memory_bytes;
+    const oldMemLimit = resource.limits.memory_bytes;
+    const oldMemReserve = resource.reservations.memory_bytes;
+    const oldCpuLimit = resource.limits.cpu_cores;
+    const oldCpuReserve = resource.reservations.cpu_cores;
+
+    let newMemLimit = oldMemLimit;
+    let newMemReserve = oldMemReserve;
+    let newCpuLimit = oldCpuLimit;
+    let newCpuReserve = oldCpuReserve;
     const baseResource = baseResources.services[entry.service] || resource;
 
     if (signals.memory_limit_ratio !== undefined && signals.memory_limit_ratio >= policy.limit_up_threshold) {
-      newLimit = Math.min(
-        Math.round(resource.limits.memory_bytes * policy.limit_scale_up),
+      newMemLimit = Math.min(
+        Math.round(oldMemLimit * policy.limit_scale_up),
         Math.round(baseResource.limits.memory_bytes * policy.max_limit_multiplier),
       );
     }
 
     if (signals.memory_reservation_ratio !== undefined && signals.memory_reservation_ratio >= policy.reserve_up_threshold) {
-      newReserve = Math.min(
-        Math.round(resource.reservations.memory_bytes * policy.reserve_scale_up),
+      newMemReserve = Math.min(
+        Math.round(oldMemReserve * policy.reserve_scale_up),
         Math.round(baseResource.reservations.memory_bytes * policy.max_reserve_multiplier),
       );
     }
 
-    if (newReserve > newLimit) {
-      newLimit = newReserve;
+    const cpuPercent = entry.docker?.cpu_percent;
+    const cpuLimitRatio = (cpuPercent !== undefined && oldCpuLimit > 0)
+      ? cpuPercent / (oldCpuLimit * replicas * 100)
+      : undefined;
+    const cpuReserveRatio = (cpuPercent !== undefined && oldCpuReserve > 0)
+      ? cpuPercent / (oldCpuReserve * replicas * 100)
+      : undefined;
+
+    if (cpuLimitRatio !== undefined && cpuLimitRatio >= policy.limit_up_threshold) {
+      const maxCpuLimit = baseResource.limits.cpu_cores > 0
+        ? baseResource.limits.cpu_cores * policy.max_limit_multiplier
+        : oldCpuLimit * policy.max_limit_multiplier;
+      newCpuLimit = Math.min(
+        roundCores(oldCpuLimit * policy.limit_scale_up),
+        roundCores(maxCpuLimit),
+      );
     }
 
-    const limitDelta = (newLimit - resource.limits.memory_bytes) * replicas;
-    if (limitDelta > 0 && maxLimitTotal > 0 && currentLimitTotal + limitDelta > maxLimitTotal) {
-      newLimit = resource.limits.memory_bytes;
+    if (cpuReserveRatio !== undefined && cpuReserveRatio >= policy.reserve_up_threshold) {
+      const maxCpuReserve = baseResource.reservations.cpu_cores > 0
+        ? baseResource.reservations.cpu_cores * policy.max_reserve_multiplier
+        : oldCpuReserve * policy.max_reserve_multiplier;
+      newCpuReserve = Math.min(
+        roundCores(oldCpuReserve * policy.reserve_scale_up),
+        roundCores(maxCpuReserve),
+      );
+    }
+
+    if (newMemReserve > newMemLimit) {
+      newMemLimit = newMemReserve;
+    }
+    if (newCpuReserve > newCpuLimit) {
+      newCpuLimit = newCpuReserve;
+    }
+
+    const memLimitDelta = (newMemLimit - oldMemLimit) * replicas;
+    if (memLimitDelta > 0 && maxMemLimitTotal > 0 && currentMemLimitTotal + memLimitDelta > maxMemLimitTotal) {
+      newMemLimit = oldMemLimit;
       serviceNotes.push('limit increase skipped (capacity headroom)');
     }
 
-    const reserveDelta = (newReserve - resource.reservations.memory_bytes) * replicas;
-    if (reserveDelta > 0 && maxReserveTotal > 0 && currentReserveTotal + reserveDelta > maxReserveTotal) {
-      newReserve = resource.reservations.memory_bytes;
+    if (newMemReserve > newMemLimit) {
+      newMemReserve = oldMemReserve;
+    }
+
+    const memReserveDelta = (newMemReserve - oldMemReserve) * replicas;
+    if (memReserveDelta > 0 && maxMemReserveTotal > 0 && currentMemReserveTotal + memReserveDelta > maxMemReserveTotal) {
+      newMemReserve = oldMemReserve;
       serviceNotes.push('reservation increase skipped (capacity headroom)');
     }
 
-    if (newLimit !== resource.limits.memory_bytes || newReserve !== resource.reservations.memory_bytes) {
-      const adjustment: PlannerTuningAdjustment = {};
-      if (newLimit !== resource.limits.memory_bytes) {
-        adjustment.limits = { memory_bytes: newLimit };
+    const cpuLimitDelta = (newCpuLimit - oldCpuLimit) * replicas;
+    if (cpuLimitDelta > 0 && maxCpuLimitTotal > 0 && currentCpuLimitTotal + cpuLimitDelta > maxCpuLimitTotal) {
+      newCpuLimit = oldCpuLimit;
+      serviceNotes.push('cpu limit increase skipped (capacity headroom)');
+    }
+
+    if (newCpuReserve > newCpuLimit) {
+      newCpuReserve = oldCpuReserve;
+    }
+
+    const cpuReserveDelta = (newCpuReserve - oldCpuReserve) * replicas;
+    if (cpuReserveDelta > 0 && maxCpuReserveTotal > 0 && currentCpuReserveTotal + cpuReserveDelta > maxCpuReserveTotal) {
+      newCpuReserve = oldCpuReserve;
+      serviceNotes.push('cpu reservation increase skipped (capacity headroom)');
+    }
+
+    const changed = newMemLimit !== oldMemLimit
+      || newMemReserve !== oldMemReserve
+      || newCpuLimit !== oldCpuLimit
+      || newCpuReserve !== oldCpuReserve;
+
+    if (changed) {
+      const adjustment: PlannerTuningAdjustment = { source: 'auto' };
+      if (newMemLimit !== oldMemLimit || newCpuLimit !== oldCpuLimit) {
+        adjustment.limits = {
+          memory_bytes: newMemLimit !== oldMemLimit ? newMemLimit : undefined,
+          cpu_cores: newCpuLimit !== oldCpuLimit ? newCpuLimit : undefined,
+        };
       }
-      if (newReserve !== resource.reservations.memory_bytes) {
-        adjustment.reservations = { memory_bytes: newReserve };
+      if (newMemReserve !== oldMemReserve || newCpuReserve !== oldCpuReserve) {
+        adjustment.reservations = {
+          memory_bytes: newMemReserve !== oldMemReserve ? newMemReserve : undefined,
+          cpu_cores: newCpuReserve !== oldCpuReserve ? newCpuReserve : undefined,
+        };
       }
       if (serviceNotes.length > 0) {
         adjustment.notes = serviceNotes;
       }
-      adjustment.source = 'auto';
       adjustments[entry.service] = adjustment;
-      if (newLimit !== resource.limits.memory_bytes) {
-        currentLimitTotal += (newLimit - resource.limits.memory_bytes) * replicas;
+
+      if (newMemLimit !== oldMemLimit) {
+        currentMemLimitTotal += (newMemLimit - oldMemLimit) * replicas;
+        resource.limits.memory_bytes = newMemLimit;
       }
-      if (newReserve !== resource.reservations.memory_bytes) {
-        currentReserveTotal += (newReserve - resource.reservations.memory_bytes) * replicas;
+      if (newMemReserve !== oldMemReserve) {
+        currentMemReserveTotal += (newMemReserve - oldMemReserve) * replicas;
+        resource.reservations.memory_bytes = newMemReserve;
       }
-      resource.limits.memory_bytes = newLimit;
-      resource.reservations.memory_bytes = newReserve;
+      if (newCpuLimit !== oldCpuLimit) {
+        currentCpuLimitTotal += (newCpuLimit - oldCpuLimit) * replicas;
+        resource.limits.cpu_cores = newCpuLimit;
+      }
+      if (newCpuReserve !== oldCpuReserve) {
+        currentCpuReserveTotal += (newCpuReserve - oldCpuReserve) * replicas;
+        resource.reservations.cpu_cores = newCpuReserve;
+      }
     }
 
     services.push({

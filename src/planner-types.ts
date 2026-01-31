@@ -55,9 +55,11 @@ export type PlannerTuningService = {
 
 export type PlannerTuningAdjustment = {
   limits?: {
+    cpu_cores?: number;
     memory_bytes?: number;
   };
   reservations?: {
+    cpu_cores?: number;
     memory_bytes?: number;
   };
   source?: string;
