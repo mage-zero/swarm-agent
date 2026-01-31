@@ -42,6 +42,13 @@ const RUNBOOKS: RunbookDefinition[] = [
     supports_remediation: true,
   },
   {
+    id: 'magento_media_permissions',
+    name: 'Magento media permissions check',
+    description: 'Verify Magento pub/media (including CAPTCHA) is writable and fix if needed.',
+    safe: true,
+    supports_remediation: true,
+  },
+  {
     id: 'proxysql_ready',
     name: 'ProxySQL readiness check',
     description: 'Check ProxySQL container status and readiness.',
@@ -260,6 +267,57 @@ async function runVarPermissions(environmentId: number): Promise<RunbookResult> 
   };
 }
 
+async function runMediaPermissions(environmentId: number): Promise<RunbookResult> {
+  const container = (await findContainer(environmentId, '_php-fpm-admin')) ?? (await findContainer(environmentId, '_php-fpm'));
+  if (!container) {
+    return {
+      runbook_id: 'magento_media_permissions',
+      status: 'failed',
+      summary: 'php-fpm container not found.',
+      observations: ['Unable to locate php-fpm container to inspect permissions.'],
+    };
+  }
+
+  const base = '/var/www/html/magento/pub/media';
+  const checkCmd = ['exec', container.id, 'sh', '-lc', `test -w ${base} && test -w ${base}/captcha`];
+  const checkResult = await runCommand('docker', checkCmd);
+  const actions: string[] = [];
+  if (checkResult.code === 0) {
+    return {
+      runbook_id: 'magento_media_permissions',
+      status: 'ok',
+      summary: 'Magento pub/media is writable.',
+      observations: ['Permissions check passed.'],
+      data: { container: container.name },
+      remediation: { attempted: false, actions },
+    };
+  }
+
+  const fixCmd = [
+    'exec',
+    container.id,
+    'sh',
+    '-lc',
+    `mkdir -p ${base}/captcha/admin && chown -R www-data:www-data ${base} && chmod -R 775 ${base}`,
+  ];
+  const fixResult = await runCommand('docker', fixCmd);
+  actions.push('Applied mkdir/chown/chmod to /var/www/html/magento/pub/media');
+
+  const recheck = await runCommand('docker', checkCmd);
+  const resolved = recheck.code === 0;
+  return {
+    runbook_id: 'magento_media_permissions',
+    status: resolved ? 'ok' : 'warning',
+    summary: resolved ? 'Permissions fixed.' : 'Permissions still failing after remediation.',
+    observations: [
+      resolved ? 'pub/media is now writable.' : 'Permissions check still failing.',
+      fixResult.stderr ? `Remediation stderr: ${fixResult.stderr.trim()}` : '',
+    ].filter(Boolean),
+    data: { container: container.name },
+    remediation: { attempted: true, actions },
+  };
+}
+
 async function runProxySqlReady(environmentId: number): Promise<RunbookResult> {
   const container = await findContainer(environmentId, '_proxysql');
   if (!container) {
@@ -391,6 +449,8 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
       return runPhpFpmHealth(environmentId);
     case 'magento_var_permissions':
       return runVarPermissions(environmentId);
+    case 'magento_media_permissions':
+      return runMediaPermissions(environmentId);
     case 'proxysql_ready':
       return runProxySqlReady(environmentId);
     case 'dns_cloudflared_ingress':
