@@ -8,6 +8,10 @@ const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DOCKER_TIMEOUT_MS = Number(process.env.MZ_RUNBOOK_TIMEOUT_MS || 15000);
 const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/deployments';
 const DEPLOY_FAILED_DIR = path.join(DEPLOY_QUEUE_DIR, 'failed');
+const DEPLOY_PROCESSING_DIR = path.join(DEPLOY_QUEUE_DIR, 'processing');
+const DEPLOY_WORK_DIR = path.join(DEPLOY_QUEUE_DIR, 'work');
+const DEPLOY_RECORD_FILENAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i;
+const DEPLOY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type RunbookDefinition = {
   id: string;
@@ -76,6 +80,20 @@ const RUNBOOKS: RunbookDefinition[] = [
     id: 'deploy_failure_summary',
     name: 'Last deploy failure summary',
     description: 'Show the most recent deploy failure for the environment (if any).',
+    safe: true,
+    supports_remediation: false,
+  },
+  {
+    id: 'deploy_active_summary',
+    name: 'Active deploy summary',
+    description: 'Show the currently processing deploy (if any) for the environment.',
+    safe: true,
+    supports_remediation: false,
+  },
+  {
+    id: 'deploy_log_excerpt',
+    name: 'Deploy log excerpt',
+    description: 'Return a small excerpt from deploy logs (build-services/build-magento) for a specific deployment.',
     safe: true,
     supports_remediation: false,
   },
@@ -530,9 +548,13 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
   const body = await request.json().catch(() => null) as {
     runbook_id?: string;
     environment_id?: number;
+    input?: Record<string, unknown>;
   } | null;
   const runbookId = String(body?.runbook_id || '').trim();
   const environmentId = Number(body?.environment_id || 0);
+  const input = (body?.input && typeof body.input === 'object' && !Array.isArray(body.input))
+    ? (body.input as Record<string, unknown>)
+    : {};
   if (!runbookId || !environmentId) {
     return { error: 'missing_parameters', status: 400 };
   }
@@ -551,6 +573,10 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
       return runRestartSummary(environmentId);
     case 'deploy_failure_summary':
       return runDeployFailureSummary(environmentId);
+    case 'deploy_active_summary':
+      return runDeployActiveSummary(environmentId);
+    case 'deploy_log_excerpt':
+      return runDeployLogExcerpt(environmentId, input);
     case 'proxysql_restart':
       return runServiceRestart(environmentId, '_proxysql', 'proxysql_restart', 'ProxySQL');
     case 'cloudflared_restart':
@@ -558,6 +584,159 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
     default:
       return { error: 'unknown_runbook', status: 404 };
   }
+}
+
+function safeReadJsonFile(filePath: string): Record<string, unknown> | null {
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const parsed = safeJsonParse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+async function runDeployActiveSummary(environmentId: number): Promise<RunbookResult> {
+  if (!fs.existsSync(DEPLOY_PROCESSING_DIR)) {
+    return {
+      runbook_id: 'deploy_active_summary',
+      status: 'ok',
+      summary: 'No processing deploy directory found.',
+      observations: [`Expected path: ${DEPLOY_PROCESSING_DIR}`],
+    };
+  }
+
+  const entries = fs.readdirSync(DEPLOY_PROCESSING_DIR)
+    .filter((name) => DEPLOY_RECORD_FILENAME.test(name))
+    .map((name) => ({ name, fullPath: path.join(DEPLOY_PROCESSING_DIR, name) }))
+    .map((entry) => {
+      try {
+        const stat = fs.statSync(entry.fullPath);
+        return { ...entry, mtimeMs: stat.mtimeMs, mtimeIso: stat.mtime.toISOString(), size: stat.size };
+      } catch {
+        return { ...entry, mtimeMs: 0, mtimeIso: '', size: 0 };
+      }
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  for (const entry of entries) {
+    const record = safeReadJsonFile(entry.fullPath);
+    if (!record) {
+      continue;
+    }
+    const payload = (record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload))
+      ? (record.payload as Record<string, unknown>)
+      : null;
+    const envId = Number(payload?.environment_id ?? 0);
+    if (envId !== environmentId) {
+      continue;
+    }
+
+    const deploymentId = String(record.id ?? path.basename(entry.name, '.json')).trim() || path.basename(entry.name, '.json');
+    const queuedAt = String(record.queued_at ?? '').trim();
+    const ageSeconds = entry.mtimeMs ? Math.max(0, Math.floor((Date.now() - entry.mtimeMs) / 1000)) : null;
+
+    return {
+      runbook_id: 'deploy_active_summary',
+      status: 'warning',
+      summary: `Deploy is in progress (${deploymentId}).`,
+      observations: [
+        `Queued at: ${queuedAt || '(unknown)'}`,
+        `Processing file mtime: ${entry.mtimeIso || '(unknown)'}${ageSeconds !== null ? ` (${ageSeconds}s ago)` : ''}`,
+        `Artifact: ${String(payload?.artifact ?? '').trim() || '(unknown)'}`,
+      ],
+      data: {
+        deployment_id: deploymentId,
+        queued_at: queuedAt || null,
+        processing_mtime: entry.mtimeIso || null,
+        processing_age_seconds: ageSeconds,
+        payload,
+      },
+    };
+  }
+
+  return {
+    runbook_id: 'deploy_active_summary',
+    status: 'ok',
+    summary: 'No active deploy found for this environment.',
+    observations: [`Scanned ${entries.length} processing record(s) in ${DEPLOY_PROCESSING_DIR}`],
+  };
+}
+
+function tailLines(text: string, count: number): string {
+  const lines = text.split(/\r?\n/);
+  if (count <= 0) return '';
+  return lines.slice(Math.max(0, lines.length - count)).join('\n');
+}
+
+async function runDeployLogExcerpt(environmentId: number, input: Record<string, unknown>): Promise<RunbookResult> {
+  const deploymentId = String(input.deployment_id ?? '').trim();
+  const step = String(input.step ?? 'build-magento').trim() || 'build-magento';
+  const stream = String(input.stream ?? 'stderr').trim() || 'stderr';
+  const lines = Math.min(200, Math.max(20, Number(input.lines ?? 120) || 120));
+
+  if (!deploymentId || !DEPLOY_ID.test(deploymentId)) {
+    return {
+      runbook_id: 'deploy_log_excerpt',
+      status: 'failed',
+      summary: 'Invalid or missing deployment_id.',
+      observations: ['Expected a UUID deployment_id.'],
+    };
+  }
+
+  const allowedSteps = new Set(['build-services', 'build-magento']);
+  const allowedStreams = new Set(['stdout', 'stderr']);
+  const safeStep = allowedSteps.has(step) ? step : 'build-magento';
+  const safeStream = allowedStreams.has(stream) ? stream : 'stderr';
+  const logFile = path.join(DEPLOY_WORK_DIR, deploymentId, 'logs', `${safeStep}.${safeStream}.log`);
+
+  if (!fs.existsSync(logFile)) {
+    return {
+      runbook_id: 'deploy_log_excerpt',
+      status: 'failed',
+      summary: 'Deploy log file not found.',
+      observations: [
+        `Env: ${environmentId}`,
+        `Deployment: ${deploymentId}`,
+        `Expected log: ${logFile}`,
+      ],
+    };
+  }
+
+  let raw = '';
+  try {
+    raw = fs.readFileSync(logFile, 'utf8');
+  } catch {
+    return {
+      runbook_id: 'deploy_log_excerpt',
+      status: 'failed',
+      summary: 'Unable to read deploy log file.',
+      observations: [`Log: ${logFile}`],
+    };
+  }
+
+  const excerpt = tailLines(raw, lines);
+  const observations = [
+    `Log: ${logFile}`,
+    `Tail lines: ${lines}`,
+  ];
+
+  return {
+    runbook_id: 'deploy_log_excerpt',
+    status: 'ok',
+    summary: `Returned ${lines} line(s) from ${safeStep}.${safeStream}.`,
+    observations,
+    data: {
+      deployment_id: deploymentId,
+      step: safeStep,
+      stream: safeStream,
+      lines,
+      excerpt,
+    },
+  };
 }
 
 export async function handleServiceRestart(request: Request): Promise<{ error?: string; status?: number; success?: boolean; service?: string; message?: string }> {
