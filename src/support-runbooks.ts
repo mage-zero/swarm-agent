@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
 import { buildSignature } from './node-hmac.js';
+import { getDeployPauseFilePath, isDeployPaused, readDeployPausedAt, setDeployPaused } from './deploy-pause.js';
 
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DOCKER_TIMEOUT_MS = Number(process.env.MZ_RUNBOOK_TIMEOUT_MS || 15000);
@@ -10,6 +11,8 @@ const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/depl
 const DEPLOY_FAILED_DIR = path.join(DEPLOY_QUEUE_DIR, 'failed');
 const DEPLOY_PROCESSING_DIR = path.join(DEPLOY_QUEUE_DIR, 'processing');
 const DEPLOY_WORK_DIR = path.join(DEPLOY_QUEUE_DIR, 'work');
+const DEPLOY_META_DIR = path.join(DEPLOY_QUEUE_DIR, 'meta');
+const DEPLOY_HISTORY_FILE = process.env.MZ_DEPLOY_HISTORY_FILE || path.join(DEPLOY_META_DIR, 'history.json');
 const DEPLOY_RECORD_FILENAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i;
 const DEPLOY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -34,6 +37,13 @@ type RunbookResult = {
 };
 
 const RUNBOOKS: RunbookDefinition[] = [
+  {
+    id: 'disk_usage_summary',
+    name: 'Disk usage summary',
+    description: 'Show disk usage and Docker storage usage on the node.',
+    safe: true,
+    supports_remediation: false,
+  },
   {
     id: 'php_fpm_health',
     name: 'PHP-FPM health check',
@@ -100,9 +110,51 @@ const RUNBOOKS: RunbookDefinition[] = [
   {
     id: 'deploy_log_excerpt',
     name: 'Deploy log excerpt',
-    description: 'Return a small excerpt from deploy logs (build-services/build-magento) for a specific deployment.',
+    description: 'Return a small excerpt from deploy logs (build-services/build-magento/stack-deploy) for a specific deployment.',
     safe: true,
     supports_remediation: false,
+  },
+  {
+    id: 'deploy_pause_status',
+    name: 'Deploy worker pause status',
+    description: 'Check whether the deploy worker is paused (break-glass).',
+    safe: true,
+    supports_remediation: false,
+  },
+  {
+    id: 'deploy_pause',
+    name: 'Pause deploy worker',
+    description: 'Pause the deploy worker so no new deploys start (break-glass).',
+    safe: true,
+    supports_remediation: false,
+  },
+  {
+    id: 'deploy_resume',
+    name: 'Resume deploy worker',
+    description: 'Resume the deploy worker (break-glass).',
+    safe: true,
+    supports_remediation: false,
+  },
+  {
+    id: 'deploy_rollback_previous',
+    name: 'Rollback to previous (last-known-good) artefact',
+    description: 'Queue a deploy using the previous retained artefact for this environment (break-glass).',
+    safe: false,
+    supports_remediation: true,
+  },
+  {
+    id: 'magento_maintenance_enable',
+    name: 'Enable Magento maintenance mode',
+    description: 'Enable Magento maintenance mode (break-glass).',
+    safe: false,
+    supports_remediation: true,
+  },
+  {
+    id: 'magento_maintenance_disable',
+    name: 'Disable Magento maintenance mode',
+    description: 'Disable Magento maintenance mode (break-glass).',
+    safe: false,
+    supports_remediation: true,
   },
   {
     id: 'proxysql_restart',
@@ -621,6 +673,8 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
     return { error: 'missing_parameters', status: 400 };
   }
   switch (runbookId) {
+    case 'disk_usage_summary':
+      return runDiskUsageSummary();
     case 'php_fpm_health':
       return runPhpFpmHealth(environmentId);
     case 'varnish_ready':
@@ -641,6 +695,18 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
       return runDeployActiveSummary(environmentId);
     case 'deploy_log_excerpt':
       return runDeployLogExcerpt(environmentId, input);
+    case 'deploy_pause_status':
+      return runDeployPauseStatus();
+    case 'deploy_pause':
+      return runDeployPause();
+    case 'deploy_resume':
+      return runDeployResume();
+    case 'deploy_rollback_previous':
+      return runDeployRollbackPrevious(environmentId, input);
+    case 'magento_maintenance_enable':
+      return runMagentoMaintenance(environmentId, 'enable');
+    case 'magento_maintenance_disable':
+      return runMagentoMaintenance(environmentId, 'disable');
     case 'proxysql_restart':
       return runServiceRestart(environmentId, '_proxysql', 'proxysql_restart', 'ProxySQL');
     case 'cloudflared_restart':
@@ -650,6 +716,30 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
     default:
       return { error: 'unknown_runbook', status: 404 };
   }
+}
+
+async function runDiskUsageSummary(): Promise<RunbookResult> {
+  const df = await runCommand('df', ['-h', '/'], 8000);
+  const dockerDf = await runCommand('docker', ['system', 'df'], 12000);
+
+  const dfOut = (df.stdout || df.stderr || '').trim();
+  const dockerOut = (dockerDf.stdout || dockerDf.stderr || '').trim();
+  const usageLine = dfOut.split('\n').slice(-1)[0] || '';
+  const status = usageLine.includes('100%') ? 'warning' : 'ok';
+
+  return {
+    runbook_id: 'disk_usage_summary',
+    status,
+    summary: 'Disk usage collected.',
+    observations: [
+      usageLine ? `Filesystem: ${usageLine}` : 'Filesystem usage unavailable.',
+      dockerOut ? 'Docker usage included.' : 'Docker usage unavailable.',
+    ],
+    data: {
+      df: dfOut,
+      docker_system_df: dockerOut,
+    },
+  };
 }
 
 function safeReadJsonFile(filePath: string): Record<string, unknown> | null {
@@ -738,6 +828,184 @@ function tailLines(text: string, count: number): string {
   return lines.slice(Math.max(0, lines.length - count)).join('\n');
 }
 
+type DeployHistoryEntry = { artifacts: string[]; imageTags: string[]; updated_at?: string };
+type DeployHistory = Record<string, DeployHistoryEntry>;
+
+function safeReadDeployHistory(): DeployHistory {
+  try {
+    if (!fs.existsSync(DEPLOY_HISTORY_FILE)) {
+      return {};
+    }
+    const raw = fs.readFileSync(DEPLOY_HISTORY_FILE, 'utf8');
+    const parsed = safeJsonParse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return {};
+    }
+    return parsed as DeployHistory;
+  } catch {
+    return {};
+  }
+}
+
+function ensureDir(target: string) {
+  if (!fs.existsSync(target)) {
+    fs.mkdirSync(target, { recursive: true });
+  }
+}
+
+function enqueueDeploymentRecord(payload: Record<string, unknown>, deploymentId: string) {
+  ensureDir(DEPLOY_QUEUE_DIR);
+  const target = path.join(DEPLOY_QUEUE_DIR, `${deploymentId}.json`);
+  fs.writeFileSync(
+    target,
+    JSON.stringify({ id: deploymentId, queued_at: new Date().toISOString(), payload }, null, 2),
+  );
+}
+
+async function runDeployPauseStatus(): Promise<RunbookResult> {
+  const paused = isDeployPaused();
+  const pausedAt = paused ? readDeployPausedAt() : null;
+  const filePath = getDeployPauseFilePath();
+  return {
+    runbook_id: 'deploy_pause_status',
+    status: paused ? 'warning' : 'ok',
+    summary: paused ? 'Deploy worker is paused.' : 'Deploy worker is not paused.',
+    observations: [
+      `Paused: ${paused ? 'true' : 'false'}`,
+      pausedAt ? `Paused at: ${pausedAt}` : '',
+      `File: ${filePath}`,
+    ].filter(Boolean),
+    data: { paused, paused_at: pausedAt, file: filePath },
+  };
+}
+
+async function runDeployPause(): Promise<RunbookResult> {
+  const status = setDeployPaused(true);
+  return {
+    runbook_id: 'deploy_pause',
+    status: 'ok',
+    summary: 'Deploy worker paused.',
+    observations: [
+      'Paused: true',
+      status.paused_at ? `Paused at: ${status.paused_at}` : '',
+      `File: ${status.path}`,
+    ].filter(Boolean),
+    remediation: { attempted: true, actions: ['Paused deploy worker'] },
+    data: status,
+  };
+}
+
+async function runDeployResume(): Promise<RunbookResult> {
+  const status = setDeployPaused(false);
+  return {
+    runbook_id: 'deploy_resume',
+    status: 'ok',
+    summary: 'Deploy worker resumed.',
+    observations: [
+      'Paused: false',
+      `File: ${status.path}`,
+    ],
+    remediation: { attempted: true, actions: ['Resumed deploy worker'] },
+    data: status,
+  };
+}
+
+async function runDeployRollbackPrevious(environmentId: number, input: Record<string, unknown>): Promise<RunbookResult> {
+  const repository = String(input.repository ?? '').trim();
+  const ref = String(input.ref ?? '').trim();
+  const stackId = Number(input.stack_id ?? 0);
+
+  if (!repository || !ref || !stackId) {
+    return {
+      runbook_id: 'deploy_rollback_previous',
+      status: 'failed',
+      summary: 'Missing required input for rollback.',
+      observations: ['Expected input: { repository, ref, stack_id }'],
+    };
+  }
+
+  const history = safeReadDeployHistory();
+  const key = `env:${environmentId}:${repository}`;
+  const entry = history[key];
+  const artifacts = Array.isArray(entry?.artifacts) ? entry.artifacts : [];
+  const targetArtifact = String(artifacts[1] || '').trim();
+  if (!targetArtifact) {
+    return {
+      runbook_id: 'deploy_rollback_previous',
+      status: 'failed',
+      summary: 'No previous retained artefact available for rollback.',
+      observations: [
+        `Key: ${key}`,
+        `History file: ${DEPLOY_HISTORY_FILE}`,
+        `Artifacts retained: ${artifacts.length}`,
+      ],
+      data: { key, artifacts },
+    };
+  }
+
+  const deploymentId = crypto.randomUUID();
+  enqueueDeploymentRecord({
+    artifact: targetArtifact,
+    stack_id: stackId,
+    environment_id: environmentId,
+    repository,
+    ref,
+    rollback_of: String(artifacts[0] || '') || null,
+  }, deploymentId);
+
+  return {
+    runbook_id: 'deploy_rollback_previous',
+    status: 'warning',
+    summary: `Rollback queued (deployment ${deploymentId}).`,
+    observations: [
+      `Repository: ${repository}`,
+      `Ref: ${ref}`,
+      `Using artefact: ${targetArtifact}`,
+    ],
+    remediation: { attempted: true, actions: ['Queued rollback deploy using previous artefact'] },
+    data: { deployment_id: deploymentId, artifact: targetArtifact, key, history_updated_at: entry?.updated_at || null },
+  };
+}
+
+async function runMagentoMaintenance(environmentId: number, mode: 'enable' | 'disable'): Promise<RunbookResult> {
+  const container = (await findContainer(environmentId, '_php-fpm-admin')) ?? (await findContainer(environmentId, '_php-fpm'));
+  const runbookId = mode === 'enable' ? 'magento_maintenance_enable' : 'magento_maintenance_disable';
+  if (!container) {
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'php-fpm container not found.',
+      observations: ['Unable to locate php-fpm container to run bin/magento maintenance command.'],
+    };
+  }
+
+  const cmd = mode === 'enable'
+    ? 'bin/magento maintenance:enable --no-interaction'
+    : 'bin/magento maintenance:disable --no-interaction';
+
+  const result = await runCommand('docker', [
+    'exec',
+    container.id,
+    'sh',
+    '-lc',
+    `cd /var/www/html/magento && ${cmd}`,
+  ], 60_000);
+
+  const ok = result.code === 0;
+  return {
+    runbook_id: runbookId,
+    status: ok ? 'ok' : 'failed',
+    summary: ok ? `Magento maintenance mode ${mode}d.` : `Magento maintenance mode ${mode} failed.`,
+    observations: [
+      `Container: ${container.name}`,
+      result.stdout?.trim() ? `stdout: ${tailLines(result.stdout.trim(), 20)}` : '',
+      result.stderr?.trim() ? `stderr: ${tailLines(result.stderr.trim(), 20)}` : '',
+    ].filter(Boolean),
+    remediation: { attempted: true, actions: [`Magento maintenance:${mode}`] },
+    data: { container: container.name, code: result.code },
+  };
+}
+
 async function runDeployLogExcerpt(environmentId: number, input: Record<string, unknown>): Promise<RunbookResult> {
   const deploymentId = String(input.deployment_id ?? '').trim();
   const step = String(input.step ?? 'build-magento').trim() || 'build-magento';
@@ -753,7 +1021,7 @@ async function runDeployLogExcerpt(environmentId: number, input: Record<string, 
     };
   }
 
-  const allowedSteps = new Set(['build-services', 'build-magento']);
+  const allowedSteps = new Set(['build-services', 'build-magento', 'stack-deploy']);
   const allowedStreams = new Set(['stdout', 'stderr']);
   const safeStep = allowedSteps.has(step) ? step : 'build-magento';
   const safeStream = allowedStreams.has(stream) ? stream : 'stderr';

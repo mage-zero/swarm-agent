@@ -12,7 +12,9 @@ import {
   handleTuningApprovalRequest,
 } from './status.js';
 import { handleMeshJoinRequest } from './mesh.js';
+import { handleDeployLogsBundle } from './deploy-logs.js';
 import { executeRunbook, handleServiceRestart, listRunbooks } from './support-runbooks.js';
+import { Readable } from 'stream';
 
 export const createApp = () => {
   const app = new Hono();
@@ -89,6 +91,15 @@ export const createApp = () => {
       return c.json({ error: result.error }, (result.status || 500) as ContentfulStatusCode);
     }
     return c.json(result);
+  });
+
+  app.get('/v1/deploy/logs/:deploymentId/bundle', async (c) => {
+    const result = await handleDeployLogsBundle(c);
+    if ('body' in result) {
+      return c.json(result.body, result.status as ContentfulStatusCode);
+    }
+    const stream = Readable.toWeb(result.stream) as unknown as ReadableStream;
+    return new Response(stream, { status: result.status, headers: result.headers });
   });
 
   app.get('/v1/services', async (c) => {

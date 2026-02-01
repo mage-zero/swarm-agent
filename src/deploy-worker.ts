@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
 import { spawn } from 'child_process';
+import { isDeployPaused } from './deploy-pause.js';
 import { presignS3Url } from './r2-presign.js';
 import { buildCapacityPayload, buildPlannerPayload, isSwarmManager, readConfig } from './status.js';
 
@@ -108,6 +109,7 @@ const DEPLOY_HISTORY_FILE = process.env.MZ_DEPLOY_HISTORY_FILE || path.join(DEPL
 const LEGACY_DEPLOY_HISTORY_FILE = path.join(DEPLOY_QUEUE_DIR, 'history.json');
 const DEPLOY_RECORD_FILENAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i;
 const DEPLOY_RETAIN_COUNT = Math.max(1, Number(process.env.MZ_DEPLOY_RETAIN_COUNT || 2));
+const DEPLOY_FAILED_RETAIN_COUNT = Math.max(0, Number(process.env.MZ_DEPLOY_FAILED_RETAIN_COUNT || 3));
 const DEPLOY_CLEANUP_ENABLED = (process.env.MZ_DEPLOY_CLEANUP_ENABLED || '1') !== '0';
 const REGISTRY_CLEANUP_ENABLED = (process.env.MZ_REGISTRY_CLEANUP_ENABLED || '1') !== '0';
 const REGISTRY_CLEANUP_HOST = process.env.MZ_REGISTRY_CLEANUP_HOST || process.env.REGISTRY_PUSH_HOST || '127.0.0.1';
@@ -349,6 +351,53 @@ async function cleanupWorkDirs(keepArtifactBases: Set<string>) {
       } catch {
         // ignore
       }
+    }
+  }
+}
+
+function cleanupFailedWorkDirs() {
+  if (DEPLOY_FAILED_RETAIN_COUNT <= 0) {
+    return;
+  }
+  if (!fs.existsSync(DEPLOY_WORK_DIR) || !fs.existsSync(path.join(DEPLOY_QUEUE_DIR, 'failed'))) {
+    return;
+  }
+  const failedDir = path.join(DEPLOY_QUEUE_DIR, 'failed');
+  const failedIds = new Set<string>();
+  for (const entry of fs.readdirSync(failedDir, { withFileTypes: true })) {
+    if (!entry.isFile()) continue;
+    if (!DEPLOY_RECORD_FILENAME.test(entry.name)) continue;
+    failedIds.add(path.basename(entry.name, '.json'));
+  }
+  if (!failedIds.size) {
+    return;
+  }
+
+  const candidates = fs.readdirSync(DEPLOY_WORK_DIR, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && failedIds.has(entry.name))
+    .map((entry) => {
+      const dirPath = path.join(DEPLOY_WORK_DIR, entry.name);
+      const marker = path.join(failedDir, `${entry.name}.json`);
+      let mtimeMs = 0;
+      try {
+        mtimeMs = fs.statSync(marker).mtimeMs;
+      } catch {
+        try {
+          mtimeMs = fs.statSync(dirPath).mtimeMs;
+        } catch {
+          mtimeMs = 0;
+        }
+      }
+      return { id: entry.name, dirPath, mtimeMs };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  const remove = candidates.slice(DEPLOY_FAILED_RETAIN_COUNT);
+  for (const item of remove) {
+    try {
+      fs.rmSync(item.dirPath, { recursive: true, force: true });
+    } catch {
+      // ignore
     }
   }
 }
@@ -2139,6 +2188,7 @@ async function handleDeploymentFile(recordPath: string) {
     } catch {
       // ignore
     }
+    cleanupFailedWorkDirs();
 
     const config = readConfig();
     const baseUrl = (config.mz_control_base_url || process.env.MZ_CONTROL_BASE_URL || '').trim();
@@ -2167,6 +2217,9 @@ async function tick() {
     return;
   }
   if (shutdownRequested) {
+    return;
+  }
+  if (isDeployPaused()) {
     return;
   }
   if (!(await isSwarmManager())) {
