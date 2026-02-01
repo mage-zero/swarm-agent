@@ -42,6 +42,13 @@ const RUNBOOKS: RunbookDefinition[] = [
     supports_remediation: false,
   },
   {
+    id: 'varnish_ready',
+    name: 'Varnish readiness check',
+    description: 'Check Varnish container status and reachability.',
+    safe: true,
+    supports_remediation: false,
+  },
+  {
     id: 'magento_var_permissions',
     name: 'Magento var permissions check',
     description: 'Verify Magento var directories are writable and fix if needed.',
@@ -108,6 +115,13 @@ const RUNBOOKS: RunbookDefinition[] = [
     id: 'cloudflared_restart',
     name: 'Restart Cloudflared service',
     description: 'Restart the Cloudflared service for the environment.',
+    safe: false,
+    supports_remediation: true,
+  },
+  {
+    id: 'varnish_restart',
+    name: 'Restart Varnish service',
+    description: 'Restart the Varnish service for the environment.',
     safe: false,
     supports_remediation: true,
   },
@@ -243,6 +257,54 @@ async function runPhpFpmHealth(environmentId: number): Promise<RunbookResult> {
     summary: `php-fpm status: ${container.status}`,
     observations: [`Container ${container.name} is ${container.status}`],
     data: { container },
+  };
+}
+
+async function runVarnishReady(environmentId: number): Promise<RunbookResult> {
+  const container = await findContainer(environmentId, '_varnish');
+  if (!container) {
+    return {
+      runbook_id: 'varnish_ready',
+      status: 'failed',
+      summary: 'Varnish container not found.',
+      observations: ['No varnish container matched for this environment.'],
+    };
+  }
+
+  const health = deriveHealth(container.status);
+  const ok = health === 'healthy' || health === 'up';
+  const observations: string[] = [`Container ${container.name} is ${container.status}`];
+  let probe = null as null | { code: number; stdout: string; stderr: string };
+
+  // Best-effort probe: from php-fpm container, hit Varnish /mz-healthz if curl/wget exists.
+  const probeContainer = await findContainer(environmentId, '_php-fpm');
+  if (probeContainer) {
+    probe = await runCommand('docker', [
+      'exec',
+      probeContainer.id,
+      'sh',
+      '-lc',
+      "if command -v curl >/dev/null 2>&1; then curl -fsS --max-time 5 http://varnish/mz-healthz >/dev/null; exit $?; fi; if command -v wget >/dev/null 2>&1; then wget -qO- --timeout=5 http://varnish/mz-healthz >/dev/null; exit $?; fi; exit 0",
+    ], 8000);
+    if (probe.code === 0) {
+      observations.push('Probe: http://varnish/mz-healthz reachable from php-fpm.');
+    } else {
+      observations.push('Probe: http://varnish/mz-healthz not reachable from php-fpm.');
+      if (probe.stderr?.trim()) {
+        observations.push(`Probe stderr: ${probe.stderr.trim()}`);
+      }
+    }
+  } else {
+    observations.push('Probe skipped: php-fpm container not found.');
+  }
+
+  const finalOk = ok && (!probe || probe.code === 0);
+  return {
+    runbook_id: 'varnish_ready',
+    status: finalOk ? 'ok' : ok ? 'warning' : 'failed',
+    summary: finalOk ? `Varnish status: ${container.status}` : `Varnish not ready: ${container.status}`,
+    observations,
+    data: { container, probe: probe ? { code: probe.code } : null },
   };
 }
 
@@ -561,6 +623,8 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
   switch (runbookId) {
     case 'php_fpm_health':
       return runPhpFpmHealth(environmentId);
+    case 'varnish_ready':
+      return runVarnishReady(environmentId);
     case 'magento_var_permissions':
       return runVarPermissions(environmentId);
     case 'magento_media_permissions':
@@ -581,6 +645,8 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
       return runServiceRestart(environmentId, '_proxysql', 'proxysql_restart', 'ProxySQL');
     case 'cloudflared_restart':
       return runServiceRestart(environmentId, ['cloudflared', '_tunnel'], 'cloudflared_restart', 'Cloudflared');
+    case 'varnish_restart':
+      return runServiceRestart(environmentId, '_varnish', 'varnish_restart', 'Varnish');
     default:
       return { error: 'unknown_runbook', status: 404 };
   }
