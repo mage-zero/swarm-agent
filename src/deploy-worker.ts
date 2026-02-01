@@ -1159,8 +1159,9 @@ async function waitForDatabase(containerId: string, timeoutMs: number) {
   throw new Error('Database did not become ready in time');
 }
 
-async function waitForProxySql(containerId: string, timeoutMs: number) {
+async function waitForProxySql(containerId: string, stackName: string, timeoutMs: number) {
   const start = Date.now();
+  let currentId = containerId;
   const probe = [
     '$host=getenv("MZ_DB_HOST") ?: "proxysql";',
     '$port=(int)(getenv("MZ_DB_PORT") ?: 6033);',
@@ -1169,17 +1170,26 @@ async function waitForProxySql(containerId: string, timeoutMs: number) {
   ].join(' ');
   while (Date.now() - start < timeoutMs) {
     try {
-      await runCommandCapture('docker', ['exec', containerId, 'php', '-r', probe]);
+      await runCommandCapture('docker', ['exec', currentId, 'php', '-r', probe]);
       return;
-    } catch {
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('No such container') || message.includes('is not running')) {
+        try {
+          currentId = await waitForContainer(stackName, 'php-fpm-admin', 60 * 1000);
+        } catch {
+          // ignore; retry with previous container id
+        }
+      }
       await delay(2000);
     }
   }
   throw new Error('ProxySQL did not become ready in time');
 }
 
-async function waitForRedisCache(containerId: string, timeoutMs: number) {
+async function waitForRedisCache(containerId: string, stackName: string, timeoutMs: number) {
   const start = Date.now();
+  let currentId = containerId;
   const probe = [
     '$host="redis-cache";',
     '$port=6379;',
@@ -1188,9 +1198,17 @@ async function waitForRedisCache(containerId: string, timeoutMs: number) {
   ].join(' ');
   while (Date.now() - start < timeoutMs) {
     try {
-      await runCommandCapture('docker', ['exec', containerId, 'php', '-r', probe]);
+      await runCommandCapture('docker', ['exec', currentId, 'php', '-r', probe]);
       return;
-    } catch {
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('No such container') || message.includes('is not running')) {
+        try {
+          currentId = await waitForContainer(stackName, 'php-fpm-admin', 60 * 1000);
+        } catch {
+          // ignore; retry with previous container id
+        }
+      }
       await delay(2000);
     }
   }
@@ -1571,7 +1589,7 @@ async function runSetupUpgradeWithRetry(
         log(`setup:upgrade attempt ${attempt} failed: ${message}`);
         await delay(5000);
         adminContainerId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
-        await waitForRedisCache(adminContainerId, 5 * 60 * 1000);
+        await waitForRedisCache(adminContainerId, stackName, 5 * 60 * 1000);
         continue;
       }
       throw error;
@@ -1904,8 +1922,8 @@ async function processDeployment(recordPath: string) {
     opensearchTimeout
   );
   dbContainerId = await setSearchEngine(stackName, dbContainerId, envVars.MYSQL_DATABASE || 'magento', 'mysql');
-  await waitForProxySql(adminContainerId, 5 * 60 * 1000);
-  await waitForRedisCache(adminContainerId, 5 * 60 * 1000);
+  await waitForProxySql(adminContainerId, stackName, 5 * 60 * 1000);
+  await waitForRedisCache(adminContainerId, stackName, 5 * 60 * 1000);
   adminContainerId = await ensureMagentoEnvWrapperWithRetry(adminContainerId, stackName, log);
   try {
     const upgradeResult = await runSetupUpgradeWithRetry(adminContainerId, stackName, log);
