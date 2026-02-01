@@ -1,10 +1,13 @@
 import crypto from 'crypto';
 import fs from 'fs';
+import path from 'path';
 import { spawn } from 'child_process';
 import { buildSignature } from './node-hmac.js';
 
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DOCKER_TIMEOUT_MS = Number(process.env.MZ_RUNBOOK_TIMEOUT_MS || 15000);
+const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/deployments';
+const DEPLOY_FAILED_DIR = path.join(DEPLOY_QUEUE_DIR, 'failed');
 
 type RunbookDefinition = {
   id: string;
@@ -66,6 +69,13 @@ const RUNBOOKS: RunbookDefinition[] = [
     id: 'container_restart_summary',
     name: 'Container restart summary',
     description: 'Summarize restarts and unhealthy containers.',
+    safe: true,
+    supports_remediation: false,
+  },
+  {
+    id: 'deploy_failure_summary',
+    name: 'Last deploy failure summary',
+    description: 'Show the most recent deploy failure for the environment (if any).',
     safe: true,
     supports_remediation: false,
   },
@@ -385,6 +395,88 @@ async function runRestartSummary(environmentId: number): Promise<RunbookResult> 
   };
 }
 
+function safeJsonParse(raw: string): unknown {
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+async function runDeployFailureSummary(environmentId: number): Promise<RunbookResult> {
+  if (!fs.existsSync(DEPLOY_FAILED_DIR)) {
+    return {
+      runbook_id: 'deploy_failure_summary',
+      status: 'ok',
+      summary: 'No failed deploy records directory found.',
+      observations: [`Expected path: ${DEPLOY_FAILED_DIR}`],
+    };
+  }
+
+  const files = fs.readdirSync(DEPLOY_FAILED_DIR).filter((name) => name.endsWith('.json'));
+  let best: { deploymentId: string; failedAt: string; failedAtMs: number; error: string; record: Record<string, unknown> } | null = null;
+
+  for (const file of files) {
+    const fullPath = path.join(DEPLOY_FAILED_DIR, file);
+    let raw = '';
+    try {
+      raw = fs.readFileSync(fullPath, 'utf8');
+    } catch {
+      continue;
+    }
+    const parsed = safeJsonParse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      continue;
+    }
+    const record = parsed as Record<string, unknown>;
+    const payload = (record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload))
+      ? (record.payload as Record<string, unknown>)
+      : null;
+    const envId = Number(payload?.environment_id ?? 0);
+    if (!envId || envId !== environmentId) {
+      continue;
+    }
+
+    const failedAt = String(record.failed_at ?? '').trim();
+    const failedAtMs = failedAt ? Date.parse(failedAt) : 0;
+    const deploymentId = String(record.id ?? path.basename(file, '.json')).trim() || path.basename(file, '.json');
+    const error = String(record.error ?? '').trim();
+
+    if (!best || failedAtMs > best.failedAtMs) {
+      best = { deploymentId, failedAt, failedAtMs, error, record };
+    }
+  }
+
+  if (!best) {
+    return {
+      runbook_id: 'deploy_failure_summary',
+      status: 'ok',
+      summary: 'No failed deploy records found for this environment.',
+      observations: [`Scanned ${files.length} record(s) in ${DEPLOY_FAILED_DIR}`],
+    };
+  }
+
+  const observations = [
+    best.failedAt ? `Failed at: ${best.failedAt}` : 'Failed at: (unknown)',
+    best.error ? `Error: ${best.error}` : 'Error: (missing error message)',
+  ];
+
+  return {
+    runbook_id: 'deploy_failure_summary',
+    status: 'warning',
+    summary: best.error
+      ? `Most recent deploy failed (${best.deploymentId}): ${best.error}`
+      : `Most recent deploy failed (${best.deploymentId}).`,
+    observations,
+    data: {
+      deployment_id: best.deploymentId,
+      failed_at: best.failedAt || null,
+      error: best.error || null,
+      record: best.record,
+    },
+  };
+}
+
 async function runServiceRestart(
   environmentId: number,
   includes: string | string[],
@@ -457,6 +549,8 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
       return runCloudflared(environmentId);
     case 'container_restart_summary':
       return runRestartSummary(environmentId);
+    case 'deploy_failure_summary':
+      return runDeployFailureSummary(environmentId);
     case 'proxysql_restart':
       return runServiceRestart(environmentId, '_proxysql', 'proxysql_restart', 'ProxySQL');
     case 'cloudflared_restart':
