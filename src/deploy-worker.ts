@@ -104,7 +104,9 @@ type DeployHistory = Record<string, DeployHistoryEntry>;
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/deployments';
 const DEPLOY_WORK_DIR = process.env.MZ_DEPLOY_WORK_DIR || '/opt/mage-zero/deployments/work';
-const DEPLOY_HISTORY_FILE = process.env.MZ_DEPLOY_HISTORY_FILE || path.join(DEPLOY_QUEUE_DIR, 'history.json');
+const DEPLOY_HISTORY_FILE = process.env.MZ_DEPLOY_HISTORY_FILE || path.join(DEPLOY_QUEUE_DIR, 'meta', 'history.json');
+const LEGACY_DEPLOY_HISTORY_FILE = path.join(DEPLOY_QUEUE_DIR, 'history.json');
+const DEPLOY_RECORD_FILENAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.json$/i;
 const DEPLOY_RETAIN_COUNT = Math.max(1, Number(process.env.MZ_DEPLOY_RETAIN_COUNT || 2));
 const DEPLOY_CLEANUP_ENABLED = (process.env.MZ_DEPLOY_CLEANUP_ENABLED || '1') !== '0';
 const REGISTRY_CLEANUP_ENABLED = (process.env.MZ_REGISTRY_CLEANUP_ENABLED || '1') !== '0';
@@ -193,13 +195,32 @@ function inferRepositoryFromArtifactKey(artifactKey: string) {
 }
 
 function readDeploymentHistory(): DeployHistory {
-  try {
-    const raw = fs.readFileSync(DEPLOY_HISTORY_FILE, 'utf8');
-    const parsed = JSON.parse(raw) as DeployHistory;
-    return parsed || {};
-  } catch {
-    return {};
+  const candidates = [DEPLOY_HISTORY_FILE, LEGACY_DEPLOY_HISTORY_FILE];
+  for (const file of candidates) {
+    if (!file) continue;
+    try {
+      if (!fs.existsSync(file)) continue;
+      const raw = fs.readFileSync(file, 'utf8');
+      const parsed = JSON.parse(raw) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        continue;
+      }
+      const history = parsed as DeployHistory;
+      if (file === LEGACY_DEPLOY_HISTORY_FILE && DEPLOY_HISTORY_FILE !== LEGACY_DEPLOY_HISTORY_FILE) {
+        try {
+          ensureDir(path.dirname(DEPLOY_HISTORY_FILE));
+          fs.writeFileSync(DEPLOY_HISTORY_FILE, JSON.stringify(history, null, 2));
+          fs.unlinkSync(LEGACY_DEPLOY_HISTORY_FILE);
+        } catch {
+          // ignore migration failures
+        }
+      }
+      return history;
+    } catch {
+      continue;
+    }
   }
+  return {};
 }
 
 function writeDeploymentHistory(history: DeployHistory) {
@@ -483,7 +504,7 @@ function listQueueFiles(): string[] {
     return [];
   }
   return fs.readdirSync(DEPLOY_QUEUE_DIR, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+    .filter((entry) => entry.isFile() && DEPLOY_RECORD_FILENAME.test(entry.name))
     .map((entry) => path.join(DEPLOY_QUEUE_DIR, entry.name))
     .sort((a, b) => a.localeCompare(b));
 }
@@ -514,7 +535,7 @@ function recoverProcessingQueue() {
     return;
   }
   const entries = fs.readdirSync(processingDir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+    .filter((entry) => entry.isFile() && DEPLOY_RECORD_FILENAME.test(entry.name))
     .map((entry) => entry.name);
   for (const entry of entries) {
     const source = path.join(processingDir, entry);
