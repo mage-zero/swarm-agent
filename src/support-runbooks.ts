@@ -45,6 +45,34 @@ const RUNBOOKS: RunbookDefinition[] = [
     supports_remediation: false,
   },
   {
+    id: 'db_replication_status',
+    name: 'Database replication status',
+    description: 'Inspect primary/replica roles and replication lag for the environment.',
+    safe: true,
+    supports_remediation: false,
+  },
+  {
+    id: 'db_replica_enable',
+    name: 'Enable database replica placement',
+    description: 'Ensure database-replica runs on a different node and is replicating (replica-required).',
+    safe: false,
+    supports_remediation: true,
+  },
+  {
+    id: 'db_failover',
+    name: 'Fail over database to replica',
+    description: 'Planned switchover: enable maintenance, promote replica to writer, and demote primary to replica.',
+    safe: false,
+    supports_remediation: true,
+  },
+  {
+    id: 'db_failback',
+    name: 'Fail back database to primary',
+    description: 'Planned switchover: enable maintenance, promote primary to writer, and demote replica.',
+    safe: false,
+    supports_remediation: true,
+  },
+  {
     id: 'php_fpm_health',
     name: 'PHP-FPM health check',
     description: 'Check php-fpm container status and health.',
@@ -283,12 +311,244 @@ async function findService(environmentId: number, includes: string) {
   return services.find((entry) => entry.name.includes(includes));
 }
 
+async function findContainerForService(environmentId: number, serviceName: string) {
+  return findContainer(environmentId, `_${serviceName}.`);
+}
+
 function deriveHealth(status: string) {
   const lower = status.toLowerCase();
   if (lower.includes('unhealthy')) return 'unhealthy';
   if (lower.includes('healthy')) return 'healthy';
   if (lower.includes('up')) return 'up';
   return 'down';
+}
+
+function escapeForShellDoubleQuotes(value: string) {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, ' ');
+}
+
+async function runMariaDb(containerId: string, sql: string, timeoutMs = 60_000) {
+  const safeSql = escapeForShellDoubleQuotes(sql);
+  return runCommand('docker', [
+    'exec',
+    containerId,
+    'sh',
+    '-lc',
+    [
+      'set -e',
+      'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+      `mariadb -uroot -p"$ROOT_PASS" -N -B -e "${safeSql}"`,
+    ].join(' && '),
+  ], timeoutMs);
+}
+
+async function runMariaDbRaw(containerId: string, sql: string, timeoutMs = 60_000) {
+  const safeSql = escapeForShellDoubleQuotes(sql);
+  return runCommand('docker', [
+    'exec',
+    containerId,
+    'sh',
+    '-lc',
+    [
+      'set -e',
+      'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+      `mariadb -uroot -p"$ROOT_PASS" -e "${safeSql}"`,
+    ].join(' && '),
+  ], timeoutMs);
+}
+
+async function getReadOnly(containerId: string): Promise<boolean | null> {
+  const result = await runMariaDb(containerId, 'SELECT @@GLOBAL.read_only;');
+  if (result.code !== 0) return null;
+  const value = result.stdout.trim();
+  if (value === '0') return false;
+  if (value === '1') return true;
+  return null;
+}
+
+async function setReadOnly(containerId: string, enabled: boolean): Promise<boolean> {
+  const value = enabled ? 1 : 0;
+  const result = await runMariaDbRaw(containerId, `SET GLOBAL read_only=${value};`);
+  return result.code === 0;
+}
+
+type SlaveStatus = Record<string, string>;
+
+function parseSlaveStatus(raw: string): SlaveStatus | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const out: Record<string, string> = {};
+  for (const line of trimmed.split('\n')) {
+    const idx = line.indexOf(':');
+    if (idx <= 0) continue;
+    const key = line.slice(0, idx).trim();
+    const value = line.slice(idx + 1).trim();
+    if (key) out[key] = value;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+async function getSlaveStatus(containerId: string): Promise<SlaveStatus | null> {
+  const result = await runCommand('docker', [
+    'exec',
+    containerId,
+    'sh',
+    '-lc',
+    [
+      'set -e',
+      'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+      // SHOW SLAVE STATUS returns 0 rows when not configured; \G makes it easier to parse.
+      'mariadb -uroot -p"$ROOT_PASS" -e "SHOW SLAVE STATUS\\G" || true',
+    ].join(' && '),
+  ], 60_000);
+  if (result.code !== 0) {
+    return null;
+  }
+  return parseSlaveStatus(result.stdout);
+}
+
+async function waitForReplicaCaughtUp(replicaId: string, timeoutMs = 120_000): Promise<{ ok: boolean; lagSeconds: number | null; note?: string }> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const status = await getSlaveStatus(replicaId);
+    if (!status) {
+      return { ok: false, lagSeconds: null, note: 'replica not configured (no slave status)' };
+    }
+    const ioRunning = status.Slave_IO_Running || '';
+    const sqlRunning = status.Slave_SQL_Running || '';
+    const secondsRaw = status.Seconds_Behind_Master ?? '';
+    const lag = secondsRaw === '' || secondsRaw.toUpperCase() === 'NULL' ? null : Number.parseInt(secondsRaw, 10);
+    const lagOk = lag === 0;
+    const runningOk = ioRunning.toLowerCase() === 'yes' && sqlRunning.toLowerCase() === 'yes';
+    if (runningOk && lagOk) {
+      return { ok: true, lagSeconds: lag };
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return { ok: false, lagSeconds: null, note: 'timeout waiting for replica catch-up' };
+}
+
+async function stopAndResetSlave(containerId: string): Promise<boolean> {
+  const result = await runMariaDbRaw(containerId, 'STOP SLAVE; RESET SLAVE ALL;');
+  if (result.code === 0) return true;
+  const stderr = (result.stderr || '').toLowerCase();
+  if (
+    stderr.includes('no slave')
+    || stderr.includes('not a slave')
+    || stderr.includes('slave thread')
+    || stderr.includes('error 1198')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+async function configureAsReplica(containerId: string, masterHost: string, replicaUser: string): Promise<boolean> {
+  const safeHost = masterHost.replace(/'/g, "''");
+  const safeUser = replicaUser.replace(/'/g, "''");
+  const passRef = '${REPL_PASS}';
+  const sql = `CHANGE MASTER TO MASTER_HOST='${safeHost}', MASTER_PORT=3306, MASTER_USER='${safeUser}', MASTER_PASSWORD='${passRef}', MASTER_USE_GTID=slave_pos; START SLAVE;`;
+  const safeSql = escapeForShellDoubleQuotes(sql);
+  const result = await runCommand('docker', [
+    'exec',
+    containerId,
+    'sh',
+    '-lc',
+    [
+      'set -e',
+      'REPL_PASS="$(cat /run/secrets/db_replication_password)"',
+      'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+      `mariadb -uroot -p"$ROOT_PASS" -e "${safeSql}"`,
+    ].join(' && '),
+  ], 90_000);
+  return result.code === 0;
+}
+
+async function scaleEnvironmentService(environmentId: number, serviceName: string, replicas: number): Promise<{ ok: boolean; note?: string }> {
+  const target = `mz-env-${environmentId}_${serviceName}=${replicas}`;
+  const result = await runCommand('docker', ['service', 'scale', target], 60_000);
+  if (result.code !== 0) {
+    return { ok: false, note: result.stderr.trim() || result.stdout.trim() || `failed to scale ${target}` };
+  }
+  return { ok: true };
+}
+
+async function getServiceTaskNode(environmentId: number, serviceName: string): Promise<string | null> {
+  const service = `mz-env-${environmentId}_${serviceName}`;
+  const result = await runCommand('docker', ['service', 'ps', service, '--no-trunc', '--format', '{{.Node}}|{{.CurrentState}}'], 12_000);
+  if (result.code !== 0) return null;
+  const lines = result.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+  const running = lines.find((line) => line.includes('|Running')) || lines[0] || '';
+  const node = running.split('|')[0]?.trim() || '';
+  return node || null;
+}
+
+async function getNodeLabels(): Promise<Array<{ id: string; hostname: string; labels: Record<string, string>; availability: string; status: string; role: string }>> {
+  const ls = await runCommand('docker', ['node', 'ls', '--format', '{{.ID}}|{{.Hostname}}|{{.Status}}|{{.Availability}}|{{.ManagerStatus}}'], 12_000);
+  if (ls.code !== 0) return [];
+  const nodes = ls.stdout.split('\n').map((l) => l.trim()).filter(Boolean).map((line) => {
+    const [id, hostname, status, availability, managerStatus] = line.split('|');
+    const role = managerStatus && managerStatus.trim() !== '' ? 'manager' : 'worker';
+    return { id: id.trim(), hostname: (hostname || '').trim(), status: (status || '').trim(), availability: (availability || '').trim(), role };
+  });
+  const out: Array<{ id: string; hostname: string; labels: Record<string, string>; availability: string; status: string; role: string }> = [];
+  for (const node of nodes) {
+    const inspect = await runCommand('docker', ['node', 'inspect', node.id, '--format', '{{json .Spec.Labels}}'], 12_000);
+    let labels: Record<string, string> = {};
+    try {
+      const parsed = JSON.parse(inspect.stdout.trim() || '{}') as Record<string, string>;
+      if (parsed && typeof parsed === 'object') labels = parsed;
+    } catch {
+      labels = {};
+    }
+    out.push({ ...node, labels });
+  }
+  return out;
+}
+
+async function updateNodeLabel(nodeId: string, labelKey: string, labelValue: string | null): Promise<boolean> {
+  const args = ['node', 'update'];
+  if (labelValue === null) {
+    args.push('--label-rm', labelKey);
+  } else {
+    args.push('--label-add', `${labelKey}=${labelValue}`);
+  }
+  args.push(nodeId);
+  const result = await runCommand('docker', args, 20_000);
+  return result.code === 0;
+}
+
+async function queryProxySqlHostgroups(environmentId: number): Promise<Array<{ hostgroup: number; hostname: string; status: string }>> {
+  const container = await findContainerForService(environmentId, 'proxysql');
+  if (!container) return [];
+  const result = await runCommand('docker', [
+    'exec',
+    container.id,
+    'sh',
+    '-lc',
+    'mysql -h 127.0.0.1 -P 6032 -u admin -padmin -N -B -e "SELECT hostgroup_id,hostname,status FROM runtime_mysql_servers ORDER BY hostgroup_id,hostname;" 2>/dev/null || true',
+  ], 12_000);
+  if (result.code !== 0) return [];
+  return result.stdout
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [hg, hostname, status] = line.split(/\s+/);
+      return { hostgroup: Number(hg || 0), hostname: String(hostname || ''), status: String(status || '') };
+    })
+    .filter((row) => Number.isFinite(row.hostgroup) && row.hostgroup > 0 && row.hostname !== '');
+}
+
+async function waitForProxySqlWriter(environmentId: number, writerHost: string, timeoutMs = 30_000): Promise<boolean> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const rows = await queryProxySqlHostgroups(environmentId);
+    const writer = rows.find((row) => row.hostgroup === 10 && row.hostname === writerHost);
+    if (writer) return true;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return false;
 }
 
 async function runPhpFpmHealth(environmentId: number): Promise<RunbookResult> {
@@ -675,6 +935,14 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
   switch (runbookId) {
     case 'disk_usage_summary':
       return runDiskUsageSummary();
+    case 'db_replication_status':
+      return runDbReplicationStatus(environmentId);
+    case 'db_replica_enable':
+      return runDbReplicaEnable(environmentId);
+    case 'db_failover':
+      return runDbSwitchRole(environmentId, 'to_replica');
+    case 'db_failback':
+      return runDbSwitchRole(environmentId, 'to_primary');
     case 'php_fpm_health':
       return runPhpFpmHealth(environmentId);
     case 'varnish_ready':
@@ -738,6 +1006,342 @@ async function runDiskUsageSummary(): Promise<RunbookResult> {
     data: {
       df: dfOut,
       docker_system_df: dockerOut,
+    },
+  };
+}
+
+async function runDbReplicationStatus(environmentId: number): Promise<RunbookResult> {
+  const primary = await findContainerForService(environmentId, 'database');
+  const replica = await findContainerForService(environmentId, 'database-replica');
+
+  if (!primary) {
+    return {
+      runbook_id: 'db_replication_status',
+      status: 'failed',
+      summary: 'Primary database container not found.',
+      observations: [`No database container matched for environment ${environmentId}.`],
+    };
+  }
+
+  const observations: string[] = [];
+  const data: Record<string, unknown> = {};
+
+  const primaryReadOnly = await getReadOnly(primary.id);
+  const primarySlave = await getSlaveStatus(primary.id);
+  observations.push(`Primary: ${primary.name} (${primary.status})`);
+  observations.push(`Primary read_only: ${primaryReadOnly === null ? 'unknown' : primaryReadOnly ? 'ON' : 'OFF'}`);
+  observations.push(`Primary replication: ${primarySlave ? 'configured' : 'not configured'}`);
+  data.primary = {
+    container: primary,
+    read_only: primaryReadOnly,
+    slave_status: primarySlave,
+  };
+
+  if (!replica) {
+    observations.push('Replica: not running (database-replica container not found).');
+    return {
+      runbook_id: 'db_replication_status',
+      status: 'warning',
+      summary: 'Replica container not found.',
+      observations,
+      data,
+    };
+  }
+
+  const replicaReadOnly = await getReadOnly(replica.id);
+  const replicaSlave = await getSlaveStatus(replica.id);
+  const lagRaw = replicaSlave?.Seconds_Behind_Master ?? '';
+  const lagSeconds = lagRaw === '' || String(lagRaw).toUpperCase() === 'NULL'
+    ? null
+    : Number.parseInt(String(lagRaw), 10);
+  observations.push(`Replica: ${replica.name} (${replica.status})`);
+  observations.push(`Replica read_only: ${replicaReadOnly === null ? 'unknown' : replicaReadOnly ? 'ON' : 'OFF'}`);
+  observations.push(`Replica replication: ${replicaSlave ? 'configured' : 'not configured'}`);
+  if (replicaSlave) {
+    observations.push(`Replica lag: ${lagSeconds === null ? '(unknown)' : `${lagSeconds}s`}`);
+  }
+  data.replica = {
+    container: replica,
+    read_only: replicaReadOnly,
+    slave_status: replicaSlave,
+    lag_seconds: lagSeconds,
+  };
+
+  const writer = (primaryReadOnly === false && !primarySlave)
+    ? 'database'
+    : (replicaReadOnly === false && !replicaSlave)
+      ? 'database-replica'
+      : '(unknown)';
+
+  const primaryNode = await getServiceTaskNode(environmentId, 'database');
+  const replicaNode = await getServiceTaskNode(environmentId, 'database-replica');
+  if (primaryNode) observations.push(`Primary node: ${primaryNode}`);
+  if (replicaNode) observations.push(`Replica node: ${replicaNode}`);
+  if (primaryNode && replicaNode && primaryNode === replicaNode) {
+    observations.push('Warning: primary and replica are co-located on the same node.');
+  }
+
+  observations.push(`Writer (best-effort): ${writer}`);
+
+  return {
+    runbook_id: 'db_replication_status',
+    status: writer === '(unknown)' ? 'warning' : 'ok',
+    summary: `DB topology: writer=${writer}`,
+    observations,
+    data,
+  };
+}
+
+async function runDbReplicaEnable(environmentId: number): Promise<RunbookResult> {
+  const actions: string[] = [];
+  const observations: string[] = [];
+
+  const nodes = await getNodeLabels();
+  const ready = nodes.filter(
+    (node) => node.status.toLowerCase() === 'ready' && node.availability.toLowerCase() === 'active',
+  );
+  if (ready.length < 2) {
+    return {
+      runbook_id: 'db_replica_enable',
+      status: 'failed',
+      summary: 'Replica requires at least 2 ready nodes.',
+      observations: [`Ready nodes: ${ready.length}`],
+      remediation: { attempted: false, actions: [] },
+      data: { ready_nodes: ready.map((n) => ({ id: n.id, hostname: n.hostname })) },
+    };
+  }
+
+  const dbNode = ready.find((node) => node.labels.database === 'true') || null;
+  if (!dbNode) {
+    return {
+      runbook_id: 'db_replica_enable',
+      status: 'failed',
+      summary: 'No database=true node label found.',
+      observations: ['Database placement requires one node labelled database=true.'],
+      remediation: { attempted: false, actions: [] },
+      data: { nodes: ready.map((n) => ({ id: n.id, hostname: n.hostname, labels: n.labels })) },
+    };
+  }
+
+  const existingReplicaNode = ready.find((node) => node.labels.database_replica === 'true') || null;
+  let targetReplicaNode = existingReplicaNode;
+
+  if (!targetReplicaNode || targetReplicaNode.id === dbNode.id) {
+    const candidates = ready.filter((node) => node.id !== dbNode.id);
+    // Prefer a worker node for replica placement.
+    targetReplicaNode = candidates.find((node) => node.role === 'worker') || candidates[0] || null;
+  }
+
+  if (!targetReplicaNode) {
+    return {
+      runbook_id: 'db_replica_enable',
+      status: 'failed',
+      summary: 'Unable to choose a replica node.',
+      observations: ['No suitable node available for database_replica=true.'],
+      remediation: { attempted: false, actions: [] },
+    };
+  }
+
+  if (existingReplicaNode && existingReplicaNode.id !== targetReplicaNode.id) {
+    const removed = await updateNodeLabel(existingReplicaNode.id, 'database_replica', null);
+    actions.push(removed
+      ? `Removed database_replica label from ${existingReplicaNode.hostname || existingReplicaNode.id}`
+      : `Failed to remove database_replica label from ${existingReplicaNode.hostname || existingReplicaNode.id}`);
+  }
+  if (!existingReplicaNode || existingReplicaNode.id !== targetReplicaNode.id) {
+    const added = await updateNodeLabel(targetReplicaNode.id, 'database_replica', 'true');
+    actions.push(added
+      ? `Set database_replica=true on ${targetReplicaNode.hostname || targetReplicaNode.id}`
+      : `Failed to set database_replica=true on ${targetReplicaNode.hostname || targetReplicaNode.id}`);
+  }
+
+  // Ensure the replica service is running (deploy may have set replicas=0 when no label existed).
+  const scale = await scaleEnvironmentService(environmentId, 'database-replica', 1);
+  actions.push(scale.ok ? 'Scaled database-replica service to 1' : `Failed to scale database-replica: ${scale.note || ''}`.trim());
+
+  // Wait for replica container to exist.
+  const startedAt = Date.now();
+  let replica = await findContainerForService(environmentId, 'database-replica');
+  while (!replica && Date.now() - startedAt < 5 * 60_000) {
+    await new Promise((r) => setTimeout(r, 2000));
+    replica = await findContainerForService(environmentId, 'database-replica');
+  }
+
+  if (!replica) {
+    return {
+      runbook_id: 'db_replica_enable',
+      status: 'failed',
+      summary: 'Replica container did not start.',
+      observations: ['database-replica service scaled, but no container was found within timeout.'],
+      remediation: { attempted: true, actions },
+    };
+  }
+
+  // Best-effort: if replication is not configured, configure it.
+  let slave = await getSlaveStatus(replica.id);
+  if (!slave) {
+    const configured = await configureAsReplica(replica.id, 'database', 'replica');
+    actions.push(configured ? 'Configured replication on database-replica' : 'Failed to configure replication on database-replica');
+    slave = await getSlaveStatus(replica.id);
+  }
+
+  // Ensure read_only is on for replica.
+  const setRo = await setReadOnly(replica.id, true);
+  actions.push(setRo ? 'Set replica read_only=ON' : 'Failed to set replica read_only');
+
+  const primaryNode = await getServiceTaskNode(environmentId, 'database');
+  const replicaNode = await getServiceTaskNode(environmentId, 'database-replica');
+  if (primaryNode) observations.push(`Primary node: ${primaryNode}`);
+  if (replicaNode) observations.push(`Replica node: ${replicaNode}`);
+  if (primaryNode && replicaNode && primaryNode === replicaNode) {
+    observations.push('Warning: primary and replica are still co-located; check node labels.');
+  }
+
+  const lagRaw = slave?.Seconds_Behind_Master ?? '';
+  const lagSeconds = lagRaw === '' || String(lagRaw).toUpperCase() === 'NULL'
+    ? null
+    : Number.parseInt(String(lagRaw), 10);
+  if (slave) {
+    observations.push(`Replica lag: ${lagSeconds === null ? '(unknown)' : `${lagSeconds}s`}`);
+  } else {
+    observations.push('Replica replication: not configured.');
+  }
+
+  const ok = Boolean(slave) && (!primaryNode || !replicaNode || primaryNode !== replicaNode);
+  return {
+    runbook_id: 'db_replica_enable',
+    status: ok ? 'ok' : 'warning',
+    summary: ok ? 'Replica placement enabled.' : 'Replica placement partially configured.',
+    observations,
+    remediation: { attempted: true, actions },
+    data: {
+      db_node: dbNode.hostname || dbNode.id,
+      replica_node: targetReplicaNode.hostname || targetReplicaNode.id,
+      primary_task_node: primaryNode,
+      replica_task_node: replicaNode,
+      replica_lag_seconds: lagSeconds,
+    },
+  };
+}
+
+type DbSwitchDirection = 'to_replica' | 'to_primary';
+
+async function runDbSwitchRole(environmentId: number, direction: DbSwitchDirection): Promise<RunbookResult> {
+  const actions: string[] = [];
+  const observations: string[] = [];
+
+  const fromService = direction === 'to_replica' ? 'database' : 'database-replica';
+  const toService = direction === 'to_replica' ? 'database-replica' : 'database';
+
+  const fromContainer = await findContainerForService(environmentId, fromService);
+  const toContainer = await findContainerForService(environmentId, toService);
+
+  if (!fromContainer || !toContainer) {
+    return {
+      runbook_id: direction === 'to_replica' ? 'db_failover' : 'db_failback',
+      status: 'failed',
+      summary: 'Database containers not found.',
+      observations: [
+        fromContainer ? `Found ${fromService}: ${fromContainer.name}` : `Missing ${fromService} container.`,
+        toContainer ? `Found ${toService}: ${toContainer.name}` : `Missing ${toService} container.`,
+      ],
+      remediation: { attempted: false, actions: [] },
+    };
+  }
+
+  const desiredWriterHost = toService;
+  const runbookId = direction === 'to_replica' ? 'db_failover' : 'db_failback';
+
+  // Quick no-op check.
+  const toReadOnly = await getReadOnly(toContainer.id);
+  const toSlave = await getSlaveStatus(toContainer.id);
+  if (toReadOnly === false && !toSlave) {
+    return {
+      runbook_id: runbookId,
+      status: 'ok',
+      summary: `Database already writing on ${desiredWriterHost}.`,
+      observations: [
+        `${toService} is already read_only=OFF and not configured as a replica.`,
+      ],
+      remediation: { attempted: false, actions: [] },
+      data: { writer: desiredWriterHost },
+    };
+  }
+
+  // Maintenance mode + pause cron to quiesce writes.
+  const maintenance = await runMagentoMaintenance(environmentId, 'enable');
+  actions.push('Enabled Magento maintenance mode');
+  observations.push(...maintenance.observations.map((line) => `Maintenance: ${line}`));
+  if (maintenance.status !== 'ok') {
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Failed to enable maintenance mode; aborting switchover.',
+      observations,
+      remediation: { attempted: true, actions },
+      data: { direction, writer_target: desiredWriterHost },
+    };
+  }
+
+  const cronDown = await scaleEnvironmentService(environmentId, 'cron', 0);
+  actions.push(cronDown.ok ? 'Scaled cron service to 0' : `Failed to scale cron service: ${cronDown.note || ''}`.trim());
+
+  // Demote current writer (fromService) to read-only before we wait for catch-up.
+  const roSet = await setReadOnly(fromContainer.id, true);
+  actions.push(roSet ? `Set ${fromService} read_only=ON` : `Failed to set ${fromService} read_only=ON`);
+
+  // Ensure the target (toService) is caught up before promotion.
+  const caughtUp = await waitForReplicaCaughtUp(toContainer.id, 180_000);
+  observations.push(caughtUp.ok ? 'Replica catch-up: OK' : `Replica catch-up: ${caughtUp.note || 'not caught up'}`);
+  if (!caughtUp.ok) {
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Replica is not caught up; aborting switchover to avoid data loss.',
+      observations,
+      remediation: { attempted: true, actions },
+      data: { direction, writer_target: desiredWriterHost },
+    };
+  }
+
+  // Promote target to writer.
+  const stopReplica = await stopAndResetSlave(toContainer.id);
+  actions.push(stopReplica ? `Stopped replication on ${toService}` : `Failed to stop replication on ${toService}`);
+  const rw = await setReadOnly(toContainer.id, false);
+  actions.push(rw ? `Set ${toService} read_only=OFF` : `Failed to set ${toService} read_only=OFF`);
+
+  // Configure the old writer as a replica of the new writer.
+  const cleaned = await stopAndResetSlave(fromContainer.id);
+  actions.push(cleaned ? `Cleared replication state on ${fromService}` : `Failed to clear replication state on ${fromService}`);
+  const configured = await configureAsReplica(fromContainer.id, toService, 'replica');
+  actions.push(configured ? `Configured ${fromService} as replica of ${toService}` : `Failed to configure ${fromService} replication`);
+  const roAgain = await setReadOnly(fromContainer.id, true);
+  actions.push(roAgain ? `Set ${fromService} read_only=ON` : `Failed to set ${fromService} read_only=ON`);
+
+  // Wait for ProxySQL to see the new writer hostgroup (best-effort).
+  const proxysqlOk = await waitForProxySqlWriter(environmentId, desiredWriterHost, 45_000);
+  observations.push(proxysqlOk
+    ? `ProxySQL: writer now ${desiredWriterHost}`
+    : `ProxySQL: writer not confirmed as ${desiredWriterHost} (may still converge)`);
+
+  // Resume cron and disable maintenance mode.
+  const cronUp = await scaleEnvironmentService(environmentId, 'cron', 1);
+  actions.push(cronUp.ok ? 'Scaled cron service to 1' : `Failed to scale cron service: ${cronUp.note || ''}`.trim());
+
+  const maintenanceOff = await runMagentoMaintenance(environmentId, 'disable');
+  actions.push('Disabled Magento maintenance mode');
+  observations.push(...maintenanceOff.observations.map((line) => `Maintenance: ${line}`));
+
+  return {
+    runbook_id: runbookId,
+    status: proxysqlOk ? 'ok' : 'warning',
+    summary: `Switchover complete. Writer is now ${desiredWriterHost}.`,
+    observations,
+    remediation: { attempted: true, actions },
+    data: {
+      direction,
+      writer: desiredWriterHost,
+      proxysql_writer_confirmed: proxysqlOk,
     },
   };
 }
