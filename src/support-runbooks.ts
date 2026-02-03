@@ -1,12 +1,26 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { spawn } from 'child_process';
 import { buildSignature } from './node-hmac.js';
 import { getDeployPauseFilePath, isDeployPaused, readDeployPausedAt, setDeployPaused } from './deploy-pause.js';
+import { runCommand } from './exec.js';
+import {
+  buildJobName,
+  envServiceName,
+  findEnvironmentService,
+  getServiceTaskNode,
+  inspectServiceSpec,
+  listEnvironmentServices,
+  listServiceTasks,
+  pickNetworkName,
+  pickSecretName,
+  runSwarmJob,
+  summarizeServiceTasks,
+  waitForServiceNotRunning,
+  waitForServiceRunning,
+} from './swarm.js';
 
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
-const DOCKER_TIMEOUT_MS = Number(process.env.MZ_RUNBOOK_TIMEOUT_MS || 15000);
 const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/deployments';
 const DEPLOY_FAILED_DIR = path.join(DEPLOY_QUEUE_DIR, 'failed');
 const DEPLOY_PROCESSING_DIR = path.join(DEPLOY_QUEUE_DIR, 'processing');
@@ -273,326 +287,48 @@ async function validateNodeRequest(request: Request): Promise<boolean> {
   return timingSafeEquals(expected, signature);
 }
 
-function runCommand(command: string, args: string[], timeoutMs = DOCKER_TIMEOUT_MS): Promise<{ code: number; stdout: string; stderr: string }> {
-  return new Promise((resolve) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-    }, timeoutMs);
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      resolve({ code: code ?? 1, stdout, stderr });
-    });
-  });
-}
-
-type SwarmServiceSecret = {
-  file_name: string;
-  secret_name: string;
-};
-
-type SwarmServiceNetwork = {
-  name: string;
-  aliases: string[];
-};
-
-type SwarmServiceMount = {
-  type: string;
-  source: string;
-  target: string;
-  read_only: boolean;
-};
-
-type SwarmServiceSpecSummary = {
-  service_name: string;
-  image: string;
-  networks: SwarmServiceNetwork[];
-  secrets: SwarmServiceSecret[];
-  mounts: SwarmServiceMount[];
-};
-
-const networkNameCache = new Map<string, string>();
-
-async function getNetworkName(networkId: string): Promise<string | null> {
-  const cached = networkNameCache.get(networkId);
-  if (cached) return cached;
-  const result = await runCommand('docker', ['network', 'inspect', networkId, '--format', '{{.Name}}'], 12_000);
-  if (result.code !== 0) return null;
-  const name = result.stdout.trim();
-  if (!name) return null;
-  networkNameCache.set(networkId, name);
-  return name;
-}
-
-async function inspectServiceSpec(serviceName: string): Promise<SwarmServiceSpecSummary | null> {
-  const result = await runCommand('docker', ['service', 'inspect', serviceName, '--format', '{{json .}}'], 12_000);
-  if (result.code !== 0) return null;
-  let parsed: Record<string, unknown> | null = null;
-  try {
-    parsed = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
-  } catch {
-    parsed = null;
-  }
-  if (!parsed || typeof parsed !== 'object') return null;
-
-  const spec = (parsed as any).Spec as Record<string, unknown> | undefined;
-  const task = (spec as any)?.TaskTemplate as Record<string, unknown> | undefined;
-  const containerSpec = (task as any)?.ContainerSpec as Record<string, unknown> | undefined;
-  const image = String((containerSpec as any)?.Image || '').trim();
-  if (!image) return null;
-
-  const networksRaw = Array.isArray((task as any)?.Networks) ? (task as any).Networks as Array<Record<string, unknown>> : [];
-  const networks: SwarmServiceNetwork[] = [];
-  for (const entry of networksRaw) {
-    const targetId = String((entry as any)?.Target || '').trim();
-    const aliases = Array.isArray((entry as any)?.Aliases) ? (entry as any).Aliases.map((a: unknown) => String(a || '').trim()).filter(Boolean) : [];
-    if (!targetId) continue;
-    const networkName = await getNetworkName(targetId);
-    if (!networkName) continue;
-    networks.push({ name: networkName, aliases });
-  }
-
-  const secretsRaw = Array.isArray((containerSpec as any)?.Secrets) ? (containerSpec as any).Secrets as Array<Record<string, unknown>> : [];
-  const secrets: SwarmServiceSecret[] = [];
-  for (const entry of secretsRaw) {
-    const file = (entry as any)?.File as Record<string, unknown> | undefined;
-    const fileName = String((file as any)?.Name || '').trim();
-    const secretName = String((entry as any)?.SecretName || '').trim();
-    if (!fileName || !secretName) continue;
-    secrets.push({ file_name: fileName, secret_name: secretName });
-  }
-
-  const mountsRaw = Array.isArray((containerSpec as any)?.Mounts) ? (containerSpec as any).Mounts as Array<Record<string, unknown>> : [];
-  const mounts: SwarmServiceMount[] = [];
-  for (const entry of mountsRaw) {
-    const type = String((entry as any)?.Type || '').trim();
-    const source = String((entry as any)?.Source || '').trim();
-    const target = String((entry as any)?.Target || '').trim();
-    const readOnly = Boolean((entry as any)?.ReadOnly);
-    if (!type || !source || !target) continue;
-    mounts.push({ type, source, target, read_only: readOnly });
-  }
-
-  return {
-    service_name: serviceName,
-    image,
-    networks,
-    secrets,
-    mounts,
-  };
-}
-
-type SwarmJobOptions = {
-  name: string;
-  image: string;
-  command: string[];
-  networks?: string[];
-  secrets?: Array<{ source: string; target: string }>;
-  mounts?: Array<{ type: string; source: string; target: string; read_only?: boolean }>;
-  env?: Record<string, string>;
-  constraints?: string[];
-  timeout_ms?: number;
-};
-
-async function runSwarmJob(options: SwarmJobOptions): Promise<{ ok: boolean; state: string; logs: string; error?: string; details?: string[] }> {
-  const timeoutMs = options.timeout_ms ?? 5 * 60_000;
-  const args: string[] = [
-    'service',
-    'create',
-    '--quiet',
-    '--name',
-    options.name,
-    '--restart-condition',
-    'none',
-    '--mode',
-    'replicated-job',
-    '--replicas',
-    '1',
-  ];
-
-  for (const network of options.networks || []) {
-    args.push('--network', network);
-  }
-
-  for (const secret of options.secrets || []) {
-    args.push('--secret', `source=${secret.source},target=${secret.target}`);
-  }
-
-  for (const mount of options.mounts || []) {
-    const readOnly = mount.read_only ? ',readonly' : '';
-    args.push('--mount', `type=${mount.type},src=${mount.source},dst=${mount.target}${readOnly}`);
-  }
-
-  for (const [key, value] of Object.entries(options.env || {})) {
-    args.push('--env', `${key}=${value}`);
-  }
-
-  for (const constraint of options.constraints || []) {
-    args.push('--constraint', constraint);
-  }
-
-  args.push(options.image, ...options.command);
-
-  const created = await runCommand('docker', args, 30_000);
-  if (created.code !== 0) {
-    return {
-      ok: false,
-      state: 'create_failed',
-      logs: '',
-      error: created.stderr.trim() || created.stdout.trim() || 'failed to create swarm job',
-    };
-  }
-
-  const startedAt = Date.now();
-  const details: string[] = [];
-  let finalState = 'unknown';
-  while (Date.now() - startedAt < timeoutMs) {
-    const ps = await runCommand('docker', ['service', 'ps', options.name, '--no-trunc', '--format', '{{.CurrentState}}|{{.Error}}'], 12_000);
-    const lines = ps.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
-    if (lines.length) {
-      details.splice(0, details.length, ...lines.slice(0, 5));
-      const [stateRaw] = (lines[0] || '').split('|');
-      const stateWord = (stateRaw || '').trim().split(' ')[0] || '';
-      if (stateWord) {
-        finalState = stateWord;
-      }
-      if (stateWord === 'Complete' || stateWord === 'Failed' || stateWord === 'Rejected') {
-        break;
-      }
-    }
-    await new Promise((r) => setTimeout(r, 500));
-  }
-
-  const logResult = await runCommand('docker', ['service', 'logs', options.name, '--raw', '--no-task-ids'], 30_000);
-  const logs = (logResult.stdout || logResult.stderr || '').trim();
-
-  await runCommand('docker', ['service', 'rm', options.name], 12_000);
-
-  const ok = finalState === 'Complete';
-  if (!ok && finalState === 'unknown') {
-    return {
-      ok: false,
-      state: 'timeout',
-      logs,
-      error: `swarm job timed out after ${timeoutMs}ms`,
-      details,
-    };
-  }
-
-  return {
-    ok,
-    state: finalState,
-    logs,
-    error: ok ? undefined : `swarm job ended with state: ${finalState}`,
-    details,
-  };
-}
-
-async function listEnvironmentContainers(environmentId: number) {
-  const filter = `name=mz-env-${environmentId}_`;
-  const result = await runCommand('docker', ['ps', '--filter', filter, '--format', '{{.ID}}|{{.Names}}|{{.Status}}']);
-  const entries = result.stdout
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const [id, name, status] = line.split('|');
-      return { id, name, status };
-    });
-  return entries;
-}
-
-async function listEnvironmentServices(environmentId: number) {
-  const result = await runCommand('docker', ['service', 'ls', '--format', '{{.ID}}|{{.Name}}|{{.Replicas}}']);
-  const entries = result.stdout
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const [id, name, replicas] = line.split('|');
-      return { id, name, replicas };
-    })
-    .filter((entry) => entry.name.includes(`mz-env-${environmentId}_`));
-  return entries;
-}
-
-async function findContainer(environmentId: number, includes: string) {
-  const containers = await listEnvironmentContainers(environmentId);
-  return containers.find((entry) => entry.name.includes(includes));
-}
-
-async function findService(environmentId: number, includes: string) {
-  const services = await listEnvironmentServices(environmentId);
-  return services.find((entry) => entry.name.includes(includes));
-}
-
-async function findContainerForService(environmentId: number, serviceName: string) {
-  return findContainer(environmentId, `_${serviceName}.`);
-}
-
-function deriveHealth(status: string) {
-  const lower = status.toLowerCase();
-  if (lower.includes('unhealthy')) return 'unhealthy';
-  if (lower.includes('healthy')) return 'healthy';
-  if (lower.includes('up')) return 'up';
-  return 'down';
-}
-
 function escapeForShellDoubleQuotes(value: string) {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, ' ');
 }
 
-async function runMariaDb(containerId: string, sql: string, timeoutMs = 60_000) {
+async function dbQueryScalar(environmentId: number, host: string, sql: string, timeoutMs = 60_000): Promise<string | null> {
   const safeSql = escapeForShellDoubleQuotes(sql);
-  return runCommand('docker', [
-    'exec',
-    containerId,
-    'sh',
-    '-lc',
-    [
-      'set -e',
-      'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
-      `mariadb -uroot -p"$ROOT_PASS" -N -B -e "${safeSql}"`,
-    ].join(' && '),
-  ], timeoutMs);
+  const script = [
+    'set -e',
+    'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+    `HOST="${host}"`,
+    `SQL="${safeSql}"`,
+    'mariadb -uroot -p"$ROOT_PASS" -h "$HOST" -N -B -e "$SQL" 2>/dev/null || echo ""',
+  ].join(' && ');
+  const job = await runDatabaseJob(environmentId, 'db-q', script, { timeout_ms: timeoutMs });
+  if (!job.ok) return null;
+  const line = job.logs.split('\n').map((l) => l.trim()).filter(Boolean)[0] || '';
+  return line || null;
 }
 
-async function runMariaDbRaw(containerId: string, sql: string, timeoutMs = 60_000) {
+async function dbExecSql(environmentId: number, host: string, sql: string, opts?: { include_replication_secret?: boolean; timeout_ms?: number }): Promise<boolean> {
   const safeSql = escapeForShellDoubleQuotes(sql);
-  return runCommand('docker', [
-    'exec',
-    containerId,
-    'sh',
-    '-lc',
-    [
-      'set -e',
-      'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
-      `mariadb -uroot -p"$ROOT_PASS" -e "${safeSql}"`,
-    ].join(' && '),
-  ], timeoutMs);
+  const script = [
+    'set -e',
+    'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+    `HOST="${host}"`,
+    `SQL="${safeSql}"`,
+    'mariadb -uroot -p"$ROOT_PASS" -h "$HOST" -e "$SQL"',
+  ].join(' && ');
+  const job = await runDatabaseJob(environmentId, 'db-exec', script, opts);
+  return job.ok;
 }
 
-async function getReadOnly(containerId: string): Promise<boolean | null> {
-  const result = await runMariaDb(containerId, 'SELECT @@GLOBAL.read_only;');
-  if (result.code !== 0) return null;
-  const value = result.stdout.trim();
+async function dbGetReadOnly(environmentId: number, host: string): Promise<boolean | null> {
+  const value = await dbQueryScalar(environmentId, host, 'SELECT @@GLOBAL.read_only;');
   if (value === '0') return false;
   if (value === '1') return true;
   return null;
 }
 
-async function setReadOnly(containerId: string, enabled: boolean): Promise<boolean> {
+async function dbSetReadOnly(environmentId: number, host: string, enabled: boolean): Promise<boolean> {
   const value = enabled ? 1 : 0;
-  const result = await runMariaDbRaw(containerId, `SET GLOBAL read_only=${value};`);
-  return result.code === 0;
+  return dbExecSql(environmentId, host, `SET GLOBAL read_only=${value};`);
 }
 
 type SlaveStatus = Record<string, string>;
@@ -687,80 +423,91 @@ function parseDbReplicationProbe(rawLogs: string): DbReplicationProbe | null {
   };
 }
 
-async function getSlaveStatus(containerId: string): Promise<SlaveStatus | null> {
-  const result = await runCommand('docker', [
-    'exec',
-    containerId,
-    'sh',
-    '-lc',
-    [
-      'set -e',
-      'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
-      // SHOW SLAVE STATUS returns 0 rows when not configured; \G makes it easier to parse.
-      'mariadb -uroot -p"$ROOT_PASS" -e "SHOW SLAVE STATUS\\G" || true',
-    ].join(' && '),
-  ], 60_000);
-  if (result.code !== 0) {
-    return null;
-  }
-  return parseSlaveStatus(result.stdout);
+async function dbGetSlaveStatus(environmentId: number, host: string, timeoutMs = 60_000): Promise<SlaveStatus | null> {
+  const script = [
+    'set -e',
+    'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+    `HOST="${host}"`,
+    'mariadb -uroot -p"$ROOT_PASS" -h "$HOST" -e "SHOW SLAVE STATUS\\\\G" 2>/dev/null | grep -E "^[[:space:]]*(Master_Host|Slave_IO_Running|Slave_SQL_Running|Seconds_Behind_Master|Last_IO_Errno|Last_IO_Error|Last_SQL_Errno|Last_SQL_Error|Using_Gtid|Gtid_IO_Pos|Slave_SQL_Running_State):" || true',
+  ].join(' && ');
+  const job = await runDatabaseJob(environmentId, 'db-slave', script, { timeout_ms: timeoutMs });
+  if (!job.ok) return null;
+  return parseSlaveStatus(job.logs);
 }
 
-async function waitForReplicaCaughtUp(replicaId: string, timeoutMs = 120_000): Promise<{ ok: boolean; lagSeconds: number | null; note?: string }> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    const status = await getSlaveStatus(replicaId);
-    if (!status) {
-      return { ok: false, lagSeconds: null, note: 'replica not configured (no slave status)' };
-    }
-    const ioRunning = status.Slave_IO_Running || '';
-    const sqlRunning = status.Slave_SQL_Running || '';
-    const secondsRaw = status.Seconds_Behind_Master ?? '';
-    const lag = secondsRaw === '' || secondsRaw.toUpperCase() === 'NULL' ? null : Number.parseInt(secondsRaw, 10);
-    const lagOk = lag === 0;
-    const runningOk = ioRunning.toLowerCase() === 'yes' && sqlRunning.toLowerCase() === 'yes';
-    if (runningOk && lagOk) {
-      return { ok: true, lagSeconds: lag };
-    }
-    await new Promise((r) => setTimeout(r, 1000));
+async function dbWaitForReplicaCaughtUp(environmentId: number, host: string, timeoutMs = 120_000): Promise<{ ok: boolean; lagSeconds: number | null; note?: string }> {
+  const timeoutSeconds = Math.max(10, Math.floor(timeoutMs / 1000));
+  const script = [
+    'set -e',
+    'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+    `HOST="${host}"`,
+    `TIMEOUT="${timeoutSeconds}"`,
+    'started="$(date +%s)"',
+    'while [ $(( $(date +%s) - started )) -lt "$TIMEOUT" ]; do',
+    '  raw="$(mariadb -uroot -p"$ROOT_PASS" -h "$HOST" -e "SHOW SLAVE STATUS\\\\G" 2>/dev/null || true)"',
+    '  if [ -z "$raw" ]; then echo "NOT_CONFIGURED=1"; exit 2; fi',
+    '  io="$(echo "$raw" | awk -F: \'/Slave_IO_Running:/{gsub(/^[ \\t]+/,\"\",$2); print $2; exit}\')"',
+    '  sql="$(echo "$raw" | awk -F: \'/Slave_SQL_Running:/{gsub(/^[ \\t]+/,\"\",$2); print $2; exit}\')"',
+    '  lag="$(echo "$raw" | awk -F: \'/Seconds_Behind_Master:/{gsub(/^[ \\t]+/,\"\",$2); print $2; exit}\')"',
+    '  echo "IO=${io} SQL=${sql} LAG=${lag}"',
+    '  if [ "$io" = "Yes" ] && [ "$sql" = "Yes" ] && [ "$lag" = "0" ]; then echo "CAUGHT_UP=1"; exit 0; fi',
+    '  sleep 2',
+    'done',
+    'echo "TIMEOUT=1"',
+    'exit 1',
+  ].join('\n');
+
+  const job = await runDatabaseJob(environmentId, 'db-wait', script, { timeout_ms: timeoutMs + 30_000 });
+  if (job.ok) {
+    return { ok: true, lagSeconds: 0 };
   }
-  return { ok: false, lagSeconds: null, note: 'timeout waiting for replica catch-up' };
+
+  if (job.logs.includes('NOT_CONFIGURED=1')) {
+    return { ok: false, lagSeconds: null, note: 'replica not configured (no slave status)' };
+  }
+
+  const lastLag = job.logs
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('IO='))
+    .slice(-1)[0] || '';
+  const lagMatch = lastLag.match(/\bLAG=([0-9]+)\b/);
+  const lagSeconds = lagMatch ? Number.parseInt(lagMatch[1], 10) : null;
+  return { ok: false, lagSeconds: Number.isFinite(lagSeconds as number) ? lagSeconds : null, note: 'timeout waiting for replica catch-up' };
 }
 
-async function stopAndResetSlave(containerId: string): Promise<boolean> {
-  const result = await runMariaDbRaw(containerId, 'STOP SLAVE; RESET SLAVE ALL;');
-  if (result.code === 0) return true;
-  const stderr = (result.stderr || '').toLowerCase();
-  if (
-    stderr.includes('no slave')
-    || stderr.includes('not a slave')
-    || stderr.includes('slave thread')
-    || stderr.includes('error 1198')
-  ) {
-    return true;
-  }
-  return false;
+async function dbStopAndResetSlave(environmentId: number, host: string): Promise<boolean> {
+  const script = [
+    'set -e',
+    'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+    `HOST="${host}"`,
+    'SQL="STOP SLAVE; RESET SLAVE ALL;"',
+    'if mariadb -uroot -p"$ROOT_PASS" -h "$HOST" -e "$SQL" >/tmp/out 2>&1; then exit 0; fi',
+    'out="$(cat /tmp/out || true)"',
+    'echo "$out"',
+    'echo "$out" | tr "\\n" " " | grep -qiE "no slave|not a slave|slave thread|error 1198" && exit 0',
+    'exit 1',
+  ].join('\n');
+  const job = await runDatabaseJob(environmentId, 'db-reset', script, { timeout_ms: 90_000 });
+  return job.ok;
 }
 
-async function configureAsReplica(containerId: string, masterHost: string, replicaUser: string): Promise<boolean> {
-  const safeHost = masterHost.replace(/'/g, "''");
+async function dbConfigureAsReplica(environmentId: number, replicaHost: string, masterHost: string, replicaUser: string): Promise<boolean> {
+  const safeMasterHost = masterHost.replace(/'/g, "''");
   const safeUser = replicaUser.replace(/'/g, "''");
   const passRef = '${REPL_PASS}';
-  const sql = `CHANGE MASTER TO MASTER_HOST='${safeHost}', MASTER_PORT=3306, MASTER_USER='${safeUser}', MASTER_PASSWORD='${passRef}', MASTER_USE_GTID=slave_pos; START SLAVE;`;
+  const sql = `CHANGE MASTER TO MASTER_HOST='${safeMasterHost}', MASTER_PORT=3306, MASTER_USER='${safeUser}', MASTER_PASSWORD='${passRef}', MASTER_USE_GTID=slave_pos; START SLAVE;`;
   const safeSql = escapeForShellDoubleQuotes(sql);
-  const result = await runCommand('docker', [
-    'exec',
-    containerId,
-    'sh',
-    '-lc',
-    [
-      'set -e',
-      'REPL_PASS="$(cat /run/secrets/db_replication_password)"',
-      'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
-      `mariadb -uroot -p"$ROOT_PASS" -e "${safeSql}"`,
-    ].join(' && '),
-  ], 90_000);
-  return result.code === 0;
+  const script = [
+    'set -e',
+    'REPL_PASS="$(cat /run/secrets/db_replication_password)"',
+    'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+    `HOST="${replicaHost}"`,
+    `SQL="${safeSql}"`,
+    'mariadb -uroot -p"$ROOT_PASS" -h "$HOST" -e "$SQL"',
+  ].join(' && ');
+  const job = await runDatabaseJob(environmentId, 'db-config', script, { include_replication_secret: true, timeout_ms: 90_000 });
+  return job.ok;
 }
 
 async function scaleEnvironmentService(environmentId: number, serviceName: string, replicas: number): Promise<{ ok: boolean; note?: string }> {
@@ -770,71 +517,6 @@ async function scaleEnvironmentService(environmentId: number, serviceName: strin
     return { ok: false, note: result.stderr.trim() || result.stdout.trim() || `failed to scale ${target}` };
   }
   return { ok: true };
-}
-
-async function getServiceTaskNode(environmentId: number, serviceName: string): Promise<string | null> {
-  const service = `mz-env-${environmentId}_${serviceName}`;
-  const result = await runCommand('docker', ['service', 'ps', service, '--no-trunc', '--format', '{{.Node}}|{{.CurrentState}}'], 12_000);
-  if (result.code !== 0) return null;
-  const lines = result.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
-  const running = lines.find((line) => line.includes('|Running')) || lines[0] || '';
-  const node = running.split('|')[0]?.trim() || '';
-  return node || null;
-}
-
-function pickSecretName(spec: SwarmServiceSpecSummary, fileName: string): string | null {
-  const match = spec.secrets.find((entry) => entry.file_name === fileName);
-  return match?.secret_name || null;
-}
-
-function pickNetworkName(spec: SwarmServiceSpecSummary, requiredAlias?: string): string | null {
-  if (requiredAlias) {
-    const match = spec.networks.find((net) => net.aliases.includes(requiredAlias));
-    if (match?.name) return match.name;
-  }
-  return spec.networks[0]?.name || null;
-}
-
-function buildJobName(prefix: string, environmentId: number) {
-  const suffix = crypto.randomBytes(3).toString('hex');
-  const raw = `mz-rb-${prefix}-${environmentId}-${suffix}`.toLowerCase();
-  return raw.replace(/[^a-z0-9-]/g, '-').slice(0, 63);
-}
-
-async function waitForServiceRunning(serviceFullName: string, timeoutMs = 180_000): Promise<{ ok: boolean; state?: string; note?: string }> {
-  const startedAt = Date.now();
-  let lastState = '';
-  while (Date.now() - startedAt < timeoutMs) {
-    const ps = await runCommand('docker', ['service', 'ps', serviceFullName, '--no-trunc', '--format', '{{.CurrentState}}|{{.Error}}'], 12_000);
-    if (ps.code === 0) {
-      const lines = ps.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
-      const state = (lines.find((l) => l.includes('Running')) || lines[0] || '').split('|')[0]?.trim() || '';
-      lastState = state || lastState;
-      if (state.startsWith('Running')) {
-        return { ok: true, state };
-      }
-      if (state.startsWith('Failed') || state.startsWith('Rejected')) {
-        const errorText = (lines[0] || '').split('|')[1]?.trim() || '';
-        return { ok: false, state, note: errorText || 'service task failed' };
-      }
-    }
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-  return { ok: false, state: lastState || undefined, note: `timeout after ${timeoutMs}ms` };
-}
-
-async function waitForServiceNotRunning(serviceFullName: string, timeoutMs = 120_000): Promise<{ ok: boolean; note?: string }> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    const ps = await runCommand('docker', ['service', 'ps', serviceFullName, '--no-trunc', '--format', '{{.CurrentState}}'], 12_000);
-    if (ps.code === 0) {
-      const lines = ps.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
-      const hasRunning = lines.some((line) => line.startsWith('Running'));
-      if (!hasRunning) return { ok: true };
-    }
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-  return { ok: false, note: `timeout after ${timeoutMs}ms` };
 }
 
 async function runDatabaseJob(
@@ -1029,73 +711,164 @@ function parseProxySqlHostgroups(raw: string): Array<{ hostgroup: number; hostna
     .filter((row) => Number.isFinite(row.hostgroup) && row.hostgroup > 0 && row.hostname !== '');
 }
 
+async function runServiceJob(
+  environmentId: number,
+  serviceName: string,
+  jobPrefix: string,
+  script: string,
+  opts?: {
+    constrain_to_service_node?: boolean;
+    timeout_ms?: number;
+  }
+): Promise<{ ok: boolean; logs: string; state: string; error?: string; details?: string[]; service?: string; node?: string }> {
+  const serviceFullName = envServiceName(environmentId, serviceName);
+  const spec = await inspectServiceSpec(serviceFullName);
+  if (!spec) {
+    return { ok: false, state: 'missing_service', logs: '', error: `service not found (${serviceFullName})` };
+  }
+
+  const networks = Array.from(new Set(spec.networks.map((net) => net.name).filter(Boolean)));
+  if (!networks.length) networks.push('mz-backend');
+
+  const secrets = spec.secrets.map((secret) => ({ source: secret.secret_name, target: secret.file_name }));
+  const mounts = spec.mounts.map((mount) => ({
+    type: mount.type,
+    source: mount.source,
+    target: mount.target,
+    read_only: mount.read_only,
+  }));
+
+  let node: string | null = null;
+  if (opts?.constrain_to_service_node !== false) {
+    node = await getServiceTaskNode(environmentId, serviceName);
+  }
+  const constraints = node ? [`node.hostname==${node}`] : [];
+
+  const jobName = buildJobName(jobPrefix, environmentId);
+  const result = await runSwarmJob({
+    name: jobName,
+    image: spec.image,
+    networks,
+    secrets,
+    mounts,
+    env: spec.env,
+    constraints,
+    command: ['sh', '-lc', script],
+    timeout_ms: opts?.timeout_ms,
+  });
+
+  return {
+    ok: result.ok,
+    logs: result.logs,
+    state: result.state,
+    error: result.error,
+    details: result.details,
+    service: serviceFullName,
+    node: node || undefined,
+  };
+}
+
 async function runPhpFpmHealth(environmentId: number): Promise<RunbookResult> {
-  const container = await findContainer(environmentId, '_php-fpm');
-  if (!container) {
+  const serviceName = envServiceName(environmentId, 'php-fpm');
+  const tasks = await listServiceTasks(serviceName);
+  if (!tasks.length) {
     return {
       runbook_id: 'php_fpm_health',
       status: 'failed',
-      summary: 'php-fpm container not found.',
-      observations: ['No php-fpm container matched for this environment.'],
+      summary: 'php-fpm service not found or has no tasks.',
+      observations: [`Missing tasks for ${serviceName}`],
     };
   }
-  const health = deriveHealth(container.status);
-  const ok = health === 'healthy' || health === 'up';
+
+  const summary = summarizeServiceTasks(tasks);
+  const observations: string[] = [
+    `Service: ${serviceName}`,
+    `Tasks: running=${summary.running}/${summary.desired_running} total=${summary.total}`,
+    summary.nodes.length ? `Nodes: ${summary.nodes.join(', ')}` : '',
+    ...summary.issues.map((line) => `Issue: ${line}`),
+  ].filter(Boolean);
+
+  const spec = await inspectServiceSpec(serviceName);
+  const networkName = spec ? pickNetworkName(spec) || 'mz-backend' : 'mz-backend';
+  const probe = await runCommand('docker', [
+    'run',
+    '--rm',
+    '--network',
+    networkName,
+    'alpine:3.19',
+    'sh',
+    '-lc',
+    `nc -z -w2 ${serviceName} 9000`,
+  ], 8000);
+  const probeOk = probe.code === 0;
+  observations.push(`Probe: ${probeOk ? 'tcp/9000 reachable' : 'tcp/9000 NOT reachable'} (network=${networkName})`);
+
+  const ok = summary.ok && probeOk;
   return {
     runbook_id: 'php_fpm_health',
-    status: ok ? 'ok' : 'warning',
-    summary: `php-fpm status: ${container.status}`,
-    observations: [`Container ${container.name} is ${container.status}`],
-    data: { container },
+    status: ok ? 'ok' : summary.ok ? 'warning' : 'failed',
+    summary: ok ? 'php-fpm ready.' : summary.ok ? 'php-fpm running but probe failed.' : 'php-fpm is not running cleanly.',
+    observations,
+    data: {
+      service: serviceName,
+      tasks: tasks.slice(0, 10),
+      probe: { ok: probeOk, exit_code: probe.code },
+    },
   };
 }
 
 async function runVarnishReady(environmentId: number): Promise<RunbookResult> {
-  const container = await findContainer(environmentId, '_varnish');
-  if (!container) {
+  const serviceName = envServiceName(environmentId, 'varnish');
+  const tasks = await listServiceTasks(serviceName);
+  if (!tasks.length) {
     return {
       runbook_id: 'varnish_ready',
       status: 'failed',
-      summary: 'Varnish container not found.',
-      observations: ['No varnish container matched for this environment.'],
+      summary: 'Varnish service not found or has no tasks.',
+      observations: [`Missing tasks for ${serviceName}`],
     };
   }
 
-  const health = deriveHealth(container.status);
-  const ok = health === 'healthy' || health === 'up';
-  const observations: string[] = [`Container ${container.name} is ${container.status}`];
-  let probe = null as null | { code: number; stdout: string; stderr: string };
-  const varnishUrl = `http://mz-env-${environmentId}_varnish/mz-healthz`;
+  const summary = summarizeServiceTasks(tasks);
+  const observations: string[] = [
+    `Service: ${serviceName}`,
+    `Tasks: running=${summary.running}/${summary.desired_running} total=${summary.total}`,
+    summary.nodes.length ? `Nodes: ${summary.nodes.join(', ')}` : '',
+    ...summary.issues.map((line) => `Issue: ${line}`),
+  ].filter(Boolean);
 
-  // Best-effort probe: from php-fpm container, hit Varnish /mz-healthz if curl/wget exists.
-  const probeContainer = await findContainer(environmentId, '_php-fpm');
-  if (probeContainer) {
-    probe = await runCommand('docker', [
-      'exec',
-      probeContainer.id,
-      'sh',
-      '-lc',
-      `if command -v curl >/dev/null 2>&1; then curl -fsS --max-time 5 ${varnishUrl} >/dev/null; exit $?; fi; if command -v wget >/dev/null 2>&1; then wget -qO- --timeout=5 ${varnishUrl} >/dev/null; exit $?; fi; exit 0`,
-    ], 8000);
-    if (probe.code === 0) {
-      observations.push(`Probe: ${varnishUrl} reachable from php-fpm.`);
-    } else {
-      observations.push(`Probe: ${varnishUrl} not reachable from php-fpm.`);
-      if (probe.stderr?.trim()) {
-        observations.push(`Probe stderr: ${probe.stderr.trim()}`);
-      }
-    }
-  } else {
-    observations.push('Probe skipped: php-fpm container not found.');
+  const spec = await inspectServiceSpec(serviceName);
+  const networkName = spec ? pickNetworkName(spec) || 'mz-backend' : 'mz-backend';
+  const varnishUrl = `http://${serviceName}/mz-healthz`;
+  const probe = await runCommand('docker', [
+    'run',
+    '--rm',
+    '--network',
+    networkName,
+    'curlimages/curl:8.5.0',
+    'curl',
+    '-fsS',
+    '--max-time',
+    '5',
+    varnishUrl,
+  ], 10_000);
+  const probeOk = probe.code === 0;
+  observations.push(`Probe: ${probeOk ? 'OK' : 'FAILED'} ${varnishUrl} (network=${networkName})`);
+  if (!probeOk && probe.stderr.trim()) {
+    observations.push(`Probe stderr: ${tailLines(probe.stderr.trim(), 10)}`);
   }
 
-  const finalOk = ok && (!probe || probe.code === 0);
+  const finalOk = summary.ok && probeOk;
   return {
     runbook_id: 'varnish_ready',
-    status: finalOk ? 'ok' : ok ? 'warning' : 'failed',
-    summary: finalOk ? `Varnish status: ${container.status}` : `Varnish not ready: ${container.status}`,
+    status: finalOk ? 'ok' : summary.ok ? 'warning' : 'failed',
+    summary: finalOk ? 'Varnish ready.' : summary.ok ? 'Varnish running but probe failed.' : 'Varnish is not running cleanly.',
     observations,
-    data: { container, probe: probe ? { code: probe.code } : null },
+    data: {
+      service: serviceName,
+      tasks: tasks.slice(0, 10),
+      probe: { ok: probeOk, exit_code: probe.code },
+    },
   };
 }
 
@@ -1222,101 +995,95 @@ async function runHttpSmokeCheck(environmentId: number, input: Record<string, un
 }
 
 async function runVarPermissions(environmentId: number): Promise<RunbookResult> {
-  const container = await findContainer(environmentId, '_php-fpm');
-  if (!container) {
-    return {
-      runbook_id: 'magento_var_permissions',
-      status: 'failed',
-      summary: 'php-fpm container not found.',
-      observations: ['Unable to locate php-fpm container to inspect permissions.'],
-    };
-  }
-  const checkCmd = ['exec', container.id, 'sh', '-lc', 'test -w /var/www/html/var && test -w /var/www/html/var/log && test -w /var/www/html/var/report'];
-  const checkResult = await runCommand('docker', checkCmd);
   const actions: string[] = [];
-  if (checkResult.code === 0) {
+  const checkScript = 'test -w /var/www/html/var && test -w /var/www/html/var/log && test -w /var/www/html/var/report';
+  const check = await runServiceJob(environmentId, 'php-fpm', 'var-perms-check', checkScript, { timeout_ms: 60_000 });
+  if (check.ok) {
     return {
       runbook_id: 'magento_var_permissions',
       status: 'ok',
       summary: 'Magento var directories are writable.',
-      observations: ['Permissions check passed.'],
-      data: { container: container.name },
+      observations: [
+        'Permissions check passed.',
+        check.node ? `Node: ${check.node}` : '',
+      ].filter(Boolean),
+      data: { service: check.service || envServiceName(environmentId, 'php-fpm') },
       remediation: { attempted: false, actions },
     };
   }
 
-  const fixCmd = [
-    'exec',
-    container.id,
-    'sh',
-    '-lc',
+  const fix = await runServiceJob(
+    environmentId,
+    'php-fpm',
+    'var-perms-fix',
     'chown -R www-data:www-data /var/www/html/var && chmod -R g+rwX /var/www/html/var',
-  ];
-  const fixResult = await runCommand('docker', fixCmd);
+    { timeout_ms: 120_000 }
+  );
   actions.push('Applied chown/chmod to /var/www/html/var');
 
-  const recheck = await runCommand('docker', checkCmd);
-  const resolved = recheck.code === 0;
+  const recheck = await runServiceJob(environmentId, 'php-fpm', 'var-perms-recheck', checkScript, { timeout_ms: 60_000 });
+  const resolved = recheck.ok;
   return {
     runbook_id: 'magento_var_permissions',
     status: resolved ? 'ok' : 'warning',
     summary: resolved ? 'Permissions fixed.' : 'Permissions still failing after remediation.',
     observations: [
       resolved ? 'Var directories are now writable.' : 'Permissions check still failing.',
-      fixResult.stderr ? `Remediation stderr: ${fixResult.stderr.trim()}` : '',
+      fix.node ? `Node: ${fix.node}` : '',
+      fix.ok ? '' : `Fix failed: ${fix.error || fix.state}`,
+      fix.logs.trim() ? `Fix logs: ${tailLines(fix.logs.trim(), 20)}` : '',
     ].filter(Boolean),
-    data: { container: container.name },
+    data: { service: fix.service || envServiceName(environmentId, 'php-fpm') },
     remediation: { attempted: true, actions },
   };
 }
 
 async function runMediaPermissions(environmentId: number): Promise<RunbookResult> {
-  const container = (await findContainer(environmentId, '_php-fpm-admin')) ?? (await findContainer(environmentId, '_php-fpm'));
-  if (!container) {
-    return {
-      runbook_id: 'magento_media_permissions',
-      status: 'failed',
-      summary: 'php-fpm container not found.',
-      observations: ['Unable to locate php-fpm container to inspect permissions.'],
-    };
-  }
+  const actions: string[] = [];
+  const hasAdmin = Boolean(await inspectServiceSpec(envServiceName(environmentId, 'php-fpm-admin')));
+  const targetService = hasAdmin ? 'php-fpm-admin' : 'php-fpm';
 
   const base = '/var/www/html/magento/pub/media';
-  const checkCmd = ['exec', container.id, 'sh', '-lc', `test -w ${base} && test -w ${base}/captcha`];
-  const checkResult = await runCommand('docker', checkCmd);
-  const actions: string[] = [];
-  if (checkResult.code === 0) {
+  const checkScript = `test -w ${base} && test -w ${base}/captcha`;
+  const check = await runServiceJob(environmentId, targetService, 'media-perms-check', checkScript, { timeout_ms: 60_000 });
+  if (check.ok) {
     return {
       runbook_id: 'magento_media_permissions',
       status: 'ok',
       summary: 'Magento pub/media is writable.',
-      observations: ['Permissions check passed.'],
-      data: { container: container.name },
+      observations: [
+        'Permissions check passed.',
+        `Service: ${envServiceName(environmentId, targetService)}`,
+        check.node ? `Node: ${check.node}` : '',
+      ].filter(Boolean),
+      data: { service: check.service || envServiceName(environmentId, targetService) },
       remediation: { attempted: false, actions },
     };
   }
 
-  const fixCmd = [
-    'exec',
-    container.id,
-    'sh',
-    '-lc',
+  const fix = await runServiceJob(
+    environmentId,
+    targetService,
+    'media-perms-fix',
     `mkdir -p ${base}/captcha/admin && chown -R www-data:www-data ${base} && chmod -R 775 ${base}`,
-  ];
-  const fixResult = await runCommand('docker', fixCmd);
+    { timeout_ms: 120_000 }
+  );
   actions.push('Applied mkdir/chown/chmod to /var/www/html/magento/pub/media');
 
-  const recheck = await runCommand('docker', checkCmd);
-  const resolved = recheck.code === 0;
+  const recheck = await runServiceJob(environmentId, targetService, 'media-perms-recheck', checkScript, { timeout_ms: 60_000 });
+  const resolved = recheck.ok;
   return {
     runbook_id: 'magento_media_permissions',
     status: resolved ? 'ok' : 'warning',
     summary: resolved ? 'Permissions fixed.' : 'Permissions still failing after remediation.',
     observations: [
       resolved ? 'pub/media is now writable.' : 'Permissions check still failing.',
-      fixResult.stderr ? `Remediation stderr: ${fixResult.stderr.trim()}` : '',
+      `Service: ${envServiceName(environmentId, targetService)}`,
+      fix.node ? `Node: ${fix.node}` : '',
+      fix.ok ? '' : `Fix failed: ${fix.error || fix.state}`,
+      fix.logs.trim() ? `Fix logs: ${tailLines(fix.logs.trim(), 20)}` : '',
     ].filter(Boolean),
-    data: { container: container.name },
+    data: { service: fix.service || envServiceName(environmentId, targetService) },
     remediation: { attempted: true, actions },
   };
 }
@@ -1362,48 +1129,96 @@ async function runProxySqlReady(environmentId: number): Promise<RunbookResult> {
 }
 
 async function runCloudflared(environmentId: number): Promise<RunbookResult> {
-  const containers = await listEnvironmentContainers(environmentId);
-  const container = containers.find((entry) => entry.name.includes('cloudflared') || entry.name.includes('_tunnel'));
-  if (!container) {
+  const services = await listEnvironmentServices(environmentId);
+  const matches = services.filter((entry) => entry.name.includes('cloudflared') || entry.name.includes('_tunnel'));
+  if (!matches.length) {
     return {
       runbook_id: 'dns_cloudflared_ingress',
       status: 'failed',
-      summary: 'Cloudflared container not found.',
-      observations: ['No cloudflared container matched for this environment.'],
+      summary: 'Cloudflared service not found.',
+      observations: ['No cloudflared service matched for this environment.'],
     };
   }
-  const health = deriveHealth(container.status);
-  const ok = health === 'healthy' || health === 'up';
+
+  const observations: string[] = [];
+  let ok = true;
+  for (const service of matches) {
+    const tasks = await listServiceTasks(service.name);
+    const summary = summarizeServiceTasks(tasks);
+    observations.push(
+      `Service: ${service.name} (${service.replicas || 'replicas unknown'})`,
+      `Tasks: running=${summary.running}/${summary.desired_running} total=${summary.total}`,
+      summary.nodes.length ? `Nodes: ${summary.nodes.join(', ')}` : ''
+    );
+    for (const issue of summary.issues) {
+      observations.push(`Issue: ${issue}`);
+    }
+    ok = ok && summary.ok;
+  }
   return {
     runbook_id: 'dns_cloudflared_ingress',
     status: ok ? 'ok' : 'warning',
-    summary: `Cloudflared status: ${container.status}`,
-    observations: [`Container ${container.name} is ${container.status}`],
-    data: { container },
+    summary: ok ? 'Cloudflared ingress appears healthy.' : 'Cloudflared ingress has task issues.',
+    observations: observations.filter(Boolean),
+    data: { services: matches },
   };
 }
 
+function parseCurrentStateAgeSeconds(currentState: string): number | null {
+  const trimmed = currentState.trim();
+  const exact = trimmed.match(/^Running\s+(\d+)\s+(second|minute|hour|day)s?\s+ago/i);
+  if (exact) {
+    const n = Number.parseInt(exact[1], 10);
+    if (!Number.isFinite(n)) return null;
+    const unit = exact[2].toLowerCase();
+    if (unit === 'second') return n;
+    if (unit === 'minute') return n * 60;
+    if (unit === 'hour') return n * 3600;
+    if (unit === 'day') return n * 86400;
+  }
+  const about = trimmed.match(/^Running\s+about\s+an?\s+(minute|hour)\s+ago/i);
+  if (about) {
+    const unit = about[1].toLowerCase();
+    return unit === 'hour' ? 3600 : 60;
+  }
+  return null;
+}
+
 async function runRestartSummary(environmentId: number): Promise<RunbookResult> {
-  const containers = await listEnvironmentContainers(environmentId);
-  const restarts = containers.filter((entry) => entry.status.toLowerCase().includes('restarting'));
-  const unhealthy = containers.filter((entry) => entry.status.toLowerCase().includes('unhealthy'));
-  const ok = restarts.length === 0 && unhealthy.length === 0;
-  const observations: string[] = [];
-  if (restarts.length) {
-    observations.push(`Restarting: ${restarts.map((entry) => entry.name).join(', ')}`);
+  const services = await listEnvironmentServices(environmentId);
+  const issues: string[] = [];
+  const recentlyStarted: string[] = [];
+
+  for (const service of services) {
+    const tasks = await listServiceTasks(service.name);
+    const summary = summarizeServiceTasks(tasks);
+    if (!summary.ok) {
+      for (const issue of summary.issues) {
+        issues.push(`${service.name}: ${issue}`);
+      }
+    }
+    for (const task of tasks) {
+      const ageSeconds = parseCurrentStateAgeSeconds(task.current_state);
+      if (ageSeconds !== null && ageSeconds < 600) {
+        recentlyStarted.push(`${task.name} on ${task.node || '(unknown node)'}: ${task.current_state}`);
+      }
+    }
   }
-  if (unhealthy.length) {
-    observations.push(`Unhealthy: ${unhealthy.map((entry) => entry.name).join(', ')}`);
-  }
-  if (!observations.length) {
-    observations.push('No restarting or unhealthy containers detected.');
-  }
+
+  const ok = issues.length === 0 && recentlyStarted.length === 0;
+  const observations: string[] = [
+    `Services checked: ${services.length}`,
+    issues.length ? `Non-running tasks: ${issues.length}` : 'No non-running tasks detected.',
+    recentlyStarted.length ? `Recently started tasks (<10m): ${recentlyStarted.length}` : 'No recently started tasks detected (<10m).',
+    ...issues.slice(0, 10),
+    ...recentlyStarted.slice(0, 10),
+  ];
   return {
     runbook_id: 'container_restart_summary',
     status: ok ? 'ok' : 'warning',
-    summary: ok ? 'No restart issues detected.' : 'Container restarts or unhealthy states detected.',
+    summary: ok ? 'No restart issues detected.' : 'Potential restart/health issues detected.',
     observations,
-    data: { count: containers.length },
+    data: { services_checked: services.length, issues_count: issues.length, recently_started_count: recentlyStarted.length },
   };
 }
 
@@ -1496,9 +1311,9 @@ async function runServiceRestart(
   label: string
 ): Promise<RunbookResult> {
   const patterns = Array.isArray(includes) ? includes : [includes];
-  let service = null as Awaited<ReturnType<typeof findService>> | null;
+  let service = null as Awaited<ReturnType<typeof findEnvironmentService>> | null;
   for (const pattern of patterns) {
-    service = await findService(environmentId, pattern);
+    service = await findEnvironmentService(environmentId, pattern);
     if (service) break;
   }
   if (!service) {
@@ -2318,28 +2133,29 @@ async function runDbSwitchRole(environmentId: number, direction: DbSwitchDirecti
   const fromService = direction === 'to_replica' ? 'database' : 'database-replica';
   const toService = direction === 'to_replica' ? 'database-replica' : 'database';
 
-  const fromContainer = await findContainerForService(environmentId, fromService);
-  const toContainer = await findContainerForService(environmentId, toService);
-
-  if (!fromContainer || !toContainer) {
+  const fromHost = envServiceName(environmentId, fromService);
+  const toHost = envServiceName(environmentId, toService);
+  const fromTasks = await listServiceTasks(fromHost);
+  const toTasks = await listServiceTasks(toHost);
+  if (!fromTasks.length || !toTasks.length) {
     return {
       runbook_id: direction === 'to_replica' ? 'db_failover' : 'db_failback',
       status: 'failed',
-      summary: 'Database containers not found.',
+      summary: 'Database services not found or have no tasks.',
       observations: [
-        fromContainer ? `Found ${fromService}: ${fromContainer.name}` : `Missing ${fromService} container.`,
-        toContainer ? `Found ${toService}: ${toContainer.name}` : `Missing ${toService} container.`,
+        fromTasks.length ? `Found ${fromService}: ${fromHost}` : `Missing tasks for ${fromHost}`,
+        toTasks.length ? `Found ${toService}: ${toHost}` : `Missing tasks for ${toHost}`,
       ],
       remediation: { attempted: false, actions: [] },
     };
   }
 
-  const desiredWriterHost = `mz-env-${environmentId}_${toService}`;
+  const desiredWriterHost = toHost;
   const runbookId = direction === 'to_replica' ? 'db_failover' : 'db_failback';
 
   // Quick no-op check.
-  const toReadOnly = await getReadOnly(toContainer.id);
-  const toSlave = await getSlaveStatus(toContainer.id);
+  const toReadOnly = await dbGetReadOnly(environmentId, toHost);
+  const toSlave = await dbGetSlaveStatus(environmentId, toHost);
   if (toReadOnly === false && !toSlave) {
     return {
       runbook_id: runbookId,
@@ -2372,11 +2188,11 @@ async function runDbSwitchRole(environmentId: number, direction: DbSwitchDirecti
   actions.push(cronDown.ok ? 'Scaled cron service to 0' : `Failed to scale cron service: ${cronDown.note || ''}`.trim());
 
   // Demote current writer (fromService) to read-only before we wait for catch-up.
-  const roSet = await setReadOnly(fromContainer.id, true);
+  const roSet = await dbSetReadOnly(environmentId, fromHost, true);
   actions.push(roSet ? `Set ${fromService} read_only=ON` : `Failed to set ${fromService} read_only=ON`);
 
   // Ensure the target (toService) is caught up before promotion.
-  const caughtUp = await waitForReplicaCaughtUp(toContainer.id, 180_000);
+  const caughtUp = await dbWaitForReplicaCaughtUp(environmentId, toHost, 180_000);
   observations.push(caughtUp.ok ? 'Replica catch-up: OK' : `Replica catch-up: ${caughtUp.note || 'not caught up'}`);
   if (!caughtUp.ok) {
     return {
@@ -2390,17 +2206,17 @@ async function runDbSwitchRole(environmentId: number, direction: DbSwitchDirecti
   }
 
   // Promote target to writer.
-  const stopReplica = await stopAndResetSlave(toContainer.id);
+  const stopReplica = await dbStopAndResetSlave(environmentId, toHost);
   actions.push(stopReplica ? `Stopped replication on ${toService}` : `Failed to stop replication on ${toService}`);
-  const rw = await setReadOnly(toContainer.id, false);
+  const rw = await dbSetReadOnly(environmentId, toHost, false);
   actions.push(rw ? `Set ${toService} read_only=OFF` : `Failed to set ${toService} read_only=OFF`);
 
   // Configure the old writer as a replica of the new writer.
-  const cleaned = await stopAndResetSlave(fromContainer.id);
+  const cleaned = await dbStopAndResetSlave(environmentId, fromHost);
   actions.push(cleaned ? `Cleared replication state on ${fromService}` : `Failed to clear replication state on ${fromService}`);
-  const configured = await configureAsReplica(fromContainer.id, desiredWriterHost, 'replica');
+  const configured = await dbConfigureAsReplica(environmentId, fromHost, desiredWriterHost, 'replica');
   actions.push(configured ? `Configured ${fromService} as replica of ${desiredWriterHost}` : `Failed to configure ${fromService} replication`);
-  const roAgain = await setReadOnly(fromContainer.id, true);
+  const roAgain = await dbSetReadOnly(environmentId, fromHost, true);
   actions.push(roAgain ? `Set ${fromService} read_only=ON` : `Failed to set ${fromService} read_only=ON`);
 
   // Wait for ProxySQL to see the new writer hostgroup (best-effort).
@@ -2657,14 +2473,16 @@ async function runDeployRollbackPrevious(environmentId: number, input: Record<st
 }
 
 async function runMagentoMaintenance(environmentId: number, mode: 'enable' | 'disable'): Promise<RunbookResult> {
-  const container = (await findContainer(environmentId, '_php-fpm-admin')) ?? (await findContainer(environmentId, '_php-fpm'));
   const runbookId = mode === 'enable' ? 'magento_maintenance_enable' : 'magento_maintenance_disable';
-  if (!container) {
+  const hasAdmin = Boolean(await inspectServiceSpec(envServiceName(environmentId, 'php-fpm-admin')));
+  const targetService = hasAdmin ? 'php-fpm-admin' : 'php-fpm';
+  const serviceFullName = envServiceName(environmentId, targetService);
+  if (!(await inspectServiceSpec(serviceFullName))) {
     return {
       runbook_id: runbookId,
       status: 'failed',
-      summary: 'php-fpm container not found.',
-      observations: ['Unable to locate php-fpm container to run bin/magento maintenance command.'],
+      summary: 'php-fpm service not found.',
+      observations: [`Missing service: ${serviceFullName}`],
     };
   }
 
@@ -2672,26 +2490,20 @@ async function runMagentoMaintenance(environmentId: number, mode: 'enable' | 'di
     ? 'bin/magento maintenance:enable --no-interaction'
     : 'bin/magento maintenance:disable --no-interaction';
 
-  const result = await runCommand('docker', [
-    'exec',
-    container.id,
-    'sh',
-    '-lc',
-    `cd /var/www/html/magento && ${cmd}`,
-  ], 60_000);
-
-  const ok = result.code === 0;
+  const job = await runServiceJob(environmentId, targetService, `maintenance-${mode}`, `cd /var/www/html/magento && ${cmd}`, { timeout_ms: 90_000 });
+  const ok = job.ok;
   return {
     runbook_id: runbookId,
     status: ok ? 'ok' : 'failed',
     summary: ok ? `Magento maintenance mode ${mode}d.` : `Magento maintenance mode ${mode} failed.`,
     observations: [
-      `Container: ${container.name}`,
-      result.stdout?.trim() ? `stdout: ${tailLines(result.stdout.trim(), 20)}` : '',
-      result.stderr?.trim() ? `stderr: ${tailLines(result.stderr.trim(), 20)}` : '',
+      `Service: ${serviceFullName}`,
+      job.node ? `Node: ${job.node}` : '',
+      job.logs.trim() ? `Logs: ${tailLines(job.logs.trim(), 30)}` : '',
+      ok ? '' : `Error: ${job.error || job.state}`,
     ].filter(Boolean),
     remediation: { attempted: true, actions: [`Magento maintenance:${mode}`] },
-    data: { container: container.name, code: result.code },
+    data: { service: serviceFullName, ok, state: job.state },
   };
 }
 
@@ -2776,7 +2588,7 @@ export async function handleServiceRestart(request: Request): Promise<{ error?: 
   if (!serviceName || !environmentId) {
     return { error: 'missing service_name or environment_id', status: 400 };
   }
-  const service = await findService(environmentId, serviceName);
+  const service = await findEnvironmentService(environmentId, serviceName);
   if (!service) {
     return { error: `Service matching "${serviceName}" not found for environment ${environmentId}.`, status: 404 };
   }
