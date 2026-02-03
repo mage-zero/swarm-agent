@@ -1265,7 +1265,7 @@ async function waitForRedisCache(containerId: string, stackName: string, timeout
   const start = Date.now();
   let currentId = containerId;
   const probe = [
-    '$host="redis-cache";',
+    '$host=getenv("MZ_REDIS_CACHE_HOST") ?: "redis-cache";',
     '$port=6379;',
     '$fp=@fsockopen($host,$port,$errno,$errstr,1);',
     'if(!$fp){fwrite(STDERR,$errstr ?: "connect failed"); exit(1);} fclose($fp);',
@@ -1514,10 +1514,12 @@ async function setOpensearchSystemConfig(
   return runDatabaseCommandWithRetry(stackName, containerId, command);
 }
 
-const MAGENTO_DB_OVERRIDE_ENV = {
-  MZ_DB_HOST: 'database',
-  MZ_DB_PORT: '3306',
-};
+function buildMagentoDbOverrideEnv(stackName: string): Record<string, string> {
+  return {
+    MZ_DB_HOST: `${stackName}_database`,
+    MZ_DB_PORT: '3306',
+  };
+}
 
 function buildDockerEnvArgs(env: Record<string, string> | undefined) {
   if (!env) {
@@ -1575,8 +1577,9 @@ async function ensureMagentoEnvWrapperWithRetry(
 
 async function runMagentoCommandCapture(
   containerId: string,
+  stackName: string,
   command: string,
-  env: Record<string, string> = MAGENTO_DB_OVERRIDE_ENV,
+  env: Record<string, string> = buildMagentoDbOverrideEnv(stackName),
 ) {
   const envArgs = buildDockerEnvArgs(env);
   return await runCommandCapture('docker', ['exec', ...envArgs, containerId, 'sh', '-c', command]);
@@ -1584,8 +1587,9 @@ async function runMagentoCommandCapture(
 
 async function runMagentoCommandWithStatus(
   containerId: string,
+  stackName: string,
   command: string,
-  env: Record<string, string> = MAGENTO_DB_OVERRIDE_ENV,
+  env: Record<string, string> = buildMagentoDbOverrideEnv(stackName),
 ) {
   const envArgs = buildDockerEnvArgs(env);
   return await runCommandCaptureWithStatus('docker', ['exec', ...envArgs, containerId, 'sh', '-c', command]);
@@ -1845,7 +1849,7 @@ async function enforceMagentoPerformance(
   let currentId = containerId;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     currentId = await ensureMagentoEnvWrapperWithRetry(currentId, stackName, log);
-    const result = await runMagentoCommandWithStatus(currentId, checkScript);
+    const result = await runMagentoCommandWithStatus(currentId, stackName, checkScript);
     if (result.code === 0) {
       log('Magento production mode + caches confirmed');
       return;
@@ -1875,6 +1879,7 @@ async function runSetupUpgradeWithRetry(
       adminContainerId = await ensureMagentoEnvWrapperWithRetry(adminContainerId, stackName, log);
       const result = await runMagentoCommandWithStatus(
         adminContainerId,
+        stackName,
         'php bin/magento setup:upgrade --keep-generated',
       );
       if (result.code === 0) {
@@ -1951,6 +1956,7 @@ async function processDeployment(recordPath: string) {
     throw new Error('Deployment payload missing artifact/stack/environment');
   }
   log(`start stack=${stackId} env=${environmentId} artifact=${artifactKey}`);
+  const stackName = `mz-env-${environmentId}`;
 
   const config = readConfig();
   const baseUrl = (config.mz_control_base_url || process.env.MZ_CONTROL_BASE_URL || '').trim();
@@ -1978,7 +1984,7 @@ async function processDeployment(recordPath: string) {
   const selections = envRecord?.application_selections;
   const versions = resolveVersionEnv(selections);
   const searchEngine = process.env.MZ_SEARCH_ENGINE || 'opensearch';
-  const opensearchHost = process.env.MZ_OPENSEARCH_HOST || 'opensearch';
+  const opensearchHost = process.env.MZ_OPENSEARCH_HOST || `${stackName}_opensearch`;
   const opensearchPort = process.env.MZ_OPENSEARCH_PORT || '9200';
   const opensearchTimeout = process.env.MZ_OPENSEARCH_TIMEOUT || '15';
 
@@ -2020,8 +2026,10 @@ async function processDeployment(recordPath: string) {
   const activeProfile = resolveActiveProfile(tuningPayload);
   const configEnv = buildConfigEnv(activeProfile?.config_changes || []);
 
+  const stackService = (service: string) => `${stackName}_${service}`;
+
   const replicaUser = 'replica';
-  let replicaHost = 'database';
+  let replicaServiceName: 'database' | 'database-replica' = 'database';
   let replicaEnabled = false;
   const envTypeRaw = String(envRecord?.environment_type || '').trim().toLowerCase();
   const envEligible = envTypeRaw === ''
@@ -2035,7 +2043,7 @@ async function processDeployment(recordPath: string) {
     const hasReplicaLabel = readyNodes.some((node) => node.labels?.database_replica === 'true');
     replicaEnabled = envEligible && hasReplicaLabel && readyNodes.length > 1;
     if (replicaEnabled) {
-      replicaHost = 'database-replica';
+      replicaServiceName = 'database-replica';
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -2055,14 +2063,22 @@ async function processDeployment(recordPath: string) {
     MAGE_VERSION: mageVersion,
     MYSQL_DATABASE: process.env.MYSQL_DATABASE || 'magento',
     MYSQL_USER: process.env.MYSQL_USER || 'magento',
-    MZ_DB_HOST: 'proxysql',
+    MZ_DB_HOST: stackService('proxysql'),
     MZ_DB_PORT: '6033',
-    MZ_PROXYSQL_DB_HOST: 'database',
-    MZ_PROXYSQL_DB_REPLICA_HOST: replicaHost,
+    MZ_PROXYSQL_DB_HOST: stackService('database'),
+    MZ_PROXYSQL_DB_REPLICA_HOST: stackService(replicaServiceName),
     MZ_PROXYSQL_DB_PORT: '3306',
-    MZ_MARIADB_MASTER_HOST: 'database',
+    MZ_MARIADB_MASTER_HOST: stackService('database'),
     MZ_REPLICATION_USER: replicaUser,
     MZ_DATABASE_REPLICA_REPLICAS: replicaEnabled ? '1' : '0',
+    MZ_RABBITMQ_HOST: stackService('rabbitmq'),
+    MZ_REDIS_CACHE_HOST: stackService('redis-cache'),
+    MZ_REDIS_SESSION_HOST: stackService('redis-session'),
+    MZ_VARNISH_HOST: stackService('varnish'),
+    MZ_PHP_FPM_HOST: stackService('php-fpm'),
+    MZ_PHP_FPM_ADMIN_HOST: stackService('php-fpm-admin'),
+    MZ_VARNISH_BACKEND_HOST: stackService('nginx'),
+    MZ_VARNISH_BACKEND_PORT: '80',
     MZ_SEARCH_ENGINE: searchEngine,
     MZ_OPENSEARCH_HOST: opensearchHost,
     MZ_OPENSEARCH_PORT: opensearchPort,
@@ -2122,7 +2138,6 @@ async function processDeployment(recordPath: string) {
   );
   log('built magento images');
 
-  const stackName = `mz-env-${environmentId}`;
   await runCommandLogged('docker', [
     'stack',
     'deploy',
@@ -2159,11 +2174,11 @@ async function processDeployment(recordPath: string) {
     log(`base URLs set to ${envBaseUrl}`);
   }
 
-  if (replicaHost === 'database-replica') {
+  if (replicaServiceName === 'database-replica') {
     try {
       const replicaContainerId = await waitForContainer(stackName, 'database-replica', 5 * 60 * 1000);
       await waitForDatabase(replicaContainerId, 5 * 60 * 1000);
-      await configureReplica(replicaContainerId, 'database', replicaUser);
+      await configureReplica(replicaContainerId, stackService('database'), replicaUser);
       log('replica configured');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -2256,9 +2271,9 @@ async function processDeployment(recordPath: string) {
     await setVarnishConfig(
       dbContainerId,
       envVars.MYSQL_DATABASE || 'magento',
-      'nginx',
+      stackService('nginx'),
       '80',
-      'localhost,127.0.0.1,nginx,php-fpm,php-fpm-admin,varnish',
+      `localhost,127.0.0.1,${stackService('nginx')},${stackService('php-fpm')},${stackService('php-fpm-admin')},${stackService('varnish')}`,
       '300',
     );
   }

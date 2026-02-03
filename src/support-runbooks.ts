@@ -907,12 +907,14 @@ async function runDatabaseJob(
   };
 }
 
-function buildDbProbeScript() {
+function buildDbProbeScript(environmentId: number) {
+  const primary = `mz-env-${environmentId}_database`;
+  const replica = `mz-env-${environmentId}_database-replica`;
   return [
     'set -e',
     'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
-    'primary="database"',
-    'replica="database-replica"',
+    `primary="${primary}"`,
+    `replica="${replica}"`,
     'query() { mariadb -uroot -p"$ROOT_PASS" -h "$1" -N -B -e "$2" 2>/dev/null || echo ""; }',
     'queryraw() { mariadb -uroot -p"$ROOT_PASS" -h "$1" -e "$2" 2>/dev/null || true; }',
     'echo "PRIMARY_READ_ONLY=$(query "$primary" "SELECT @@GLOBAL.read_only;")"',
@@ -1036,6 +1038,7 @@ async function runVarnishReady(environmentId: number): Promise<RunbookResult> {
   const ok = health === 'healthy' || health === 'up';
   const observations: string[] = [`Container ${container.name} is ${container.status}`];
   let probe = null as null | { code: number; stdout: string; stderr: string };
+  const varnishUrl = `http://mz-env-${environmentId}_varnish/mz-healthz`;
 
   // Best-effort probe: from php-fpm container, hit Varnish /mz-healthz if curl/wget exists.
   const probeContainer = await findContainer(environmentId, '_php-fpm');
@@ -1045,12 +1048,12 @@ async function runVarnishReady(environmentId: number): Promise<RunbookResult> {
       probeContainer.id,
       'sh',
       '-lc',
-      "if command -v curl >/dev/null 2>&1; then curl -fsS --max-time 5 http://varnish/mz-healthz >/dev/null; exit $?; fi; if command -v wget >/dev/null 2>&1; then wget -qO- --timeout=5 http://varnish/mz-healthz >/dev/null; exit $?; fi; exit 0",
+      `if command -v curl >/dev/null 2>&1; then curl -fsS --max-time 5 ${varnishUrl} >/dev/null; exit $?; fi; if command -v wget >/dev/null 2>&1; then wget -qO- --timeout=5 ${varnishUrl} >/dev/null; exit $?; fi; exit 0`,
     ], 8000);
     if (probe.code === 0) {
-      observations.push('Probe: http://varnish/mz-healthz reachable from php-fpm.');
+      observations.push(`Probe: ${varnishUrl} reachable from php-fpm.`);
     } else {
-      observations.push('Probe: http://varnish/mz-healthz not reachable from php-fpm.');
+      observations.push(`Probe: ${varnishUrl} not reachable from php-fpm.`);
       if (probe.stderr?.trim()) {
         observations.push(`Probe stderr: ${probe.stderr.trim()}`);
       }
@@ -1601,7 +1604,7 @@ async function runDbReplicationStatus(environmentId: number): Promise<RunbookRes
 
   // Run a short-lived Swarm job that connects over the overlay network so we can diagnose
   // even when containers are placed on other nodes.
-  const job = await runDatabaseJob(environmentId, 'db-probe', buildDbProbeScript(), { timeout_ms: 60_000 });
+  const job = await runDatabaseJob(environmentId, 'db-probe', buildDbProbeScript(environmentId), { timeout_ms: 60_000 });
   data.probe_job = { ok: job.ok, state: job.state };
   if (!job.ok) {
     observations.push(`Probe failed: ${job.error || job.state}`);
@@ -1783,7 +1786,7 @@ async function runDbReplicaEnable(environmentId: number): Promise<RunbookResult>
   }
 
   // Probe current status and decide next steps.
-  const beforeJob = await runDatabaseJob(environmentId, 'db-probe', buildDbProbeScript(), { timeout_ms: 60_000 });
+  const beforeJob = await runDatabaseJob(environmentId, 'db-probe', buildDbProbeScript(environmentId), { timeout_ms: 60_000 });
   const before = beforeJob.ok ? parseDbReplicationProbe(beforeJob.logs) : null;
   const beforeSlave = before?.replica.slave_status || null;
   const beforeIo = (beforeSlave?.Slave_IO_Running || '').toLowerCase();
@@ -1827,6 +1830,8 @@ async function runDbReplicaEnable(environmentId: number): Promise<RunbookResult>
   }
 
   // Best-effort: ensure replication is configured and read_only is ON.
+  const primaryHost = `mz-env-${environmentId}_database`;
+  const replicaHost = `mz-env-${environmentId}_database-replica`;
   const passRef = '${REPL_PASS}';
   const ensureReplicaUserSql = [
     `CREATE USER IF NOT EXISTS 'replica'@'%' IDENTIFIED BY '${passRef}';`,
@@ -1834,18 +1839,18 @@ async function runDbReplicaEnable(environmentId: number): Promise<RunbookResult>
     "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'replica'@'%';",
     'FLUSH PRIVILEGES;',
   ].join(' ');
-  const changeMasterSql = `CHANGE MASTER TO MASTER_HOST='database', MASTER_PORT=3306, MASTER_USER='replica', MASTER_PASSWORD='${passRef}', MASTER_USE_GTID=slave_pos; START SLAVE;`;
+  const changeMasterSql = `CHANGE MASTER TO MASTER_HOST='${primaryHost}', MASTER_PORT=3306, MASTER_USER='replica', MASTER_PASSWORD='${passRef}', MASTER_USE_GTID=slave_pos; START SLAVE;`;
 
   if (!beforeSlave || beforeIo !== 'yes' || beforeSql !== 'yes') {
     const configScript = [
       'set -e',
       'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
       'REPL_PASS="$(cat /run/secrets/db_replication_password)"',
-      'i=0; until mariadb -uroot -p"$ROOT_PASS" -h database -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 30 ]; then echo "primary not ready" >&2; exit 1; fi; sleep 1; done',
-      'i=0; until mariadb -uroot -p"$ROOT_PASS" -h database-replica -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 30 ]; then echo "replica not ready" >&2; exit 1; fi; sleep 1; done',
-      `mariadb -uroot -p"$ROOT_PASS" -h database -e "${escapeForShellDoubleQuotes(ensureReplicaUserSql)}"`,
-      `mariadb -uroot -p"$ROOT_PASS" -h database-replica -e "${escapeForShellDoubleQuotes(changeMasterSql)}"`,
-      'mariadb -uroot -p"$ROOT_PASS" -h database-replica -e "SET GLOBAL read_only=1;" || true',
+      `i=0; until mariadb -uroot -p"$ROOT_PASS" -h ${primaryHost} -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 30 ]; then echo "primary not ready" >&2; exit 1; fi; sleep 1; done`,
+      `i=0; until mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 30 ]; then echo "replica not ready" >&2; exit 1; fi; sleep 1; done`,
+      `mariadb -uroot -p"$ROOT_PASS" -h ${primaryHost} -e "${escapeForShellDoubleQuotes(ensureReplicaUserSql)}"`,
+      `mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "${escapeForShellDoubleQuotes(changeMasterSql)}"`,
+      `mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "SET GLOBAL read_only=1;" || true`,
       'echo "CONFIGURED=1"',
     ].join(' && ');
     const configJob = await runDatabaseJob(environmentId, 'db-enable', configScript, { include_replication_secret: true, timeout_ms: 120_000 });
@@ -1855,7 +1860,7 @@ async function runDbReplicaEnable(environmentId: number): Promise<RunbookResult>
     }
   }
 
-  const afterJob = await runDatabaseJob(environmentId, 'db-probe', buildDbProbeScript(), { timeout_ms: 60_000 });
+  const afterJob = await runDatabaseJob(environmentId, 'db-probe', buildDbProbeScript(environmentId), { timeout_ms: 60_000 });
   const after = afterJob.ok ? parseDbReplicationProbe(afterJob.logs) : null;
   const afterSlave = after?.replica.slave_status || null;
   const afterIo = (afterSlave?.Slave_IO_Running || '').toLowerCase();
@@ -1899,7 +1904,7 @@ async function runDbReplicaRepair(environmentId: number): Promise<RunbookResult>
   }
 
   // Initial probe.
-  const probeJob = await runDatabaseJob(environmentId, 'db-probe', buildDbProbeScript(), { timeout_ms: 60_000 });
+  const probeJob = await runDatabaseJob(environmentId, 'db-probe', buildDbProbeScript(environmentId), { timeout_ms: 60_000 });
   data.before_probe_job = { ok: probeJob.ok, state: probeJob.state };
   if (!probeJob.ok) {
     observations.push(`Probe failed: ${probeJob.error || probeJob.state}`);
@@ -1972,6 +1977,8 @@ async function runDbReplicaRepair(environmentId: number): Promise<RunbookResult>
   }
 
   // Attempt a non-destructive repair: ensure replication user, then reset + configure replication on replica.
+  const primaryHost = `mz-env-${environmentId}_database`;
+  const replicaHost = `mz-env-${environmentId}_database-replica`;
   const passRef = '${REPL_PASS}';
   const ensureReplicaUserSql = [
     `CREATE USER IF NOT EXISTS 'replica'@'%' IDENTIFIED BY '${passRef}';`,
@@ -1979,18 +1986,18 @@ async function runDbReplicaRepair(environmentId: number): Promise<RunbookResult>
     "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'replica'@'%';",
     'FLUSH PRIVILEGES;',
   ].join(' ');
-  const changeMasterSql = `CHANGE MASTER TO MASTER_HOST='database', MASTER_PORT=3306, MASTER_USER='replica', MASTER_PASSWORD='${passRef}', MASTER_USE_GTID=slave_pos; START SLAVE;`;
+  const changeMasterSql = `CHANGE MASTER TO MASTER_HOST='${primaryHost}', MASTER_PORT=3306, MASTER_USER='replica', MASTER_PASSWORD='${passRef}', MASTER_USE_GTID=slave_pos; START SLAVE;`;
 
   const repairScript = [
     'set -e',
     'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
     'REPL_PASS="$(cat /run/secrets/db_replication_password)"',
-    'i=0; until mariadb -uroot -p"$ROOT_PASS" -h database -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 30 ]; then echo "primary not ready" >&2; exit 1; fi; sleep 1; done',
-    'i=0; until mariadb -uroot -p"$ROOT_PASS" -h database-replica -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 30 ]; then echo "replica not ready" >&2; exit 1; fi; sleep 1; done',
-    `mariadb -uroot -p"$ROOT_PASS" -h database -e "${escapeForShellDoubleQuotes(ensureReplicaUserSql)}"`,
-    'mariadb -uroot -p"$ROOT_PASS" -h database-replica -e "STOP SLAVE; RESET SLAVE ALL;" || true',
-    `mariadb -uroot -p"$ROOT_PASS" -h database-replica -e "${escapeForShellDoubleQuotes(changeMasterSql)}"`,
-    'mariadb -uroot -p"$ROOT_PASS" -h database-replica -e "SET GLOBAL read_only=1;" || true',
+    `i=0; until mariadb -uroot -p"$ROOT_PASS" -h ${primaryHost} -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 30 ]; then echo "primary not ready" >&2; exit 1; fi; sleep 1; done`,
+    `i=0; until mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 30 ]; then echo "replica not ready" >&2; exit 1; fi; sleep 1; done`,
+    `mariadb -uroot -p"$ROOT_PASS" -h ${primaryHost} -e "${escapeForShellDoubleQuotes(ensureReplicaUserSql)}"`,
+    `mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "STOP SLAVE; RESET SLAVE ALL;" || true`,
+    `mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "${escapeForShellDoubleQuotes(changeMasterSql)}"`,
+    `mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "SET GLOBAL read_only=1;" || true`,
     'echo "REPAIR_ATTEMPTED=1"',
   ].join(' && ');
 
@@ -2011,7 +2018,7 @@ async function runDbReplicaRepair(environmentId: number): Promise<RunbookResult>
   }
 
   // Probe after repair.
-  const afterJob = await runDatabaseJob(environmentId, 'db-probe', buildDbProbeScript(), { timeout_ms: 60_000 });
+  const afterJob = await runDatabaseJob(environmentId, 'db-probe', buildDbProbeScript(environmentId), { timeout_ms: 60_000 });
   data.after_probe_job = { ok: afterJob.ok, state: afterJob.state };
   const after = afterJob.ok ? parseDbReplicationProbe(afterJob.logs) : null;
   if (after) data.after = after;
@@ -2171,6 +2178,8 @@ async function runDbReplicaReseed(environmentId: number): Promise<RunbookResult>
   }
 
   // Seed replica via logical snapshot with GTID position; import with sql_log_bin=0 so we don't generate local GTIDs.
+  const primaryHost = `mz-env-${environmentId}_database`;
+  const replicaHost = `mz-env-${environmentId}_database-replica`;
   const passRef = '${REPL_PASS}';
   const ensureReplicaUserSql = [
     `CREATE USER IF NOT EXISTS 'replica'@'%' IDENTIFIED BY '${passRef}';`,
@@ -2178,24 +2187,24 @@ async function runDbReplicaReseed(environmentId: number): Promise<RunbookResult>
     "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'replica'@'%';",
     'FLUSH PRIVILEGES;',
   ].join(' ');
-  const changeMasterSql = `CHANGE MASTER TO MASTER_HOST='database', MASTER_PORT=3306, MASTER_USER='replica', MASTER_PASSWORD='${passRef}', MASTER_USE_GTID=slave_pos; START SLAVE;`;
+  const changeMasterSql = `CHANGE MASTER TO MASTER_HOST='${primaryHost}', MASTER_PORT=3306, MASTER_USER='replica', MASTER_PASSWORD='${passRef}', MASTER_USE_GTID=slave_pos; START SLAVE;`;
 
   const seedScript = [
     'set -e',
     'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
     'REPL_PASS="$(cat /run/secrets/db_replication_password)"',
     // Wait for primary + replica to accept connections.
-    'i=0; until mariadb -uroot -p"$ROOT_PASS" -h database -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 60 ]; then echo "primary not ready" >&2; exit 1; fi; sleep 1; done',
-    'i=0; until mariadb -uroot -p"$ROOT_PASS" -h database-replica -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 60 ]; then echo "replica not ready" >&2; exit 1; fi; sleep 1; done',
+    `i=0; until mariadb -uroot -p"$ROOT_PASS" -h ${primaryHost} -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 60 ]; then echo "primary not ready" >&2; exit 1; fi; sleep 1; done`,
+    `i=0; until mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 60 ]; then echo "replica not ready" >&2; exit 1; fi; sleep 1; done`,
     // Stop any auto-started replication from the init script before importing.
-    'mariadb -uroot -p"$ROOT_PASS" -h database-replica -e "STOP SLAVE; RESET SLAVE ALL;" || true',
+    `mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "STOP SLAVE; RESET SLAVE ALL;" || true`,
     // Ensure replication user exists on primary.
-    `mariadb -uroot -p"$ROOT_PASS" -h database -e "${escapeForShellDoubleQuotes(ensureReplicaUserSql)}"`,
+    `mariadb -uroot -p"$ROOT_PASS" -h ${primaryHost} -e "${escapeForShellDoubleQuotes(ensureReplicaUserSql)}"`,
     // Import snapshot (no binlogging) so replica GTID sequence does not jump ahead of primary.
-    'mariadb-dump -uroot -p"$ROOT_PASS" -h database --single-transaction --quick --routines --events --triggers --hex-blob --gtid --master-data=1 --all-databases | mariadb -uroot -p"$ROOT_PASS" -h database-replica --init-command="SET SESSION sql_log_bin=0;"',
+    `mariadb-dump -uroot -p"$ROOT_PASS" -h ${primaryHost} --single-transaction --quick --routines --events --triggers --hex-blob --gtid --master-data=1 --all-databases | mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} --init-command="SET SESSION sql_log_bin=0;"`,
     // Configure and start replication.
-    `mariadb -uroot -p"$ROOT_PASS" -h database-replica -e "${escapeForShellDoubleQuotes(changeMasterSql)}"`,
-    'mariadb -uroot -p"$ROOT_PASS" -h database-replica -e "SET GLOBAL read_only=1;" || true',
+    `mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "${escapeForShellDoubleQuotes(changeMasterSql)}"`,
+    `mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "SET GLOBAL read_only=1;" || true`,
     'echo "SEEDED=1"',
   ].join(' && ');
 
@@ -2216,7 +2225,7 @@ async function runDbReplicaReseed(environmentId: number): Promise<RunbookResult>
   }
 
   // Final probe.
-  const finalProbeJob = await runDatabaseJob(environmentId, 'db-probe', buildDbProbeScript(), { timeout_ms: 60_000 });
+  const finalProbeJob = await runDatabaseJob(environmentId, 'db-probe', buildDbProbeScript(environmentId), { timeout_ms: 60_000 });
   data.after_probe_job = { ok: finalProbeJob.ok, state: finalProbeJob.state };
   const after = finalProbeJob.ok ? parseDbReplicationProbe(finalProbeJob.logs) : null;
   if (after) data.after = after;
@@ -2279,7 +2288,7 @@ async function runDbSwitchRole(environmentId: number, direction: DbSwitchDirecti
     };
   }
 
-  const desiredWriterHost = toService;
+  const desiredWriterHost = `mz-env-${environmentId}_${toService}`;
   const runbookId = direction === 'to_replica' ? 'db_failover' : 'db_failback';
 
   // Quick no-op check.
@@ -2343,8 +2352,8 @@ async function runDbSwitchRole(environmentId: number, direction: DbSwitchDirecti
   // Configure the old writer as a replica of the new writer.
   const cleaned = await stopAndResetSlave(fromContainer.id);
   actions.push(cleaned ? `Cleared replication state on ${fromService}` : `Failed to clear replication state on ${fromService}`);
-  const configured = await configureAsReplica(fromContainer.id, toService, 'replica');
-  actions.push(configured ? `Configured ${fromService} as replica of ${toService}` : `Failed to configure ${fromService} replication`);
+  const configured = await configureAsReplica(fromContainer.id, desiredWriterHost, 'replica');
+  actions.push(configured ? `Configured ${fromService} as replica of ${desiredWriterHost}` : `Failed to configure ${fromService} replication`);
   const roAgain = await setReadOnly(fromContainer.id, true);
   actions.push(roAgain ? `Set ${fromService} read_only=ON` : `Failed to set ${fromService} read_only=ON`);
 
