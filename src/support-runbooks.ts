@@ -101,6 +101,13 @@ const RUNBOOKS: RunbookDefinition[] = [
     supports_remediation: false,
   },
   {
+    id: 'http_smoke_check',
+    name: 'HTTP smoke check',
+    description: 'Run quick deploy-style HTTP smoke checks against nginx/varnish over the backend network.',
+    safe: true,
+    supports_remediation: false,
+  },
+  {
     id: 'magento_var_permissions',
     name: 'Magento var permissions check',
     description: 'Verify Magento var directories are writable and fix if needed.',
@@ -1062,6 +1069,128 @@ async function runVarnishReady(environmentId: number): Promise<RunbookResult> {
   };
 }
 
+type HttpSmokeCheckSpec = {
+  name: string;
+  url: string;
+  expect_status?: number;
+};
+
+async function runHttpSmokeCheck(environmentId: number, input: Record<string, unknown>): Promise<RunbookResult> {
+  const hostnameRaw = typeof input.hostname === 'string' ? input.hostname.trim() : '';
+  const hostHeader = hostnameRaw || undefined;
+
+  const timeoutSecondsRaw = typeof input.timeout_seconds === 'number' ? input.timeout_seconds : Number(input.timeout_seconds ?? NaN);
+  const timeoutSeconds = Number.isFinite(timeoutSecondsRaw)
+    ? Math.min(15, Math.max(2, Math.floor(timeoutSecondsRaw)))
+    : 5;
+
+  const connectTimeoutRaw = typeof input.connect_timeout_seconds === 'number'
+    ? input.connect_timeout_seconds
+    : Number(input.connect_timeout_seconds ?? NaN);
+  const connectTimeoutSeconds = Number.isFinite(connectTimeoutRaw)
+    ? Math.min(10, Math.max(1, Math.floor(connectTimeoutRaw)))
+    : 2;
+
+  const stackPrefix = `mz-env-${environmentId}_`;
+  const checks: HttpSmokeCheckSpec[] = [
+    { name: 'nginx.mz-healthz', url: `http://${stackPrefix}nginx/mz-healthz`, expect_status: 200 },
+    { name: 'varnish.mz-healthz', url: `http://${stackPrefix}varnish/mz-healthz`, expect_status: 200 },
+    { name: 'nginx.health_check.php', url: `http://${stackPrefix}nginx/health_check.php`, expect_status: 200 },
+    { name: 'varnish.root', url: `http://${stackPrefix}varnish/` },
+  ];
+
+  const args: string[] = [
+    'run',
+    '--rm',
+    '--network',
+    'mz-backend',
+    'curlimages/curl:8.5.0',
+  ];
+
+  const baseCurlArgs = [
+    '-sS',
+    '-o',
+    '/dev/null',
+    '--connect-timeout',
+    String(connectTimeoutSeconds),
+    '-m',
+    String(timeoutSeconds),
+  ];
+
+  for (let index = 0; index < checks.length; index += 1) {
+    const check = checks[index];
+    if (index > 0) {
+      args.push('--next');
+    }
+    args.push(
+      ...baseCurlArgs,
+      '-w',
+      `${check.name} %{http_code}\\n`
+    );
+    if (hostHeader) {
+      args.push('-H', `Host: ${hostHeader}`);
+    }
+    args.push(check.url);
+  }
+
+  const result = await runCommand('docker', args, 25_000);
+  const observations: string[] = [];
+  if (hostHeader) {
+    observations.push(`Host header: ${hostHeader}`);
+  }
+  observations.push(`Probe timeouts: connect=${connectTimeoutSeconds}s total=${timeoutSeconds}s per request`);
+
+  const rawLines = (result.stdout || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const statusByName = new Map<string, number>();
+  for (const line of rawLines) {
+    const match = line.match(/^(\S+)\s+(\d{3})$/);
+    if (!match) continue;
+    statusByName.set(match[1], Number(match[2]));
+  }
+
+  const failures: string[] = [];
+  const dataChecks: Array<{ name: string; url: string; status: number; ok: boolean }> = [];
+  for (const check of checks) {
+    const status = statusByName.get(check.name) ?? 0;
+    const ok = check.expect_status
+      ? status === check.expect_status
+      : status >= 200 && status < 400;
+    dataChecks.push({ name: check.name, url: check.url, status, ok });
+    observations.push(`${check.name}: ${status || 0}`);
+    if (!ok) {
+      const expected = check.expect_status ? String(check.expect_status) : '2xx/3xx';
+      failures.push(`${check.name} expected ${expected} got ${status || 0}`);
+    }
+  }
+
+  if (result.stderr?.trim()) {
+    observations.push(`Probe stderr: ${result.stderr.trim()}`);
+  }
+
+  const ok = result.code === 0 && failures.length === 0;
+  const status = ok ? 'ok' : failures.length ? 'warning' : 'failed';
+  const summary = ok
+    ? 'HTTP smoke checks passed.'
+    : failures.length
+      ? `HTTP smoke checks failed: ${failures.join('; ')}`
+      : 'HTTP smoke checks could not be completed.';
+
+  return {
+    runbook_id: 'http_smoke_check',
+    status,
+    summary,
+    observations,
+    data: {
+      checks: dataChecks,
+      docker_exit_code: result.code,
+    },
+  };
+}
+
 async function runVarPermissions(environmentId: number): Promise<RunbookResult> {
   const container = await findContainer(environmentId, '_php-fpm');
   if (!container) {
@@ -1393,6 +1522,8 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
       return runPhpFpmHealth(environmentId);
     case 'varnish_ready':
       return runVarnishReady(environmentId);
+    case 'http_smoke_check':
+      return runHttpSmokeCheck(environmentId, input);
     case 'magento_var_permissions':
       return runVarPermissions(environmentId);
     case 'magento_media_permissions':
