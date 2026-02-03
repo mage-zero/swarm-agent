@@ -73,6 +73,13 @@ const RUNBOOKS: RunbookDefinition[] = [
     supports_remediation: true,
   },
   {
+    id: 'db_replica_repair',
+    name: 'Repair database replica replication',
+    description: 'Check if database-replica container is running and repair replication configuration if it is not replicating.',
+    safe: false,
+    supports_remediation: true,
+  },
+  {
     id: 'php_fpm_health',
     name: 'PHP-FPM health check',
     description: 'Check php-fpm container status and health.',
@@ -943,6 +950,8 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
       return runDbSwitchRole(environmentId, 'to_replica');
     case 'db_failback':
       return runDbSwitchRole(environmentId, 'to_primary');
+    case 'db_replica_repair':
+      return runDbReplicaRepair(environmentId);
     case 'php_fpm_health':
       return runPhpFpmHealth(environmentId);
     case 'varnish_ready':
@@ -1221,6 +1230,134 @@ async function runDbReplicaEnable(environmentId: number): Promise<RunbookResult>
       replica_task_node: replicaNode,
       replica_lag_seconds: lagSeconds,
     },
+  };
+}
+
+async function runDbReplicaRepair(environmentId: number): Promise<RunbookResult> {
+  const actions: string[] = [];
+  const observations: string[] = [];
+
+  const primary = await findContainerForService(environmentId, 'database');
+  const replica = await findContainerForService(environmentId, 'database-replica');
+
+  if (!primary) {
+    return {
+      runbook_id: 'db_replica_repair',
+      status: 'failed',
+      summary: 'Primary database container not found.',
+      observations: [`No database container matched for environment ${environmentId}.`],
+      remediation: { attempted: false, actions: [] },
+    };
+  }
+
+  observations.push(`Primary: ${primary.name} (${primary.status})`);
+
+  if (!replica) {
+    return {
+      runbook_id: 'db_replica_repair',
+      status: 'failed',
+      summary: 'Replica container not found. Use db_replica_enable to provision a replica first.',
+      observations: [...observations, 'database-replica container not found.'],
+      remediation: { attempted: false, actions: [] },
+    };
+  }
+
+  const health = deriveHealth(replica.status);
+  observations.push(`Replica: ${replica.name} (${replica.status})`);
+
+  if (health !== 'healthy' && health !== 'up') {
+    observations.push('Replica container is not running/healthy; repair cannot proceed.');
+    return {
+      runbook_id: 'db_replica_repair',
+      status: 'failed',
+      summary: 'Replica container exists but is not running.',
+      observations,
+      remediation: { attempted: false, actions: [] },
+    };
+  }
+
+  let repaired = false;
+
+  // Check and fix replication configuration.
+  let slave = await getSlaveStatus(replica.id);
+  if (!slave) {
+    observations.push('Replication: not configured. Attempting repair.');
+    const configured = await configureAsReplica(replica.id, 'database', 'replica');
+    actions.push(configured
+      ? 'Configured replication on database-replica (MASTER_HOST=database)'
+      : 'Failed to configure replication on database-replica');
+    if (configured) {
+      repaired = true;
+      slave = await getSlaveStatus(replica.id);
+    }
+  } else {
+    const ioRunning = (slave.Slave_IO_Running || '').toLowerCase();
+    const sqlRunning = (slave.Slave_SQL_Running || '').toLowerCase();
+    if (ioRunning !== 'yes' || sqlRunning !== 'yes') {
+      observations.push(`Replication threads: IO=${slave.Slave_IO_Running}, SQL=${slave.Slave_SQL_Running}. Attempting restart.`);
+      // Stop and reconfigure.
+      await stopAndResetSlave(replica.id);
+      const reconfigured = await configureAsReplica(replica.id, 'database', 'replica');
+      actions.push(reconfigured
+        ? 'Reconfigured and restarted replication'
+        : 'Failed to reconfigure replication');
+      if (reconfigured) {
+        repaired = true;
+        slave = await getSlaveStatus(replica.id);
+      }
+    } else {
+      observations.push('Replication: IO and SQL threads running.');
+    }
+  }
+
+  // Check and fix read_only.
+  const readOnly = await getReadOnly(replica.id);
+  if (readOnly === false) {
+    observations.push('Replica read_only is OFF. Setting to ON.');
+    const setRo = await setReadOnly(replica.id, true);
+    actions.push(setRo ? 'Set replica read_only=ON' : 'Failed to set replica read_only=ON');
+    if (setRo) {
+      repaired = true;
+    }
+  } else if (readOnly === true) {
+    observations.push('Replica read_only: ON (correct).');
+  } else {
+    observations.push('Replica read_only: unknown.');
+  }
+
+  // Report lag.
+  if (slave) {
+    const lagRaw = slave.Seconds_Behind_Master ?? '';
+    const lag = lagRaw === '' || String(lagRaw).toUpperCase() === 'NULL'
+      ? null
+      : Number.parseInt(String(lagRaw), 10);
+    observations.push(`Replica lag: ${lag === null ? '(unknown)' : `${lag}s`}`);
+  }
+
+  const primaryNode = await getServiceTaskNode(environmentId, 'database');
+  const replicaNode = await getServiceTaskNode(environmentId, 'database-replica');
+  if (primaryNode) observations.push(`Primary node: ${primaryNode}`);
+  if (replicaNode) observations.push(`Replica node: ${replicaNode}`);
+  if (primaryNode && replicaNode && primaryNode === replicaNode) {
+    observations.push('Warning: primary and replica are co-located on the same node.');
+  }
+
+  if (actions.length === 0) {
+    return {
+      runbook_id: 'db_replica_repair',
+      status: 'ok',
+      summary: 'Replica is running and replication looks healthy. No repair needed.',
+      observations,
+      remediation: { attempted: false, actions: [] },
+    };
+  }
+
+  return {
+    runbook_id: 'db_replica_repair',
+    status: repaired ? 'ok' : 'warning',
+    summary: repaired ? 'Replica replication repaired.' : 'Replica repair attempted but some steps failed.',
+    observations,
+    remediation: { attempted: true, actions },
   };
 }
 
