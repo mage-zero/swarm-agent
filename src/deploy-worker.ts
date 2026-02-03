@@ -13,6 +13,7 @@ type DeployPayload = {
   environment_id?: number;
   repository?: string;
   ref?: string;
+  rollback_of?: string | null;
 };
 
 type DeploymentRecord = {
@@ -111,6 +112,9 @@ const DEPLOY_RECORD_FILENAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}
 const DEPLOY_RETAIN_COUNT = Math.max(1, Number(process.env.MZ_DEPLOY_RETAIN_COUNT || 2));
 const DEPLOY_FAILED_RETAIN_COUNT = Math.max(0, Number(process.env.MZ_DEPLOY_FAILED_RETAIN_COUNT || 3));
 const DEPLOY_CLEANUP_ENABLED = (process.env.MZ_DEPLOY_CLEANUP_ENABLED || '1') !== '0';
+const DEPLOY_SMOKE_AUTO_HEAL_ENABLED = (process.env.MZ_DEPLOY_SMOKE_AUTO_HEAL_ENABLED || '1') !== '0';
+const DEPLOY_SMOKE_AUTO_HEAL_ROUNDS = Math.max(0, Number(process.env.MZ_DEPLOY_SMOKE_AUTO_HEAL_ROUNDS || 1));
+const DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED = (process.env.MZ_DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED || '0') === '1';
 const REGISTRY_CLEANUP_ENABLED = (process.env.MZ_REGISTRY_CLEANUP_ENABLED || '1') !== '0';
 const REGISTRY_CLEANUP_HOST = process.env.MZ_REGISTRY_CLEANUP_HOST || process.env.REGISTRY_PUSH_HOST || '127.0.0.1';
 const REGISTRY_CLEANUP_PORT = process.env.MZ_REGISTRY_CLEANUP_PORT || process.env.REGISTRY_PORT || '5000';
@@ -1594,6 +1598,15 @@ type HttpProbeResult = {
   detail?: string;
 };
 
+type PostDeploySmokeCheckResult = {
+  name: string;
+  url: string;
+  expected: string;
+  status: number;
+  ok: boolean;
+  detail?: string;
+};
+
 async function probeHttpViaBackendNetwork(
   url: string,
   hostHeader: string | undefined,
@@ -1644,48 +1657,49 @@ async function runPostDeploySmokeChecks(
   stackName: string,
   envHostname: string,
   log: (message: string) => void,
-) {
+) : Promise<{ ok: true; results: PostDeploySmokeCheckResult[] } | { ok: false; results: PostDeploySmokeCheckResult[]; summary: string }> {
   const hostHeader = envHostname.trim() || undefined;
   const checks: Array<{ name: string; url: string; timeoutSeconds: number; expectStatus?: number }> = [
-    { name: 'nginx.mz-healthz', url: 'http://nginx/mz-healthz', timeoutSeconds: 10, expectStatus: 200 },
-    { name: 'varnish.mz-healthz', url: 'http://varnish/mz-healthz', timeoutSeconds: 10, expectStatus: 200 },
-    { name: 'nginx.health_check.php', url: 'http://nginx/health_check.php', timeoutSeconds: 30, expectStatus: 200 },
+    { name: 'nginx.mz-healthz', url: `http://${stackName}_nginx/mz-healthz`, timeoutSeconds: 10, expectStatus: 200 },
+    { name: 'varnish.mz-healthz', url: `http://${stackName}_varnish/mz-healthz`, timeoutSeconds: 10, expectStatus: 200 },
+    { name: 'nginx.health_check.php', url: `http://${stackName}_nginx/health_check.php`, timeoutSeconds: 30, expectStatus: 200 },
     // Root path can redirect (302) to https://<hostname>/, so accept any 2xx/3xx.
-    { name: 'varnish.root', url: 'http://varnish/', timeoutSeconds: 30 },
+    { name: 'varnish.root', url: `http://${stackName}_varnish/`, timeoutSeconds: 30 },
   ];
 
   log('running post-deploy smoke checks');
   const deadline = Date.now() + 3 * 60 * 1000;
   let lastSummary = '';
+  let lastResults: PostDeploySmokeCheckResult[] = [];
 
   while (Date.now() < deadline) {
-    const results: HttpProbeResult[] = [];
+    const results: PostDeploySmokeCheckResult[] = [];
     for (const check of checks) {
       const result = await probeHttpViaBackendNetwork(check.url, hostHeader, check.timeoutSeconds);
       const ok = check.expectStatus ? result.status === check.expectStatus : result.ok;
-      results.push({ ...result, ok });
+      results.push({
+        name: check.name,
+        url: check.url,
+        expected: check.expectStatus ? String(check.expectStatus) : '2xx/3xx',
+        status: result.status,
+        ok,
+        detail: result.detail,
+      });
     }
+    lastResults = results;
 
     const failed = results
-      .map((result, index) => ({ result, spec: checks[index] }))
-      .filter(({ result, spec }) => {
-        const expected = spec.expectStatus;
-        if (expected) {
-          return result.status !== expected;
-        }
-        return !result.ok;
-      });
+      .filter((result) => !result.ok);
 
     if (!failed.length) {
       log('post-deploy smoke checks passed');
-      return;
+      return { ok: true, results };
     }
 
     lastSummary = failed
-      .map(({ result, spec }) => {
-        const expected = spec.expectStatus ? String(spec.expectStatus) : '2xx/3xx';
+      .map((result) => {
         const detail = result.detail ? ` (${result.detail})` : '';
-        return `${spec.name} expected ${expected} got ${result.status}${detail}`;
+        return `${result.name} expected ${result.expected} got ${result.status}${detail}`;
       })
       .join('; ');
 
@@ -1693,7 +1707,125 @@ async function runPostDeploySmokeChecks(
     await delay(5000);
   }
 
-  throw new Error(`Post-deploy smoke checks failed: ${lastSummary || 'unknown error'}`);
+  return { ok: false, results: lastResults, summary: lastSummary || 'unknown error' };
+}
+
+async function tryForceUpdateService(serviceName: string, log: (message: string) => void): Promise<boolean> {
+  const result = await runCommandCaptureWithStatus('docker', ['service', 'update', '--force', serviceName]);
+  if (result.code === 0) {
+    log(`forced update: ${serviceName}`);
+    return true;
+  }
+  const output = (result.stderr || result.stdout || '').trim();
+  log(`forced update failed: ${serviceName} (exit ${result.code}) ${output}`);
+  return false;
+}
+
+async function captureServicePs(serviceName: string): Promise<string[]> {
+  const result = await runCommandCaptureWithStatus('docker', [
+    'service',
+    'ps',
+    serviceName,
+    '--no-trunc',
+    '--format',
+    '{{.Node}}|{{.CurrentState}}|{{.Error}}',
+  ]);
+  const out = (result.stdout || result.stderr || '').trim();
+  if (result.code !== 0) {
+    return [out ? `error: ${out}` : `error: exit ${result.code}`];
+  }
+  return out.split('\n').map((line) => line.trim()).filter(Boolean).slice(0, 10);
+}
+
+function writeJsonFileBestEffort(filePath: string, payload: unknown) {
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(payload, null, 2));
+  } catch {
+    // ignore write failures
+  }
+}
+
+function enqueueDeploymentRecord(payload: DeployPayload, deploymentId: string) {
+  ensureDir(DEPLOY_QUEUE_DIR);
+  const target = path.join(DEPLOY_QUEUE_DIR, `${deploymentId}.json`);
+  writeJsonFileBestEffort(target, { id: deploymentId, queued_at: new Date().toISOString(), payload });
+}
+
+function chooseLastKnownGoodArtifact(environmentId: number, repository: string): string | null {
+  const history = readDeploymentHistory();
+  const key = `env:${environmentId}:${repository}`;
+  const entry = history[key];
+  const artifacts = Array.isArray(entry?.artifacts) ? entry.artifacts : [];
+  const artifact = String(artifacts[0] || '').trim();
+  return artifact || null;
+}
+
+async function autoHealPostDeploySmokeFailure(params: {
+  stackName: string;
+  envHostname: string;
+  recordPath: string;
+  record: Record<string, unknown>;
+  initial: { summary: string; results: PostDeploySmokeCheckResult[] };
+  log: (message: string) => void;
+}): Promise<{ ok: true; results: PostDeploySmokeCheckResult[] } | { ok: false; summary: string; results: PostDeploySmokeCheckResult[] }> {
+  const run = {
+    id: crypto.randomUUID(),
+    started_at: new Date().toISOString(),
+    initial: params.initial,
+    rounds: [] as Array<Record<string, unknown>>,
+  };
+
+  const failingNames = new Set(params.initial.results.filter((r) => !r.ok).map((r) => r.name));
+  const shouldRestartNginx = Array.from(failingNames).some((name) => name.startsWith('nginx.'));
+  const shouldRestartVarnish = Array.from(failingNames).some((name) => name.startsWith('varnish.'));
+  const shouldRestartPhpFpm = failingNames.has('nginx.health_check.php');
+
+  const restartTargets = new Set<string>();
+  if (shouldRestartNginx || failingNames.size === 0) restartTargets.add(`${params.stackName}_nginx`);
+  if (shouldRestartVarnish || failingNames.size === 0) restartTargets.add(`${params.stackName}_varnish`);
+  if (shouldRestartPhpFpm) restartTargets.add(`${params.stackName}_php-fpm`);
+
+  for (let round = 1; round <= DEPLOY_SMOKE_AUTO_HEAL_ROUNDS; round += 1) {
+    params.log(`auto-heal: round ${round}/${DEPLOY_SMOKE_AUTO_HEAL_ROUNDS}`);
+    const actions: string[] = [];
+    for (const serviceName of Array.from(restartTargets)) {
+      const ok = await tryForceUpdateService(serviceName, params.log);
+      actions.push(`${ok ? 'updated' : 'failed'}:${serviceName}`);
+      await delay(1000);
+    }
+
+    await delay(5000);
+
+    const verified = await runPostDeploySmokeChecks(params.stackName, params.envHostname, params.log);
+    const psSummary: Record<string, unknown> = {};
+    for (const serviceName of Array.from(restartTargets)) {
+      psSummary[serviceName] = await captureServicePs(serviceName);
+    }
+
+    run.rounds.push({
+      round,
+      actions,
+      verified_ok: verified.ok,
+      verified_summary: verified.ok ? null : verified.summary,
+      verified_results: verified.results,
+      service_ps: psSummary,
+      captured_at: new Date().toISOString(),
+    });
+
+    params.record.post_deploy_auto_heal = run;
+    writeJsonFileBestEffort(params.recordPath, params.record);
+
+    if (verified.ok) {
+      params.log('auto-heal: post-deploy verification passed');
+      return verified;
+    }
+  }
+
+  const last = run.rounds[run.rounds.length - 1] as Record<string, unknown> | undefined;
+  const summary = typeof last?.verified_summary === 'string' ? String(last.verified_summary) : params.initial.summary;
+  const results = (last?.verified_results as PostDeploySmokeCheckResult[] | undefined) || params.initial.results;
+  params.log('auto-heal: exhausted rounds; still failing');
+  return { ok: false, summary, results };
 }
 
 async function enforceMagentoPerformance(
@@ -2135,7 +2267,80 @@ async function processDeployment(recordPath: string) {
   log('magento upgrade complete');
 
   if (envHostname) {
-    await runPostDeploySmokeChecks(stackName, envHostname, log);
+    const smoke = await runPostDeploySmokeChecks(stackName, envHostname, log);
+    if (!smoke.ok) {
+      const recordState = record as unknown as Record<string, unknown>;
+      const servicePs = {
+        [`${stackName}_nginx`]: await captureServicePs(`${stackName}_nginx`),
+        [`${stackName}_varnish`]: await captureServicePs(`${stackName}_varnish`),
+        [`${stackName}_php-fpm`]: await captureServicePs(`${stackName}_php-fpm`),
+      };
+      recordState.post_deploy_smoke_checks = {
+        ok: false,
+        summary: smoke.summary,
+        results: smoke.results,
+        service_ps: servicePs,
+        captured_at: new Date().toISOString(),
+      };
+      writeJsonFileBestEffort(recordPath, recordState);
+
+      if (DEPLOY_SMOKE_AUTO_HEAL_ENABLED && DEPLOY_SMOKE_AUTO_HEAL_ROUNDS > 0) {
+        log('post-deploy smoke checks failed; attempting auto-heal');
+        const healed = await autoHealPostDeploySmokeFailure({
+          stackName,
+          envHostname,
+          recordPath,
+          record: recordState,
+          initial: { summary: smoke.summary, results: smoke.results },
+          log,
+        });
+        if (healed.ok) {
+          recordState.post_deploy_smoke_checks = {
+            ok: true,
+            recovered_from: smoke.summary,
+            results: healed.results,
+            recovered_at: new Date().toISOString(),
+          };
+          writeJsonFileBestEffort(recordPath, recordState);
+        } else {
+          recordState.post_deploy_smoke_checks = {
+            ok: false,
+            summary: healed.summary,
+            results: healed.results,
+            captured_at: new Date().toISOString(),
+          };
+          writeJsonFileBestEffort(recordPath, recordState);
+
+          if (!payload.rollback_of && DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED) {
+            const repository = String(payload.repository || '').trim() || inferRepositoryFromArtifactKey(artifactKey);
+            const lastGood = repository ? chooseLastKnownGoodArtifact(environmentId, repository) : null;
+            if (repository && lastGood && lastGood.replace(/^\/+/, '') !== artifactKey.replace(/^\/+/, '')) {
+              const rollbackDeploymentId = crypto.randomUUID();
+              enqueueDeploymentRecord({
+                artifact: lastGood,
+                stack_id: stackId,
+                environment_id: environmentId,
+                repository,
+                ref: ref || undefined,
+                rollback_of: artifactKey,
+              }, rollbackDeploymentId);
+              recordState.post_deploy_auto_rollback = {
+                queued_deployment_id: rollbackDeploymentId,
+                artifact: lastGood,
+                repository,
+                queued_at: new Date().toISOString(),
+              };
+              writeJsonFileBestEffort(recordPath, recordState);
+              throw new Error(`Post-deploy smoke checks failed: ${healed.summary}. Auto-rollback queued (${rollbackDeploymentId}).`);
+            }
+          }
+
+          throw new Error(`Post-deploy smoke checks failed: ${healed.summary}`);
+        }
+      } else {
+        throw new Error(`Post-deploy smoke checks failed: ${smoke.summary}`);
+      }
+    }
   } else {
     log('post-deploy smoke checks skipped: no environment hostname available');
   }
