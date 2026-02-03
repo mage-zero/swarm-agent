@@ -1528,6 +1528,20 @@ async function runDbReplicationStatus(environmentId: number): Promise<RunbookRes
     if (lastIo) observations.push(`Replica Last_IO_Error: ${lastIo}`);
   }
 
+  const lastSqlErrno = (replicaSlave?.Last_SQL_Errno || '').trim();
+  const lastSqlErrorLower = (replicaSlave?.Last_SQL_Error || '').toLowerCase();
+  const hasOutOfOrderGtid =
+    lastSqlErrno === '1950' ||
+    lastSqlErrorLower.includes('out-of-order') ||
+    lastSqlErrorLower.includes('gtid strict mode');
+  if (hasOutOfOrderGtid) {
+    data.recommended_fix = {
+      runbook_id: 'db_replica_reseed',
+      reason: 'gtid_out_of_order',
+    };
+    observations.push('Recommended fix: db_replica_reseed (destructive; wipes replica data). db_replica_repair is unlikely to fix GTID out-of-order under gtid_strict_mode.');
+  }
+
   const writer = (primaryReadOnly === false && !primarySlave)
     ? 'database'
     : (replicaReadOnly === false && !replicaSlave)
@@ -1663,9 +1677,9 @@ async function runDbReplicaEnable(environmentId: number): Promise<RunbookResult>
     observations.push(`Replica probe failed: ${beforeJob.error || beforeJob.state}`);
   }
 
-  // If we hit the known "unseeded replica + GTID strict-mode ordering" failure, recommend reseed.
-  if (hasOutOfOrderGtid && before?.replica.magento_table_count === 0) {
-    observations.push('Replica appears unseeded and blocked by GTID strict-mode ordering; use db_replica_reseed.');
+  // If replication is blocked by GTID strict-mode ordering, recommend reseed.
+  if (hasOutOfOrderGtid) {
+    observations.push('Replica is blocked by GTID strict-mode ordering; use db_replica_reseed.');
     return {
       runbook_id: 'db_replica_enable',
       status: 'warning',
@@ -1806,9 +1820,16 @@ async function runDbReplicaRepair(environmentId: number): Promise<RunbookResult>
 
   // If the replica is unseeded (no Magento tables) and stuck on a GTID strict-mode error,
   // changing master/RESET SLAVE will not fix it; it needs a reseed snapshot first.
-  if (hasOutOfOrderGtid && before.replica.magento_table_count === 0) {
-    observations.push('Replica appears unseeded (0 Magento tables) and is blocked by GTID strict-mode ordering.');
-    observations.push('Use db_replica_reseed to rebuild the replica from a fresh snapshot of the primary.');
+  if (hasOutOfOrderGtid) {
+    const tables = before.replica.magento_table_count;
+    if (tables === 0) {
+      observations.push('Replica appears unseeded (0 Magento tables) and is blocked by GTID strict-mode ordering.');
+    } else if (tables !== null) {
+      observations.push(`Replica has ${tables} Magento tables but is blocked by GTID strict-mode ordering.`);
+    } else {
+      observations.push('Replica is blocked by GTID strict-mode ordering.');
+    }
+    observations.push('db_replica_repair is unlikely to resolve GTID out-of-order under gtid_strict_mode; use db_replica_reseed to rebuild the replica from a fresh snapshot of the primary.');
     return {
       runbook_id: 'db_replica_repair',
       status: 'failed',
