@@ -55,5 +55,16 @@ describe('support-runbooks helpers', () => {
     expect(parsed?.replica.slave_status?.Slave_IO_Running).toBe('Yes');
     expect(parsed?.replica.slave_status?.Last_SQL_Errno).toBe('1950');
   });
-});
 
+  it('parses proxysql hostgroup rows', () => {
+    const raw = [
+      '10 mz-env-5_database ONLINE',
+      '20 mz-env-5_database-replica OFFLINE_SOFT',
+    ].join('\n');
+    const rows = __testing.parseProxySqlHostgroups(raw);
+    expect(rows).toEqual([
+      { hostgroup: 10, hostname: 'mz-env-5_database', status: 'ONLINE' },
+      { hostgroup: 20, hostname: 'mz-env-5_database-replica', status: 'OFFLINE_SOFT' },
+    ]);
+  });
+});

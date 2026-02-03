@@ -970,25 +970,40 @@ async function updateNodeLabel(nodeId: string, labelKey: string, labelValue: str
 }
 
 async function queryProxySqlHostgroups(environmentId: number): Promise<Array<{ hostgroup: number; hostname: string; status: string }>> {
-  const container = await findContainerForService(environmentId, 'proxysql');
-  if (!container) return [];
+  const proxysqlService = `mz-env-${environmentId}_proxysql`;
+  const proxysqlSpec = await inspectServiceSpec(proxysqlService);
+  if (!proxysqlSpec) return [];
+  const networkName = pickNetworkName(proxysqlSpec) || 'mz-backend';
+
+  const dbSpec = await inspectServiceSpec(`mz-env-${environmentId}_database`);
+  const clientImage = dbSpec?.image || 'mariadb:11';
+
+  const sql = 'SELECT hostgroup_id,hostname,status FROM runtime_mysql_servers ORDER BY hostgroup_id,hostname;';
+  const safeSql = escapeForShellDoubleQuotes(sql);
+  const command = [
+    'set -e',
+    `HOST="${proxysqlService}"`,
+    `SQL="${safeSql}"`,
+    'CLIENT=""',
+    'if command -v mariadb >/dev/null 2>&1; then CLIENT="mariadb"; elif command -v mysql >/dev/null 2>&1; then CLIENT="mysql"; fi',
+    'if [ -z "$CLIENT" ]; then echo "missing mariadb/mysql client" >&2; exit 2; fi',
+    '$CLIENT -h "$HOST" -P 6032 -u admin -padmin -N -B -e "$SQL"',
+  ].join(' && ');
+
   const result = await runCommand('docker', [
-    'exec',
-    container.id,
+    'run',
+    '--rm',
+    '--network',
+    networkName,
+    '--entrypoint',
     'sh',
+    clientImage,
     '-lc',
-    'mysql -h 127.0.0.1 -P 6032 -u admin -padmin -N -B -e "SELECT hostgroup_id,hostname,status FROM runtime_mysql_servers ORDER BY hostgroup_id,hostname;" 2>/dev/null || true',
+    command,
   ], 12_000);
   if (result.code !== 0) return [];
-  return result.stdout
-    .split('\n')
-    .map((l) => l.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const [hg, hostname, status] = line.split(/\s+/);
-      return { hostgroup: Number(hg || 0), hostname: String(hostname || ''), status: String(status || '') };
-    })
-    .filter((row) => Number.isFinite(row.hostgroup) && row.hostgroup > 0 && row.hostname !== '');
+
+  return parseProxySqlHostgroups(result.stdout);
 }
 
 async function waitForProxySqlWriter(environmentId: number, writerHost: string, timeoutMs = 30_000): Promise<boolean> {
@@ -1000,6 +1015,18 @@ async function waitForProxySqlWriter(environmentId: number, writerHost: string, 
     await new Promise((r) => setTimeout(r, 1000));
   }
   return false;
+}
+
+function parseProxySqlHostgroups(raw: string): Array<{ hostgroup: number; hostname: string; status: string }> {
+  return raw
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [hg, hostname, status] = line.split(/\s+/);
+      return { hostgroup: Number(hg || 0), hostname: String(hostname || ''), status: String(status || '') };
+    })
+    .filter((row) => Number.isFinite(row.hostgroup) && row.hostgroup > 0 && row.hostname !== '');
 }
 
 async function runPhpFpmHealth(environmentId: number): Promise<RunbookResult> {
@@ -1295,23 +1322,42 @@ async function runMediaPermissions(environmentId: number): Promise<RunbookResult
 }
 
 async function runProxySqlReady(environmentId: number): Promise<RunbookResult> {
-  const container = await findContainer(environmentId, '_proxysql');
-  if (!container) {
+  const serviceName = `mz-env-${environmentId}_proxysql`;
+  const spec = await inspectServiceSpec(serviceName);
+  if (!spec) {
     return {
       runbook_id: 'proxysql_ready',
       status: 'failed',
-      summary: 'ProxySQL container not found.',
-      observations: ['No ProxySQL container matched for this environment.'],
+      summary: 'ProxySQL service not found.',
+      observations: [`Missing service: ${serviceName}`],
     };
   }
-  const health = deriveHealth(container.status);
-  const ok = health === 'healthy' || health === 'up';
+
+  const node = await getServiceTaskNode(environmentId, 'proxysql');
+  const observations = node ? [`Task node: ${node}`] : [];
+
+  const rows = await queryProxySqlHostgroups(environmentId);
+  if (!rows.length) {
+    return {
+      runbook_id: 'proxysql_ready',
+      status: 'warning',
+      summary: 'ProxySQL is running but admin readiness is unconfirmed.',
+      observations: [...observations, 'Unable to query ProxySQL admin interface (6032) over the overlay network.'],
+      data: { service: spec, task_node: node },
+    };
+  }
+
+  const onlineCount = rows.filter((row) => row.status.toUpperCase() === 'ONLINE').length;
+  const ok = onlineCount > 0;
   return {
     runbook_id: 'proxysql_ready',
     status: ok ? 'ok' : 'warning',
-    summary: `ProxySQL status: ${container.status}`,
-    observations: [`Container ${container.name} is ${container.status}`],
-    data: { container },
+    summary: ok ? 'ProxySQL ready (has ONLINE backends).' : 'ProxySQL running but no ONLINE backends.',
+    observations: [
+      ...observations,
+      `Backends: ONLINE=${onlineCount} total=${rows.length}`,
+    ],
+    data: { service: spec, task_node: node, hostgroups: rows },
   };
 }
 
@@ -2749,4 +2795,5 @@ export const __testing = {
   parseSlaveStatus,
   parseDbReplicationProbe,
   buildDbProbeScript,
+  parseProxySqlHostgroups,
 };
