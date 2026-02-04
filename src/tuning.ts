@@ -12,7 +12,7 @@ import type {
   PlannerTuningProfile,
   PlannerTuningService,
 } from './planner-types.js';
-import { buildConfigChanges } from './config-advisor.js';
+import { buildConfigBaseline, buildConfigChanges } from './config-advisor.js';
 
 type StoredTuningProfiles = {
   base: PlannerTuningProfile;
@@ -524,6 +524,7 @@ export function buildTuningPayloadFromStorage(
   const baseProfile = stored?.base || createBaseProfile(baseResources, now);
   baseProfile.resources = clonePlannerResources(baseResources);
   baseProfile.updated_at = now;
+  baseProfile.config_changes = buildConfigBaseline(inspection);
 
   let recommendedProfile = stored?.recommended;
   if (recommendedProfile && !isProfileFresh(recommendedProfile, nowMs)) {

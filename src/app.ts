@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { getHealthStatus } from './health.js';
-import { handleDeployArtifact, handleDeployKey, handleR2Presign } from './deploy.js';
+import { handleDeployAddon, handleDeployArtifact, handleDeployKey, handleR2Presign } from './deploy.js';
 import {
   buildCapacityPayload,
   buildPlannerPayload,
@@ -29,6 +29,11 @@ export const createApp = () => {
 
   app.post('/deploy/artifact', async (c) => {
     const result = await handleDeployArtifact(c);
+    return c.json(result.body, result.status as ContentfulStatusCode);
+  });
+
+  app.post('/deploy/addon', async (c) => {
+    const result = await handleDeployAddon(c);
     return c.json(result.body, result.status as ContentfulStatusCode);
   });
 

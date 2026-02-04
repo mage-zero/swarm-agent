@@ -148,6 +148,7 @@ const RESOURCE_ENV_MAP = [
   { service: 'redis-cache', prefix: 'MZ_REDIS_CACHE' },
   { service: 'redis-session', prefix: 'MZ_REDIS_SESSION' },
   { service: 'rabbitmq', prefix: 'MZ_RABBITMQ' },
+  { service: 'mailhog', prefix: 'MZ_MAILHOG' },
 ] as const;
 
 let processing = false;
@@ -2032,6 +2033,11 @@ async function processDeployment(recordPath: string) {
   let replicaServiceName: 'database' | 'database-replica' = 'database';
   let replicaEnabled = false;
   const envTypeRaw = String(envRecord?.environment_type || '').trim().toLowerCase();
+  const envHostname = String(envRecord?.environment_hostname || envRecord?.hostname || '').trim();
+  const envHostnameOnly = envHostname
+    ? envHostname.replace(/^https?:\/\//, '').split('/')[0]?.replace(/\/+$/, '') || ''
+    : '';
+  const mailCatcherEnabled = ['non-production', 'development', 'staging', 'performance'].includes(envTypeRaw);
   const envEligible = envTypeRaw === ''
     ? true
     : ['production', 'performance', 'staging'].includes(envTypeRaw);
@@ -2083,6 +2089,14 @@ async function processDeployment(recordPath: string) {
     MZ_OPENSEARCH_HOST: opensearchHost,
     MZ_OPENSEARCH_PORT: opensearchPort,
     MZ_OPENSEARCH_TIMEOUT: opensearchTimeout,
+    MZ_MAILHOG_REPLICAS: mailCatcherEnabled ? '1' : '0',
+    SMTP_HOST: mailCatcherEnabled ? stackService('mailhog') : (process.env.SMTP_HOST || ''),
+    SMTP_PORT: mailCatcherEnabled ? '1025' : (process.env.SMTP_PORT || ''),
+    SMTP_TLS: mailCatcherEnabled ? 'off' : (process.env.SMTP_TLS || ''),
+    SMTP_AUTH_USER: mailCatcherEnabled ? '' : (process.env.SMTP_AUTH_USER || ''),
+    SMTP_AUTH_PASSWORD: mailCatcherEnabled ? '' : (process.env.SMTP_AUTH_PASSWORD || ''),
+    SMTP_FROM_ADDRESS: process.env.SMTP_FROM_ADDRESS || (envHostnameOnly ? `no-reply@${envHostnameOnly}` : ''),
+    SMTP_FROM_HOSTNAME: process.env.SMTP_FROM_HOSTNAME || envHostnameOnly,
   };
   assertRequiredEnv(envVars, [
     'MAGE_VERSION',
@@ -2092,6 +2106,7 @@ async function processDeployment(recordPath: string) {
     'OPENSEARCH_VERSION',
     'REDIS_VERSION',
     'RABBITMQ_VERSION',
+    'MAILHOG_VERSION',
     'PHP_VERSION',
     'NGINX_VERSION',
     ...RESOURCE_ENV_KEYS,
@@ -2105,7 +2120,6 @@ async function processDeployment(recordPath: string) {
   assertNoLatestImages(renderedStack.stdout);
 
   const secrets = envRecord?.environment_secrets ?? null;
-  const envHostname = String(envRecord?.environment_hostname || envRecord?.hostname || '').trim();
   const envBaseUrl = envHostname ? `https://${envHostname.replace(/^https?:\/\//, '').replace(/\/+$/, '')}` : '';
   const dbSecretName = `mz_db_password_v${SECRET_VERSION}`;
   const dbRootSecretName = `mz_db_root_password_v${SECRET_VERSION}`;

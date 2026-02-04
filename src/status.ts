@@ -9,6 +9,7 @@ import type {
   PlannerCapacityChangePayload,
   PlannerInspectionPayload,
   PlannerInspectionService,
+  PlannerResourceSpec,
   PlannerResources,
   PlannerTuningPayload,
   PlannerTuningProfile,
@@ -1078,8 +1079,70 @@ function buildPlannerResourceDefaults(): PlannerResources {
         limits: { cpu_cores: 1, memory_bytes: 512 * MIB },
         reservations: { cpu_cores: 0.25, memory_bytes: 256 * MIB },
       },
+      mailhog: {
+        limits: { cpu_cores: 0.25, memory_bytes: 128 * MIB },
+        reservations: { cpu_cores: 0.05, memory_bytes: 64 * MIB },
+      },
     },
   };
+}
+
+function hasMeaningfulPlannerResourceSpec(spec: PlannerResourceSpec): boolean {
+  return spec.limits.cpu_cores > 0
+    || spec.limits.memory_bytes > 0
+    || spec.reservations.cpu_cores > 0
+    || spec.reservations.memory_bytes > 0;
+}
+
+function mergePlannerResourceSpecMax(base: PlannerResourceSpec, next: PlannerResourceSpec): PlannerResourceSpec {
+  return {
+    limits: {
+      cpu_cores: Math.max(base.limits.cpu_cores, next.limits.cpu_cores),
+      memory_bytes: Math.max(base.limits.memory_bytes, next.limits.memory_bytes),
+    },
+    reservations: {
+      cpu_cores: Math.max(base.reservations.cpu_cores, next.reservations.cpu_cores),
+      memory_bytes: Math.max(base.reservations.memory_bytes, next.reservations.memory_bytes),
+    },
+  };
+}
+
+function extractPlannerResourceOverridesFromSwarmServices(services: any[]): PlannerResources {
+  const overrides: PlannerResources = { services: {} };
+  for (const service of services) {
+    const name = String(service?.Spec?.Name || '');
+    if (!name) {
+      continue;
+    }
+    const parsed = parseEnvironmentServiceName(name);
+    if (!parsed.environmentId) {
+      continue;
+    }
+
+    const taskResources = service?.Spec?.TaskTemplate?.Resources || {};
+    const limits = taskResources?.Limits || {};
+    const reservations = taskResources?.Reservations || {};
+    const spec: PlannerResourceSpec = {
+      limits: {
+        cpu_cores: toCpuCores(limits?.NanoCPUs),
+        memory_bytes: Number(limits?.MemoryBytes || 0),
+      },
+      reservations: {
+        cpu_cores: toCpuCores(reservations?.NanoCPUs),
+        memory_bytes: Number(reservations?.MemoryBytes || 0),
+      },
+    };
+
+    if (!hasMeaningfulPlannerResourceSpec(spec)) {
+      continue;
+    }
+
+    const existing = overrides.services[parsed.service];
+    overrides.services[parsed.service] = existing
+      ? mergePlannerResourceSpecMax(existing, spec)
+      : spec;
+  }
+  return overrides;
 }
 
 type InspectionCommand = {
@@ -1092,7 +1155,7 @@ type InspectionCommand = {
 const PHP_OPCACHE_COMMAND: string[] = [
   'sh',
   '-lc',
-  'php -r \'$limit=ini_get("memory_limit"); $limitBytes=null; if ($limit===false) { $limitBytes=null; } elseif ($limit==="-1") { $limitBytes=-1; } else { $unit=strtolower(substr($limit,-1)); $value=(float)$limit; if (in_array($unit, ["k","m","g","t"], true)) { $value=(float)substr($limit,0,-1); $mult=1; if ($unit==="k") { $mult=1024; } elseif ($unit==="m") { $mult=1024*1024; } elseif ($unit==="g") { $mult=1024*1024*1024; } elseif ($unit==="t") { $mult=1024*1024*1024*1024; } $limitBytes=(int)($value*$mult); } else { $limitBytes=(int)$value; } } $out=["php_memory_limit_bytes"=>$limitBytes]; if (function_exists("opcache_get_status")) { $s=opcache_get_status(false); if ($s) { $mem=$s["memory_usage"]??[]; $stat=$s["opcache_statistics"]??[]; $out["opcache_used_bytes"]=$mem["used_memory"]??null; $out["opcache_free_bytes"]=$mem["free_memory"]??null; $out["opcache_wasted_bytes"]=$mem["wasted_memory"]??null; $out["opcache_hit_rate"]=$stat["opcache_hit_rate"]??null; $out["opcache_cached_scripts"]=$stat["num_cached_scripts"]??null; $out["opcache_cached_keys"]=$stat["num_cached_keys"]??null; $out["opcache_max_keys"]=$stat["max_cached_keys"]??null; $out["opcache_enabled"]=true; } else { $out["opcache_enabled"]=false; } } else { $out["opcache_enabled"]=false; } echo json_encode($out);\'',
+  'php -r \'$limit=ini_get("memory_limit"); $limitBytes=null; if ($limit===false) { $limitBytes=null; } elseif ($limit==="-1") { $limitBytes=-1; } else { $unit=strtolower(substr($limit,-1)); $value=(float)$limit; if (in_array($unit, ["k","m","g","t"], true)) { $value=(float)substr($limit,0,-1); $mult=1; if ($unit==="k") { $mult=1024; } elseif ($unit==="m") { $mult=1024*1024; } elseif ($unit==="g") { $mult=1024*1024*1024; } elseif ($unit==="t") { $mult=1024*1024*1024*1024; } $limitBytes=(int)($value*$mult); } else { $limitBytes=(int)$value; } } $out=["php_memory_limit_bytes"=>$limitBytes,"php.memory_limit"=>$limitBytes]; $ocMem=ini_get("opcache.memory_consumption"); if ($ocMem!==false && $ocMem!=="") { $out["opcache.memory_consumption"]=(int)$ocMem*1024*1024; } $interned=ini_get("opcache.interned_strings_buffer"); if ($interned!==false && $interned!=="") { $out["opcache.interned_strings_buffer"]=(int)$interned*1024*1024; } $maxFiles=ini_get("opcache.max_accelerated_files"); if ($maxFiles!==false && $maxFiles!=="") { $out["opcache.max_accelerated_files"]=(int)$maxFiles; } $map=["pm.max_children"=>"fpm.pm.max_children","pm.start_servers"=>"fpm.pm.start_servers","pm.min_spare_servers"=>"fpm.pm.min_spare_servers","pm.max_spare_servers"=>"fpm.pm.max_spare_servers","pm.max_requests"=>"fpm.pm.max_requests"]; $paths=array_merge(glob("/usr/local/etc/php-fpm.d/*.conf")?:[], glob("/usr/local/etc/php-fpm.d/*.ini")?:[], file_exists("/usr/local/etc/php-fpm.d/www.conf") ? ["/usr/local/etc/php-fpm.d/www.conf"] : []); foreach ($paths as $p) { $lines=@file($p, FILE_IGNORE_NEW_LINES); if (!is_array($lines)) { continue; } foreach ($lines as $line) { $line=trim($line); if ($line==="" || $line[0]===";" || $line[0]==="#") { continue; } $line=preg_replace("/[;#].*$/", "", $line); $parts=explode("=", $line, 2); if (count($parts)<2) { continue; } $k=trim($parts[0]); $v=trim($parts[1]); if (!isset($map[$k])) { continue; } if ($v==="" || !is_numeric($v)) { continue; } $out[$map[$k]]=(int)$v; } } if (function_exists("opcache_get_status")) { $s=opcache_get_status(false); if ($s) { $mem=$s["memory_usage"]??[]; $stat=$s["opcache_statistics"]??[]; $out["opcache_used_bytes"]=$mem["used_memory"]??null; $out["opcache_free_bytes"]=$mem["free_memory"]??null; $out["opcache_wasted_bytes"]=$mem["wasted_memory"]??null; $out["opcache_hit_rate"]=$stat["opcache_hit_rate"]??null; $out["opcache_cached_scripts"]=$stat["num_cached_scripts"]??null; $out["opcache_cached_keys"]=$stat["num_cached_keys"]??null; $out["opcache_max_keys"]=$stat["max_cached_keys"]??null; $out["opcache_enabled"]=true; } else { $out["opcache_enabled"]=false; } } else { $out["opcache_enabled"]=false; } echo json_encode($out);\'',
 ];
 
 const INSPECTION_COMMANDS: Record<string, InspectionCommand> = {
@@ -1135,7 +1198,7 @@ const INSPECTION_COMMANDS: Record<string, InspectionCommand> = {
     command: [
       'sh',
       '-lc',
-      'MYSQL_PWD="$(cat /run/secrets/db_root_password 2>/dev/null || true)"; if [ -z "$MYSQL_PWD" ]; then exit 0; fi; export MYSQL_PWD; mysql -uroot -N -B -e "SHOW GLOBAL STATUS WHERE Variable_name IN (\'Threads_connected\',\'Threads_running\',\'Slow_queries\',\'Questions\',\'Uptime\',\'Connections\'); SHOW GLOBAL VARIABLES WHERE Variable_name IN (\'innodb_buffer_pool_size\',\'max_connections\');"',
+      'MYSQL_PWD="$(cat /run/secrets/db_root_password 2>/dev/null || true)"; if [ -z "$MYSQL_PWD" ]; then exit 0; fi; export MYSQL_PWD; mysql -uroot -N -B -e "SHOW GLOBAL STATUS WHERE Variable_name IN (\'Threads_connected\',\'Threads_running\',\'Slow_queries\',\'Questions\',\'Uptime\',\'Connections\'); SHOW GLOBAL VARIABLES WHERE Variable_name IN (\'innodb_buffer_pool_size\',\'innodb_log_file_size\',\'max_connections\',\'tmp_table_size\',\'max_heap_table_size\',\'thread_cache_size\',\'query_cache_size\');"',
     ],
     parser: parseMysqlMetrics,
   },
@@ -1144,7 +1207,7 @@ const INSPECTION_COMMANDS: Record<string, InspectionCommand> = {
     command: [
       'sh',
       '-lc',
-      'MYSQL_PWD="$(cat /run/secrets/db_root_password 2>/dev/null || true)"; if [ -z "$MYSQL_PWD" ]; then exit 0; fi; export MYSQL_PWD; mysql -uroot -N -B -e "SHOW GLOBAL STATUS WHERE Variable_name IN (\'Threads_connected\',\'Threads_running\',\'Slow_queries\',\'Questions\',\'Uptime\',\'Connections\'); SHOW GLOBAL VARIABLES WHERE Variable_name IN (\'innodb_buffer_pool_size\',\'max_connections\');"',
+      'MYSQL_PWD="$(cat /run/secrets/db_root_password 2>/dev/null || true)"; if [ -z "$MYSQL_PWD" ]; then exit 0; fi; export MYSQL_PWD; mysql -uroot -N -B -e "SHOW GLOBAL STATUS WHERE Variable_name IN (\'Threads_connected\',\'Threads_running\',\'Slow_queries\',\'Questions\',\'Uptime\',\'Connections\'); SHOW GLOBAL VARIABLES WHERE Variable_name IN (\'innodb_buffer_pool_size\',\'innodb_log_file_size\',\'max_connections\',\'tmp_table_size\',\'max_heap_table_size\',\'thread_cache_size\',\'query_cache_size\');"',
     ],
     parser: parseMysqlMetrics,
   },
@@ -1264,7 +1327,12 @@ function parseMysqlMetrics(output: string): Record<string, InspectionMetricValue
     'Uptime',
     'Connections',
     'innodb_buffer_pool_size',
+    'innodb_log_file_size',
     'max_connections',
+    'tmp_table_size',
+    'max_heap_table_size',
+    'thread_cache_size',
+    'query_cache_size',
   ];
   for (const key of keys) {
     const value = parseNumber(raw[key] || '');
@@ -1804,8 +1872,19 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
     memory_bytes: node.resources?.memory_bytes || 0,
   }));
 
-  const baseResources = buildPlannerResourceDefaults();
   const inspection = await buildInspectionForTuning();
+  const baseResources = buildPlannerResourceDefaults();
+  try {
+    const swarmServices = await getSwarmServices(capacity.control_available);
+    const overrides = extractPlannerResourceOverridesFromSwarmServices(swarmServices);
+    for (const [service, spec] of Object.entries(overrides.services)) {
+      if (!baseResources.services[service]) {
+        baseResources.services[service] = spec;
+      }
+    }
+  } catch {
+    // ignore swarm service inspection failures
+  }
 
   let tuningResult: { payload: PlannerTuningPayload; active: PlannerTuningProfile };
   if (!inspection.services.length || (inspection.sample_count ?? 0) === 0) {

@@ -1,4 +1,5 @@
 import type {
+  InspectionMetricValue,
   PlannerConfigChange,
   PlannerInspectionPayload,
   PlannerResources,
@@ -146,4 +147,133 @@ export function buildConfigChanges(
   }
 
   return changes;
+}
+
+function pickAppMetrics(
+  inspection: PlannerInspectionPayload,
+  preferredService: string,
+  fallbackServices: string[],
+): Record<string, InspectionMetricValue> | null {
+  const direct = inspection.services.find(
+    (entry) => entry.service === preferredService && entry.app && Object.keys(entry.app).length > 0,
+  );
+  if (direct?.app) {
+    return direct.app;
+  }
+  const fallback = inspection.services.find(
+    (entry) => fallbackServices.includes(entry.service) && entry.app && Object.keys(entry.app).length > 0,
+  );
+  return fallback?.app || null;
+}
+
+function buildBaselineFromPhpApp(
+  service: string,
+  app: Record<string, InspectionMetricValue>,
+): PlannerConfigChange | null {
+  const changes: Record<string, number | string> = {};
+  const memoryLimit = app['php.memory_limit'] ?? app.php_memory_limit_bytes;
+  if (typeof memoryLimit === 'number' && Number.isFinite(memoryLimit)) {
+    changes['php.memory_limit'] = memoryLimit;
+  }
+
+  const opcacheMem = app['opcache.memory_consumption'];
+  if (typeof opcacheMem === 'number' && Number.isFinite(opcacheMem) && opcacheMem > 0) {
+    changes['opcache.memory_consumption'] = opcacheMem;
+  }
+  const interned = app['opcache.interned_strings_buffer'];
+  if (typeof interned === 'number' && Number.isFinite(interned) && interned > 0) {
+    changes['opcache.interned_strings_buffer'] = interned;
+  }
+  const maxFiles = app['opcache.max_accelerated_files'];
+  if (typeof maxFiles === 'number' && Number.isFinite(maxFiles) && maxFiles > 0) {
+    changes['opcache.max_accelerated_files'] = Math.round(maxFiles);
+  }
+
+  const fpmKeys: Array<keyof typeof changes> = [
+    'fpm.pm.max_children',
+    'fpm.pm.start_servers',
+    'fpm.pm.min_spare_servers',
+    'fpm.pm.max_spare_servers',
+    'fpm.pm.max_requests',
+  ];
+  for (const key of fpmKeys) {
+    const value = app[key];
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+      changes[key] = Math.round(value);
+    }
+  }
+
+  if (Object.keys(changes).length === 0) {
+    return null;
+  }
+
+  return {
+    service,
+    changes,
+    notes: ['Captured from running containers.'],
+  };
+}
+
+function buildBaselineFromDatabaseApp(
+  service: string,
+  app: Record<string, InspectionMetricValue>,
+): PlannerConfigChange | null {
+  const keys = [
+    'innodb_buffer_pool_size',
+    'innodb_log_file_size',
+    'max_connections',
+    'tmp_table_size',
+    'max_heap_table_size',
+    'thread_cache_size',
+    'query_cache_size',
+  ];
+  const changes: Record<string, number | string> = {};
+  for (const key of keys) {
+    const value = app[key];
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      changes[key] = value;
+    }
+  }
+
+  if (Object.keys(changes).length === 0) {
+    return null;
+  }
+
+  return {
+    service,
+    changes,
+    notes: ['Captured from running containers.'],
+  };
+}
+
+export function buildConfigBaseline(
+  inspection: PlannerInspectionPayload,
+): PlannerConfigChange[] {
+  const baseline: PlannerConfigChange[] = [];
+
+  const phpServices = ['php-fpm', 'php-fpm-admin'];
+  for (const service of phpServices) {
+    const app = pickAppMetrics(inspection, service, phpServices);
+    if (!app) {
+      continue;
+    }
+    const change = buildBaselineFromPhpApp(service, app);
+    if (change) {
+      baseline.push(change);
+    }
+  }
+
+  const dbServices = ['database', 'database-replica'];
+  for (const service of dbServices) {
+    const app = pickAppMetrics(inspection, service, dbServices);
+    if (!app) {
+      continue;
+    }
+    const change = buildBaselineFromDatabaseApp(service, app);
+    if (change) {
+      baseline.push(change);
+    }
+  }
+
+  return baseline;
 }

@@ -1,6 +1,7 @@
 import { serve } from '@hono/node-server';
 import { createApp } from './app.js';
 import { ensureCloudSwarmDeployKey } from './deploy.js';
+import { startAddonWorker } from './addon-worker.js';
 import { startDeploymentWorker } from './deploy-worker.js';
 import { startEnvironmentSync } from './env-sync.js';
 import { startInspectionScheduler, startStatusReporter, startTuningScheduler } from './status.js';
@@ -15,6 +16,7 @@ startMeshSyncScheduler();
 startEnvironmentSync();
 void ensureCloudSwarmDeployKey();
 startDeploymentWorker();
+startAddonWorker();
 
 serve({
   fetch: createApp().fetch,

@@ -6,6 +6,7 @@ import { presignS3Url } from './r2-presign.js';
 
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/deployments';
+const ADDON_QUEUE_DIR = process.env.MZ_ADDON_QUEUE_DIR || '/opt/mage-zero/addons';
 const DEPLOY_SCRIPT = process.env.MZ_DEPLOY_SCRIPT || '';
 const CLOUD_SWARM_KEY_PATH = process.env.MZ_CLOUD_SWARM_KEY_PATH || '/opt/mage-zero/keys/cloud-swarm-deploy';
 const CLOUD_SWARM_BOOTSTRAP = process.env.MZ_CLOUD_SWARM_BOOTSTRAP || '1';
@@ -23,6 +24,16 @@ type DeployPayload = {
   environment_id?: number;
   repository?: string;
   ref?: string;
+};
+
+type AddonDeployPayload = {
+  stack_id?: number;
+  environment_id?: number;
+  repository?: string;
+  ref?: string;
+  slug?: string;
+  artifact_key?: string;
+  image_tag?: string;
 };
 
 type R2Credentials = {
@@ -102,9 +113,21 @@ function ensureQueueDir() {
   }
 }
 
+function ensureAddonQueueDir() {
+  if (!fs.existsSync(ADDON_QUEUE_DIR)) {
+    fs.mkdirSync(ADDON_QUEUE_DIR, { recursive: true });
+  }
+}
+
 function enqueueDeployment(payload: DeployPayload, deploymentId: string) {
   ensureQueueDir();
   const target = `${DEPLOY_QUEUE_DIR}/${deploymentId}.json`;
+  fs.writeFileSync(target, JSON.stringify({ id: deploymentId, queued_at: new Date().toISOString(), payload }, null, 2));
+}
+
+function enqueueAddonDeployment(payload: AddonDeployPayload, deploymentId: string) {
+  ensureAddonQueueDir();
+  const target = `${ADDON_QUEUE_DIR}/${deploymentId}.json`;
   fs.writeFileSync(target, JSON.stringify({ id: deploymentId, queued_at: new Date().toISOString(), payload }, null, 2));
 }
 
@@ -148,6 +171,60 @@ export async function handleDeployArtifact(c: { req: { raw: Request; header: (na
       deployment_id: deploymentId,
       status: 'queued',
       artifact,
+    },
+  } as const;
+}
+
+export async function handleDeployAddon(c: { req: { raw: Request; header: (name: string) => string | undefined } }) {
+  const validated = await validateRequest(c);
+  if ('status' in validated) {
+    return validated;
+  }
+
+  if (!(await isSwarmManager())) {
+    return { status: 403, body: { error: 'not_manager' } } as const;
+  }
+
+  const body = await c.req.raw.json().catch(() => null) as AddonDeployPayload | null;
+  const environmentId = Number(body?.environment_id ?? 0) || 0;
+  const slug = String(body?.slug ?? '').trim();
+  const artifactKey = String(body?.artifact_key ?? '').replace(/^\/+/, '');
+
+  if (!environmentId) {
+    return { status: 400, body: { error: 'missing_environment_id' } } as const;
+  }
+  if (!slug) {
+    return { status: 400, body: { error: 'missing_slug' } } as const;
+  }
+  if (!/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(slug) || slug.length > 48) {
+    return { status: 400, body: { error: 'invalid_slug' } } as const;
+  }
+  if (!artifactKey) {
+    return { status: 400, body: { error: 'missing_artifact_key' } } as const;
+  }
+  if (artifactKey.startsWith('/') || artifactKey.includes('..') || !artifactKey.endsWith('.tar')) {
+    return { status: 400, body: { error: 'invalid_artifact_key' } } as const;
+  }
+
+  const deploymentId = crypto.randomUUID();
+  enqueueAddonDeployment({
+    stack_id: Number(body?.stack_id ?? 0) || undefined,
+    environment_id: environmentId,
+    repository: body?.repository ? String(body.repository).trim() : undefined,
+    ref: body?.ref ? String(body.ref).trim() : undefined,
+    slug,
+    artifact_key: artifactKey,
+    image_tag: body?.image_tag ? String(body.image_tag).trim() : undefined,
+  }, deploymentId);
+
+  return {
+    status: 202,
+    body: {
+      deployment_id: deploymentId,
+      status: 'queued',
+      environment_id: environmentId,
+      slug,
+      artifact_key: artifactKey,
     },
   } as const;
 }
