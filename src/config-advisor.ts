@@ -286,7 +286,7 @@ export function buildConfigBaseline(
     if (!change?.service || !change?.changes) {
       continue;
     }
-    baselineMap.set(change.service, mergeBaselineChange(baselineMap.get(change.service), change));
+    baselineMap.set(change.service, mergeBaselineChange(baselineMap.get(change.service), change, true));
   }
 
   const phpServices = ['php-fpm', 'php-fpm-admin'];

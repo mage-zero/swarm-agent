@@ -186,6 +186,7 @@ type LocalSwarmInfo = {
 const CONFIG_PATH = process.env.STATUS_CONFIG_PATH || '/opt/status/data.json';
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
+const CLOUD_SWARM_DIR = process.env.MZ_CLOUD_SWARM_DIR || '/opt/mage-zero/cloud-swarm';
 const VERSION_PATH = process.env.MZ_SWARM_AGENT_VERSION_PATH
   || '/opt/mage-zero/agent/version';
 const AI_TUNING_DISABLED = process.env.MZ_AI_TUNING_DISABLED === '1';
@@ -1335,6 +1336,139 @@ function extractConfigBaselineFromSwarmServices(services: any[]): PlannerConfigC
   return changes;
 }
 
+function parseConfigFile(filePath: string): Record<string, string> {
+  try {
+    if (!fs.existsSync(filePath)) {
+      return {};
+    }
+    const lines = fs.readFileSync(filePath, 'utf8').split('\n');
+    const output: Record<string, string> = {};
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith(';')) {
+        continue;
+      }
+      const cleaned = trimmed.replace(/[;#].*$/, '').trim();
+      const match = cleaned.match(/^([^=]+?)\s*=\s*(.+)$/);
+      if (!match) {
+        continue;
+      }
+      const key = match[1].trim().toLowerCase();
+      let value = match[2].trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      if (key) {
+        output[key] = value;
+      }
+    }
+    return output;
+  } catch {
+    return {};
+  }
+}
+
+function extractConfigBaselineFromCloudSwarm(): PlannerConfigChange[] {
+  const changes: PlannerConfigChange[] = [];
+  const phpIni = parseConfigFile(path.join(CLOUD_SWARM_DIR, 'docker/php-fpm/php.ini'));
+  const fpmConf = parseConfigFile(path.join(CLOUD_SWARM_DIR, 'docker/php-fpm/www.conf'));
+  const dbConf = parseConfigFile(path.join(CLOUD_SWARM_DIR, 'docker/mariadb/70-magento.cnf'));
+
+  const phpChanges: Record<string, number | string> = {};
+  const phpMemory = parseMemoryBytesFromEnv(phpIni['memory_limit']);
+  if (phpMemory !== null) {
+    phpChanges['php.memory_limit'] = phpMemory;
+  }
+  const opcacheMem = parseOpcacheMiBFromEnv(phpIni['opcache.memory_consumption']);
+  if (opcacheMem !== null) {
+    phpChanges['opcache.memory_consumption'] = opcacheMem;
+  }
+  const interned = parseOpcacheMiBFromEnv(phpIni['opcache.interned_strings_buffer']);
+  if (interned !== null) {
+    phpChanges['opcache.interned_strings_buffer'] = interned;
+  }
+  const maxFiles = parseEnvNumber(phpIni['opcache.max_accelerated_files']);
+  if (maxFiles !== null) {
+    phpChanges['opcache.max_accelerated_files'] = maxFiles;
+  }
+  const maxChildren = parseEnvNumber(fpmConf['pm.max_children']);
+  if (maxChildren !== null) {
+    phpChanges['fpm.pm.max_children'] = maxChildren;
+  }
+  const startServers = parseEnvNumber(fpmConf['pm.start_servers']);
+  if (startServers !== null) {
+    phpChanges['fpm.pm.start_servers'] = startServers;
+  }
+  const minSpare = parseEnvNumber(fpmConf['pm.min_spare_servers']);
+  if (minSpare !== null) {
+    phpChanges['fpm.pm.min_spare_servers'] = minSpare;
+  }
+  const maxSpare = parseEnvNumber(fpmConf['pm.max_spare_servers']);
+  if (maxSpare !== null) {
+    phpChanges['fpm.pm.max_spare_servers'] = maxSpare;
+  }
+  const maxRequests = parseEnvNumber(fpmConf['pm.max_requests']);
+  if (maxRequests !== null) {
+    phpChanges['fpm.pm.max_requests'] = maxRequests;
+  }
+  if (Object.keys(phpChanges).length > 0) {
+    changes.push({
+      service: 'php-fpm',
+      changes: phpChanges,
+      notes: ['Derived from cloud-swarm defaults.'],
+    });
+    changes.push({
+      service: 'php-fpm-admin',
+      changes: { ...phpChanges },
+      notes: ['Derived from cloud-swarm defaults.'],
+    });
+  }
+
+  const dbChanges: Record<string, number | string> = {};
+  const bufferPool = parseMemoryBytesFromEnv(dbConf['innodb_buffer_pool_size']);
+  if (bufferPool !== null) {
+    dbChanges['innodb_buffer_pool_size'] = bufferPool;
+  }
+  const logFile = parseMemoryBytesFromEnv(dbConf['innodb_log_file_size']);
+  if (logFile !== null) {
+    dbChanges['innodb_log_file_size'] = logFile;
+  }
+  const maxConnections = parseEnvNumber(dbConf['max_connections']);
+  if (maxConnections !== null) {
+    dbChanges['max_connections'] = maxConnections;
+  }
+  const tmpTable = parseMemoryBytesFromEnv(dbConf['tmp_table_size']);
+  if (tmpTable !== null) {
+    dbChanges['tmp_table_size'] = tmpTable;
+  }
+  const maxHeap = parseMemoryBytesFromEnv(dbConf['max_heap_table_size']);
+  if (maxHeap !== null) {
+    dbChanges['max_heap_table_size'] = maxHeap;
+  }
+  const threadCache = parseEnvNumber(dbConf['thread_cache_size']);
+  if (threadCache !== null) {
+    dbChanges['thread_cache_size'] = threadCache;
+  }
+  const queryCache = parseMemoryBytesFromEnv(dbConf['query_cache_size']);
+  if (queryCache !== null) {
+    dbChanges['query_cache_size'] = queryCache;
+  }
+  if (Object.keys(dbChanges).length > 0) {
+    changes.push({
+      service: 'database',
+      changes: dbChanges,
+      notes: ['Derived from cloud-swarm defaults.'],
+    });
+    changes.push({
+      service: 'database-replica',
+      changes: { ...dbChanges },
+      notes: ['Derived from cloud-swarm defaults.'],
+    });
+  }
+
+  return changes;
+}
+
 type InspectionCommand = {
   id: string;
   command: string[];
@@ -2064,7 +2198,7 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
 
   const inspection = await buildInspectionForTuning();
   const baseResources = buildPlannerResourceDefaults();
-  let configBaselineFallback: PlannerConfigChange[] = [];
+  let configBaselineFallback: PlannerConfigChange[] = extractConfigBaselineFromCloudSwarm();
   try {
     const swarmServices = await getSwarmServices(capacity.control_available);
     const overrides = extractPlannerResourceOverridesFromSwarmServices(swarmServices);
@@ -2073,7 +2207,8 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
         baseResources.services[service] = spec;
       }
     }
-    configBaselineFallback = extractConfigBaselineFromSwarmServices(swarmServices);
+    const envBaseline = extractConfigBaselineFromSwarmServices(swarmServices);
+    configBaselineFallback = [...configBaselineFallback, ...envBaseline];
   } catch {
     // ignore swarm service inspection failures
   }
