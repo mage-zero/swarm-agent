@@ -246,10 +246,48 @@ function buildBaselineFromDatabaseApp(
   };
 }
 
+function mergeBaselineChange(
+  existing: PlannerConfigChange | undefined,
+  incoming: PlannerConfigChange,
+  preferIncoming = false,
+): PlannerConfigChange {
+  if (!existing) {
+    return {
+      service: incoming.service,
+      changes: { ...incoming.changes },
+      notes: incoming.notes ? [...incoming.notes] : undefined,
+      evidence: incoming.evidence ? { ...incoming.evidence } : undefined,
+    };
+  }
+  const mergedChanges = { ...existing.changes };
+  for (const [key, value] of Object.entries(incoming.changes || {})) {
+    if (preferIncoming || mergedChanges[key] === undefined) {
+      mergedChanges[key] = value;
+    }
+  }
+  const notes = new Set<string>(existing.notes || []);
+  for (const note of incoming.notes || []) {
+    notes.add(note);
+  }
+  return {
+    service: existing.service,
+    changes: mergedChanges,
+    notes: notes.size > 0 ? Array.from(notes) : undefined,
+    evidence: existing.evidence || incoming.evidence,
+  };
+}
+
 export function buildConfigBaseline(
   inspection: PlannerInspectionPayload,
+  fallback: PlannerConfigChange[] = [],
 ): PlannerConfigChange[] {
-  const baseline: PlannerConfigChange[] = [];
+  const baselineMap = new Map<string, PlannerConfigChange>();
+  for (const change of fallback) {
+    if (!change?.service || !change?.changes) {
+      continue;
+    }
+    baselineMap.set(change.service, mergeBaselineChange(baselineMap.get(change.service), change));
+  }
 
   const phpServices = ['php-fpm', 'php-fpm-admin'];
   for (const service of phpServices) {
@@ -259,7 +297,7 @@ export function buildConfigBaseline(
     }
     const change = buildBaselineFromPhpApp(service, app);
     if (change) {
-      baseline.push(change);
+      baselineMap.set(service, mergeBaselineChange(baselineMap.get(service), change, true));
     }
   }
 
@@ -271,9 +309,9 @@ export function buildConfigBaseline(
     }
     const change = buildBaselineFromDatabaseApp(service, app);
     if (change) {
-      baseline.push(change);
+      baselineMap.set(service, mergeBaselineChange(baselineMap.get(service), change, true));
     }
   }
 
-  return baseline;
+  return Array.from(baselineMap.values());
 }

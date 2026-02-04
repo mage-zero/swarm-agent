@@ -517,6 +517,7 @@ export function isRecommendationDue(nowMs = Date.now()): boolean {
 export function buildTuningPayloadFromStorage(
   baseResources: PlannerResources,
   inspection: PlannerInspectionPayload,
+  configBaselineFallback: PlannerConfigChange[] = [],
 ): { payload: PlannerTuningPayload; active: PlannerTuningProfile } {
   const now = new Date().toISOString();
   const nowMs = Date.now();
@@ -524,7 +525,7 @@ export function buildTuningPayloadFromStorage(
   const baseProfile = stored?.base || createBaseProfile(baseResources, now);
   baseProfile.resources = clonePlannerResources(baseResources);
   baseProfile.updated_at = now;
-  baseProfile.config_changes = buildConfigBaseline(inspection);
+  baseProfile.config_changes = buildConfigBaseline(inspection, configBaselineFallback);
 
   let recommendedProfile = stored?.recommended;
   if (recommendedProfile && !isProfileFresh(recommendedProfile, nowMs)) {
@@ -1015,6 +1016,7 @@ export async function buildTuningProfiles(
   signals: PlannerTuningService[],
   baseResources: PlannerResources,
   inspection: PlannerInspectionPayload,
+  configBaselineFallback: PlannerConfigChange[] = [],
 ): Promise<{ payload: PlannerTuningPayload; active: PlannerTuningProfile }> {
   const now = new Date().toISOString();
   const nowMs = Date.now();
@@ -1022,6 +1024,7 @@ export async function buildTuningProfiles(
   const baseProfile = stored?.base || createBaseProfile(baseResources, now);
   baseProfile.resources = clonePlannerResources(baseResources);
   baseProfile.updated_at = now;
+  baseProfile.config_changes = buildConfigBaseline(inspection, configBaselineFallback);
 
   const state = resolveRecommendationState(stored, nowMs);
   let recommendedProfile = state.recommended;

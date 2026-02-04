@@ -9,6 +9,7 @@ import type {
   PlannerCapacityChangePayload,
   PlannerInspectionPayload,
   PlannerInspectionService,
+  PlannerConfigChange,
   PlannerResourceSpec,
   PlannerResources,
   PlannerTuningPayload,
@@ -1145,6 +1146,195 @@ function extractPlannerResourceOverridesFromSwarmServices(services: any[]): Plan
   return overrides;
 }
 
+function extractServiceEnv(service: any): Record<string, string> {
+  const envEntries = service?.Spec?.TaskTemplate?.ContainerSpec?.Env;
+  if (!Array.isArray(envEntries)) {
+    return {};
+  }
+  const env: Record<string, string> = {};
+  for (const entry of envEntries) {
+    if (typeof entry !== 'string') {
+      continue;
+    }
+    const idx = entry.indexOf('=');
+    if (idx === -1) {
+      continue;
+    }
+    const key = entry.slice(0, idx).trim();
+    const value = entry.slice(idx + 1);
+    if (key) {
+      env[key] = value;
+    }
+  }
+  return env;
+}
+
+function parseEnvNumber(value: string | undefined): number | null {
+  if (value === undefined) {
+    return null;
+  }
+  const trimmed = String(value).trim();
+  if (trimmed === '') {
+    return null;
+  }
+  const numeric = Number(trimmed);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+  return Math.round(numeric);
+}
+
+function parseMemoryBytesFromEnv(value: string | undefined): number | null {
+  if (value === undefined) {
+    return null;
+  }
+  const trimmed = String(value).trim();
+  if (trimmed === '') {
+    return null;
+  }
+  const match = trimmed.match(/^(\d+(?:\.\d+)?)([kKmMgGtT])?b?$/);
+  if (!match) {
+    return null;
+  }
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount)) {
+    return null;
+  }
+  const unit = (match[2] || '').toLowerCase();
+  let multiplier = 1;
+  if (unit === 'k') {
+    multiplier = 1024;
+  } else if (unit === 'm') {
+    multiplier = MIB;
+  } else if (unit === 'g') {
+    multiplier = GIB;
+  } else if (unit === 't') {
+    multiplier = 1024 * GIB;
+  }
+  return Math.round(amount * multiplier);
+}
+
+function parseOpcacheMiBFromEnv(value: string | undefined): number | null {
+  if (value === undefined) {
+    return null;
+  }
+  const trimmed = String(value).trim();
+  if (trimmed === '') {
+    return null;
+  }
+  const withUnit = trimmed.match(/[kKmMgGtT]/);
+  if (withUnit) {
+    return parseMemoryBytesFromEnv(trimmed);
+  }
+  const numeric = Number(trimmed);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+  return Math.round(numeric) * MIB;
+}
+
+function extractConfigBaselineFromSwarmServices(services: any[]): PlannerConfigChange[] {
+  const changes: PlannerConfigChange[] = [];
+
+  for (const service of services) {
+    const name = String(service?.Spec?.Name || '');
+    if (!name) {
+      continue;
+    }
+    const parsed = parseEnvironmentServiceName(name);
+    if (!parsed.environmentId) {
+      continue;
+    }
+    const serviceKey = parsed.service;
+    if (!['php-fpm', 'php-fpm-admin', 'database', 'database-replica'].includes(serviceKey)) {
+      continue;
+    }
+
+    const env = extractServiceEnv(service);
+    const serviceChanges: Record<string, number | string> = {};
+
+    if (serviceKey === 'php-fpm' || serviceKey === 'php-fpm-admin') {
+      const memoryLimit = parseMemoryBytesFromEnv(env.MZ_PHP_MEMORY_LIMIT);
+      if (memoryLimit !== null) {
+        serviceChanges['php.memory_limit'] = memoryLimit;
+      }
+      const opcacheMem = parseOpcacheMiBFromEnv(env.MZ_OPCACHE_MEMORY_CONSUMPTION);
+      if (opcacheMem !== null) {
+        serviceChanges['opcache.memory_consumption'] = opcacheMem;
+      }
+      const interned = parseOpcacheMiBFromEnv(env.MZ_OPCACHE_INTERNED_STRINGS_BUFFER);
+      if (interned !== null) {
+        serviceChanges['opcache.interned_strings_buffer'] = interned;
+      }
+      const maxFiles = parseEnvNumber(env.MZ_OPCACHE_MAX_ACCELERATED_FILES);
+      if (maxFiles !== null) {
+        serviceChanges['opcache.max_accelerated_files'] = maxFiles;
+      }
+      const maxChildren = parseEnvNumber(env.MZ_FPM_PM_MAX_CHILDREN);
+      if (maxChildren !== null) {
+        serviceChanges['fpm.pm.max_children'] = maxChildren;
+      }
+      const startServers = parseEnvNumber(env.MZ_FPM_PM_START_SERVERS);
+      if (startServers !== null) {
+        serviceChanges['fpm.pm.start_servers'] = startServers;
+      }
+      const minSpare = parseEnvNumber(env.MZ_FPM_PM_MIN_SPARE_SERVERS);
+      if (minSpare !== null) {
+        serviceChanges['fpm.pm.min_spare_servers'] = minSpare;
+      }
+      const maxSpare = parseEnvNumber(env.MZ_FPM_PM_MAX_SPARE_SERVERS);
+      if (maxSpare !== null) {
+        serviceChanges['fpm.pm.max_spare_servers'] = maxSpare;
+      }
+      const maxRequests = parseEnvNumber(env.MZ_FPM_PM_MAX_REQUESTS);
+      if (maxRequests !== null) {
+        serviceChanges['fpm.pm.max_requests'] = maxRequests;
+      }
+    }
+
+    if (serviceKey === 'database' || serviceKey === 'database-replica') {
+      const bufferPool = parseMemoryBytesFromEnv(env.MZ_DB_INNODB_BUFFER_POOL_SIZE);
+      if (bufferPool !== null) {
+        serviceChanges['innodb_buffer_pool_size'] = bufferPool;
+      }
+      const logFile = parseMemoryBytesFromEnv(env.MZ_DB_INNODB_LOG_FILE_SIZE);
+      if (logFile !== null) {
+        serviceChanges['innodb_log_file_size'] = logFile;
+      }
+      const maxConnections = parseEnvNumber(env.MZ_DB_MAX_CONNECTIONS);
+      if (maxConnections !== null) {
+        serviceChanges['max_connections'] = maxConnections;
+      }
+      const tmpTable = parseMemoryBytesFromEnv(env.MZ_DB_TMP_TABLE_SIZE);
+      if (tmpTable !== null) {
+        serviceChanges['tmp_table_size'] = tmpTable;
+      }
+      const maxHeap = parseMemoryBytesFromEnv(env.MZ_DB_MAX_HEAP_TABLE_SIZE);
+      if (maxHeap !== null) {
+        serviceChanges['max_heap_table_size'] = maxHeap;
+      }
+      const threadCache = parseEnvNumber(env.MZ_DB_THREAD_CACHE_SIZE);
+      if (threadCache !== null) {
+        serviceChanges['thread_cache_size'] = threadCache;
+      }
+      const queryCache = parseMemoryBytesFromEnv(env.MZ_DB_QUERY_CACHE_SIZE);
+      if (queryCache !== null) {
+        serviceChanges['query_cache_size'] = queryCache;
+      }
+    }
+
+    if (Object.keys(serviceChanges).length > 0) {
+      changes.push({
+        service: serviceKey,
+        changes: serviceChanges,
+        notes: ['Derived from service environment overrides.'],
+      });
+    }
+  }
+
+  return changes;
+}
+
 type InspectionCommand = {
   id: string;
   command: string[];
@@ -1874,6 +2064,7 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
 
   const inspection = await buildInspectionForTuning();
   const baseResources = buildPlannerResourceDefaults();
+  let configBaselineFallback: PlannerConfigChange[] = [];
   try {
     const swarmServices = await getSwarmServices(capacity.control_available);
     const overrides = extractPlannerResourceOverridesFromSwarmServices(swarmServices);
@@ -1882,6 +2073,7 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
         baseResources.services[service] = spec;
       }
     }
+    configBaselineFallback = extractConfigBaselineFromSwarmServices(swarmServices);
   } catch {
     // ignore swarm service inspection failures
   }
@@ -1889,7 +2081,7 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
   let tuningResult: { payload: PlannerTuningPayload; active: PlannerTuningProfile };
   if (!inspection.services.length || (inspection.sample_count ?? 0) === 0) {
     warnings.push('no inspection samples available yet; recommendations pending');
-    tuningResult = buildTuningPayloadFromStorage(baseResources, inspection);
+    tuningResult = buildTuningPayloadFromStorage(baseResources, inspection, configBaselineFallback);
   } else {
     const candidate = buildCandidateProfile(inspection, baseResources, capacity);
     const shouldUpdateRecommendation = isRecommendationDue();
@@ -1911,6 +2103,7 @@ export async function buildPlannerPayload(): Promise<PlannerPayload> {
       candidate.signals,
       baseResources,
       inspection,
+      configBaselineFallback,
     );
   }
 
