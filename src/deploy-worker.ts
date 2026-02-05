@@ -127,6 +127,8 @@ const DEPLOY_AGGRESSIVE_PRUNE_ENABLED = (process.env.MZ_DEPLOY_AGGRESSIVE_PRUNE_
 const DEPLOY_AGGRESSIVE_PRUNE_MIN_FREE_GB = Number(
   process.env.MZ_DEPLOY_AGGRESSIVE_PRUNE_MIN_FREE_GB || DEPLOY_MIN_FREE_GB
 );
+const DEPLOY_ABORT_MIN_FREE_GB = Number(process.env.MZ_DEPLOY_ABORT_MIN_FREE_GB || 5);
+const DEPLOY_BUILD_RETRIES = Math.max(0, Number(process.env.MZ_DEPLOY_BUILD_RETRIES || 1));
 const REGISTRY_GC_ENABLED = (process.env.MZ_REGISTRY_GC_ENABLED || '0') === '1';
 const REGISTRY_GC_SCRIPT = process.env.MZ_REGISTRY_GC_SCRIPT
   || path.join(process.env.MZ_CLOUD_SWARM_DIR || '/opt/mage-zero/cloud-swarm', 'scripts/registry-gc.sh');
@@ -316,6 +318,22 @@ async function getFreeSpaceGb(target: string) {
 
 async function getDeployFreeSpaceGb(): Promise<number | null> {
   return (await getFreeSpaceGb('/var/lib/docker')) ?? (await getFreeSpaceGb('/')) ?? null;
+}
+
+async function ensureMinimumFreeSpace(stage: string) {
+  if (!DEPLOY_ABORT_MIN_FREE_GB || DEPLOY_ABORT_MIN_FREE_GB <= 0) {
+    return;
+  }
+  const freeGb = await getDeployFreeSpaceGb();
+  if (freeGb === null) {
+    console.warn(`cleanup: ${stage}: free space unknown; skipping minimum-free check`);
+    return;
+  }
+  if (freeGb < DEPLOY_ABORT_MIN_FREE_GB) {
+    throw new Error(
+      `Insufficient disk space (${freeGb}GB) for deploy ${stage}; minimum ${DEPLOY_ABORT_MIN_FREE_GB}GB required`
+    );
+  }
 }
 
 async function listStackImageTags(stackName: string) {
@@ -746,6 +764,36 @@ async function runCommandLogged(
       }
     });
   });
+}
+
+async function runCommandLoggedWithRetry(
+  command: string,
+  args: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; logDir: string; label: string },
+  retryOptions: {
+    retries: number;
+    log?: (message: string) => void;
+    onRetry?: (attempt: number, error: Error) => Promise<void>;
+  }
+) {
+  const maxAttempts = Math.max(1, 1 + retryOptions.retries);
+  let attempt = 0;
+  while (attempt < maxAttempts) {
+    attempt += 1;
+    try {
+      await runCommandLogged(command, args, options);
+      return;
+    } catch (error) {
+      if (attempt >= maxAttempts) {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      retryOptions.log?.(`retrying ${options.label} (attempt ${attempt}/${maxAttempts - 1}) after error: ${message}`);
+      if (retryOptions.onRetry && error instanceof Error) {
+        await retryOptions.onRetry(attempt, error);
+      }
+    }
+  }
 }
 
 async function runCommandCapture(command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) {
@@ -2027,6 +2075,7 @@ async function waitForReleaseCohort(expectedTag: string, services: string[], log
   const startedAt = Date.now();
   let lastSummary = '';
   let lastSnapshot: Record<string, unknown> = {};
+  const resumed = new Set<string>();
   while (Date.now() - startedAt < timeoutMs) {
     const snapshot: Record<string, unknown> = {};
     const issues: string[] = [];
@@ -2052,6 +2101,13 @@ async function waitForReleaseCohort(expectedTag: string, services: string[], log
       const updateRolledBack = state.includes('rollback');
       if (updatePaused) {
         issues.push(`${serviceName} update=${updateStatus?.state || 'unknown'}`);
+        if (!resumed.has(serviceName)) {
+          resumed.add(serviceName);
+          const ok = await resumePausedServiceUpdate(serviceName, log);
+          if (ok) {
+            log(`release cohort: resumed paused update for ${serviceName}`);
+          }
+        }
         continue;
       }
       if (updateRolledBack && specTag !== expectedTag) {
@@ -2369,6 +2425,7 @@ async function processDeployment(recordPath: string) {
   log('reported deploying status');
 
   await maybeAggressivePrune('pre-deploy');
+  await ensureMinimumFreeSpace('pre-deploy');
 
   await ensureCloudSwarmRepo();
   log('cloud-swarm repo updated');
@@ -2535,16 +2592,32 @@ async function processDeployment(recordPath: string) {
   await ensureDockerSecret(mageSecretName, secrets.crypt_key, workDir);
   log('docker secrets ready');
 
-  await runCommandLogged(
+  await runCommandLoggedWithRetry(
     'bash',
     [path.join(CLOUD_SWARM_DIR, 'scripts/build-services.sh')],
-    { cwd: CLOUD_SWARM_DIR, env: envVars, logDir, label: 'build-services' }
+    { cwd: CLOUD_SWARM_DIR, env: envVars, logDir, label: 'build-services' },
+    {
+      retries: DEPLOY_BUILD_RETRIES,
+      log,
+      onRetry: async () => {
+        await maybeAggressivePrune('build-services-retry');
+        await ensureMinimumFreeSpace('build-services-retry');
+      },
+    }
   );
   log('built base services');
-  await runCommandLogged(
+  await runCommandLoggedWithRetry(
     'bash',
     [path.join(CLOUD_SWARM_DIR, 'scripts/build-magento.sh'), artifactPath],
-    { cwd: CLOUD_SWARM_DIR, env: envVars, logDir, label: 'build-magento' }
+    { cwd: CLOUD_SWARM_DIR, env: envVars, logDir, label: 'build-magento' },
+    {
+      retries: DEPLOY_BUILD_RETRIES,
+      log,
+      onRetry: async () => {
+        await maybeAggressivePrune('build-magento-retry');
+        await ensureMinimumFreeSpace('build-magento-retry');
+      },
+    }
   );
   log('built magento images');
 
