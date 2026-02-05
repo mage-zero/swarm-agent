@@ -70,6 +70,13 @@ export type SwarmServiceTask = {
   error: string;
 };
 
+export type SwarmServiceUpdateStatus = {
+  state: string;
+  started_at: string;
+  completed_at: string;
+  message: string;
+};
+
 function parseDockerJsonLines(raw: string): Array<Record<string, unknown>> {
   const out: Array<Record<string, unknown>> = [];
   for (const line of raw.split('\n')) {
@@ -244,6 +251,37 @@ export async function inspectServiceSpec(serviceName: string): Promise<SwarmServ
     secrets,
     mounts,
     env,
+  };
+}
+
+export async function inspectServiceUpdateStatus(serviceName: string): Promise<SwarmServiceUpdateStatus | null> {
+  const result = await runCommand('docker', ['service', 'inspect', serviceName, '--format', '{{json .UpdateStatus}}'], 12_000);
+  if (result.code !== 0) return null;
+  const raw = result.stdout.trim();
+  if (!raw || raw === '<no value>' || raw === 'null') {
+    return null;
+  }
+  let parsed: Record<string, unknown> | null = null;
+  try {
+    parsed = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    parsed = null;
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    return null;
+  }
+  const state = String((parsed as any).State || '').trim();
+  const startedAt = String((parsed as any).StartedAt || '').trim();
+  const completedAt = String((parsed as any).CompletedAt || '').trim();
+  const message = String((parsed as any).Message || '').trim();
+  if (!state && !message) {
+    return null;
+  }
+  return {
+    state,
+    started_at: startedAt,
+    completed_at: completedAt,
+    message,
   };
 }
 

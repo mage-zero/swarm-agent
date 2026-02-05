@@ -10,6 +10,7 @@ import {
   findEnvironmentService,
   getServiceTaskNode,
   inspectServiceSpec,
+  inspectServiceUpdateStatus,
   listEnvironmentServices,
   listServiceTasks,
   pickNetworkName,
@@ -111,6 +112,13 @@ const RUNBOOKS: RunbookDefinition[] = [
     id: 'varnish_ready',
     name: 'Varnish readiness check',
     description: 'Check Varnish container status and reachability.',
+    safe: true,
+    supports_remediation: false,
+  },
+  {
+    id: 'gateway_update_summary',
+    name: 'Gateway update summary',
+    description: 'Inspect Swarm update status (paused/rollback) for nginx/varnish/php-fpm services.',
     safe: true,
     supports_remediation: false,
   },
@@ -781,9 +789,14 @@ async function runPhpFpmHealth(environmentId: number): Promise<RunbookResult> {
   }
 
   const summary = summarizeServiceTasks(tasks);
+  const updateStatus = await inspectServiceUpdateStatus(serviceName);
+  const updateState = updateStatus?.state ? updateStatus.state.toLowerCase() : '';
+  const updatePaused = updateState.includes('pause');
+  const updateRolledBack = updateState.includes('rollback');
   const observations: string[] = [
     `Service: ${serviceName}`,
     `Tasks: running=${summary.running}/${summary.desired_running} total=${summary.total}`,
+    updateStatus ? `Update: ${updateStatus.state || 'unknown'}${updateStatus.message ? ` (${updateStatus.message})` : ''}` : '',
     summary.nodes.length ? `Nodes: ${summary.nodes.join(', ')}` : '',
     ...summary.issues.map((line) => `Issue: ${line}`),
   ].filter(Boolean);
@@ -803,16 +816,29 @@ async function runPhpFpmHealth(environmentId: number): Promise<RunbookResult> {
   const probeOk = probe.code === 0;
   observations.push(`Probe: ${probeOk ? 'tcp/9000 reachable' : 'tcp/9000 NOT reachable'} (network=${networkName})`);
 
-  const ok = summary.ok && probeOk;
+  const ready = summary.ok && probeOk;
   return {
     runbook_id: 'php_fpm_health',
-    status: ok ? 'ok' : summary.ok ? 'warning' : 'failed',
-    summary: ok ? 'php-fpm ready.' : summary.ok ? 'php-fpm running but probe failed.' : 'php-fpm is not running cleanly.',
+    status: updatePaused
+      ? 'failed'
+      : ready
+        ? updateRolledBack ? 'warning' : 'ok'
+        : summary.ok ? 'warning' : 'failed',
+    summary: updatePaused
+      ? 'php-fpm update is paused due to a task failure.'
+      : ready
+        ? updateRolledBack
+          ? 'php-fpm ready (but last update rolled back).'
+          : 'php-fpm ready.'
+        : summary.ok
+          ? 'php-fpm running but probe failed.'
+          : 'php-fpm is not running cleanly.',
     observations,
     data: {
       service: serviceName,
       tasks: tasks.slice(0, 10),
       probe: { ok: probeOk, exit_code: probe.code },
+      update_status: updateStatus || null,
     },
   };
 }
@@ -830,9 +856,14 @@ async function runVarnishReady(environmentId: number): Promise<RunbookResult> {
   }
 
   const summary = summarizeServiceTasks(tasks);
+  const updateStatus = await inspectServiceUpdateStatus(serviceName);
+  const updateState = updateStatus?.state ? updateStatus.state.toLowerCase() : '';
+  const updatePaused = updateState.includes('pause');
+  const updateRolledBack = updateState.includes('rollback');
   const observations: string[] = [
     `Service: ${serviceName}`,
     `Tasks: running=${summary.running}/${summary.desired_running} total=${summary.total}`,
+    updateStatus ? `Update: ${updateStatus.state || 'unknown'}${updateStatus.message ? ` (${updateStatus.message})` : ''}` : '',
     summary.nodes.length ? `Nodes: ${summary.nodes.join(', ')}` : '',
     ...summary.issues.map((line) => `Issue: ${line}`),
   ].filter(Boolean);
@@ -858,17 +889,97 @@ async function runVarnishReady(environmentId: number): Promise<RunbookResult> {
     observations.push(`Probe stderr: ${tailLines(probe.stderr.trim(), 10)}`);
   }
 
-  const finalOk = summary.ok && probeOk;
+  const finalReady = summary.ok && probeOk;
   return {
     runbook_id: 'varnish_ready',
-    status: finalOk ? 'ok' : summary.ok ? 'warning' : 'failed',
-    summary: finalOk ? 'Varnish ready.' : summary.ok ? 'Varnish running but probe failed.' : 'Varnish is not running cleanly.',
+    status: updatePaused
+      ? 'failed'
+      : finalReady
+        ? updateRolledBack ? 'warning' : 'ok'
+        : summary.ok ? 'warning' : 'failed',
+    summary: updatePaused
+      ? 'Varnish update is paused due to a task failure.'
+      : finalReady
+        ? updateRolledBack
+          ? 'Varnish ready (but last update rolled back).'
+          : 'Varnish ready.'
+        : summary.ok
+          ? 'Varnish running but probe failed.'
+          : 'Varnish is not running cleanly.',
     observations,
     data: {
       service: serviceName,
       tasks: tasks.slice(0, 10),
       probe: { ok: probeOk, exit_code: probe.code },
+      update_status: updateStatus || null,
     },
+  };
+}
+
+async function runGatewayUpdateSummary(environmentId: number): Promise<RunbookResult> {
+  const services = [
+    { label: 'Nginx', name: envServiceName(environmentId, 'nginx') },
+    { label: 'Varnish', name: envServiceName(environmentId, 'varnish') },
+    { label: 'PHP-FPM', name: envServiceName(environmentId, 'php-fpm') },
+    { label: 'PHP-FPM Admin', name: envServiceName(environmentId, 'php-fpm-admin') },
+  ];
+
+  const observations: string[] = [];
+  const data: Record<string, unknown> = { services: [] as any[] };
+
+  let pausedCount = 0;
+  let rollbackCount = 0;
+  let failingCount = 0;
+
+  for (const service of services) {
+    const tasks = await listServiceTasks(service.name);
+    const taskSummary = summarizeServiceTasks(tasks);
+    const updateStatus = await inspectServiceUpdateStatus(service.name);
+    const updateState = updateStatus?.state ? updateStatus.state.toLowerCase() : '';
+    const updatePaused = updateState.includes('pause');
+    const updateRolledBack = updateState.includes('rollback');
+
+    if (updatePaused) pausedCount += 1;
+    if (!updatePaused && updateRolledBack) rollbackCount += 1;
+    if (!taskSummary.ok || updatePaused) failingCount += 1;
+
+    observations.push(`${service.label}: tasks running=${taskSummary.running}/${taskSummary.desired_running} total=${taskSummary.total}`);
+    if (updateStatus) {
+      observations.push(`- update: ${updateStatus.state || 'unknown'}${updateStatus.message ? ` (${updateStatus.message})` : ''}`);
+    }
+    for (const issue of taskSummary.issues.slice(0, 3)) {
+      observations.push(`- issue: ${issue}`);
+    }
+
+    (data.services as any[]).push({
+      label: service.label,
+      service: service.name,
+      tasks: tasks.slice(0, 8),
+      update_status: updateStatus || null,
+      summary: taskSummary,
+    });
+  }
+
+  const status: RunbookResult['status'] = pausedCount > 0
+    ? 'failed'
+    : failingCount > 0 || rollbackCount > 0
+      ? 'warning'
+      : 'ok';
+
+  const summaryParts: string[] = [];
+  if (pausedCount > 0) summaryParts.push(`Paused updates: ${pausedCount}`);
+  if (rollbackCount > 0) summaryParts.push(`Recent rollbacks: ${rollbackCount}`);
+  if (failingCount > 0 && pausedCount === 0) summaryParts.push(`Unhealthy services: ${failingCount}`);
+  const summary = summaryParts.length
+    ? `Gateway update issues detected. ${summaryParts.join(', ')}.`
+    : 'Gateway services look healthy.';
+
+  return {
+    runbook_id: 'gateway_update_summary',
+    status,
+    summary,
+    observations,
+    data,
   };
 }
 
@@ -1326,21 +1437,48 @@ async function runServiceRestart(
     };
   }
   const actions: string[] = [];
-  const result = await runCommand('docker', ['service', 'update', '--force', service.id]);
+  const beforeStatus = await inspectServiceUpdateStatus(service.name);
+  if (beforeStatus?.state && beforeStatus.state.toLowerCase().includes('pause')) {
+    const resume = await runCommand('docker', ['service', 'update', '--update-failure-action', 'continue', service.name]);
+    actions.push(resume.code === 0 ? `Resumed paused update for ${service.name}` : `Failed to resume paused update for ${service.name}`);
+  }
+
+  let result = await runCommand('docker', ['service', 'update', '--force', service.name]);
+  if (result.code !== 0) {
+    const output = `${result.stderr || ''}\n${result.stdout || ''}`.toLowerCase();
+    if (output.includes('update paused') || output.includes('paused')) {
+      const resume = await runCommand('docker', ['service', 'update', '--update-failure-action', 'continue', service.name]);
+      actions.push(resume.code === 0 ? `Resumed paused update for ${service.name}` : `Failed to resume paused update for ${service.name}`);
+      result = await runCommand('docker', ['service', 'update', '--force', service.name]);
+    }
+  }
+
   if (result.code === 0) {
     actions.push(`Forced update for ${service.name}`);
   } else {
-    actions.push(`Failed to update ${service.name}`);
+    actions.push(`Failed to force update ${service.name}`);
   }
+
+  const afterStatus = await inspectServiceUpdateStatus(service.name);
+  const tasks = await listServiceTasks(service.name);
+  const taskSummary = summarizeServiceTasks(tasks);
+  const paused = afterStatus?.state ? afterStatus.state.toLowerCase().includes('pause') : false;
   return {
     runbook_id: runbookId,
-    status: result.code === 0 ? 'ok' : 'warning',
-    summary: result.code === 0 ? `${label} restart triggered.` : `${label} restart failed.`,
+    status: result.code === 0 ? 'ok' : paused ? 'failed' : 'warning',
+    summary: result.code === 0
+      ? `${label} restart triggered.`
+      : paused
+        ? `${label} update is paused due to a task failure.`
+        : `${label} restart failed.`,
     observations: [
       `Service: ${service.name} (${service.replicas || 'replicas unknown'})`,
+      afterStatus ? `Update: ${afterStatus.state || 'unknown'}${afterStatus.message ? ` (${afterStatus.message})` : ''}` : '',
+      `Tasks: running=${taskSummary.running}/${taskSummary.desired_running} total=${taskSummary.total}`,
+      ...taskSummary.issues.map((line) => `Issue: ${line}`),
       result.stderr ? `stderr: ${result.stderr.trim()}` : '',
     ].filter(Boolean),
-    data: { service },
+    data: { service, update_status: afterStatus || null, tasks: tasks.slice(0, 10) },
     remediation: { attempted: true, actions },
   };
 }
@@ -1386,6 +1524,8 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
       return runPhpFpmHealth(environmentId);
     case 'varnish_ready':
       return runVarnishReady(environmentId);
+    case 'gateway_update_summary':
+      return runGatewayUpdateSummary(environmentId);
     case 'http_smoke_check':
       return runHttpSmokeCheck(environmentId, input);
     case 'magento_var_permissions':

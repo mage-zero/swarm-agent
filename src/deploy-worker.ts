@@ -1715,14 +1715,93 @@ async function runPostDeploySmokeChecks(
   return { ok: false, results: lastResults, summary: lastSummary || 'unknown error' };
 }
 
+type ServiceUpdateStatus = {
+  state: string;
+  started_at: string;
+  completed_at: string;
+  message: string;
+};
+
+async function inspectServiceUpdateStatus(serviceName: string): Promise<ServiceUpdateStatus | null> {
+  const result = await runCommandCaptureWithStatus('docker', ['service', 'inspect', serviceName, '--format', '{{json .UpdateStatus}}']);
+  if (result.code !== 0) {
+    return null;
+  }
+  const raw = (result.stdout || '').trim();
+  if (!raw || raw === '<no value>' || raw === 'null') {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as any;
+    if (!parsed || typeof parsed !== 'object') {
+      return null;
+    }
+    const state = String(parsed.State || '').trim();
+    const startedAt = String(parsed.StartedAt || '').trim();
+    const completedAt = String(parsed.CompletedAt || '').trim();
+    const message = String(parsed.Message || '').trim();
+    if (!state && !message) {
+      return null;
+    }
+    return { state, started_at: startedAt, completed_at: completedAt, message };
+  } catch {
+    return null;
+  }
+}
+
+async function resumePausedServiceUpdate(serviceName: string, log: (message: string) => void): Promise<boolean> {
+  const updateStatus = await inspectServiceUpdateStatus(serviceName);
+  const state = (updateStatus?.state || '').toLowerCase();
+  if (!state.includes('pause')) {
+    return true;
+  }
+  log(`service update paused: ${serviceName} (${updateStatus?.state || 'paused'})${updateStatus?.message ? ` ${updateStatus.message}` : ''}`);
+  const resume = await runCommandCaptureWithStatus('docker', [
+    'service',
+    'update',
+    '--update-failure-action',
+    'continue',
+    serviceName,
+  ]);
+  const output = (resume.stderr || resume.stdout || '').trim();
+  log(`service update resume: ${serviceName} exit=${resume.code}${output ? ` ${output}` : ''}`);
+  return resume.code === 0;
+}
+
+async function inspectServiceImage(serviceName: string): Promise<string | null> {
+  const result = await runCommandCaptureWithStatus('docker', [
+    'service',
+    'inspect',
+    serviceName,
+    '--format',
+    '{{.Spec.TaskTemplate.ContainerSpec.Image}}',
+  ]);
+  if (result.code !== 0) {
+    return null;
+  }
+  return (result.stdout || '').trim() || null;
+}
+
 async function tryForceUpdateService(serviceName: string, log: (message: string) => void): Promise<boolean> {
-  const result = await runCommandCaptureWithStatus('docker', ['service', 'update', '--force', serviceName]);
+  let result = await runCommandCaptureWithStatus('docker', ['service', 'update', '--force', serviceName]);
+  if (result.code !== 0) {
+    const output = `${result.stderr || ''}\n${result.stdout || ''}`.toLowerCase();
+    if (output.includes('update paused') || output.includes('paused')) {
+      await resumePausedServiceUpdate(serviceName, log);
+      result = await runCommandCaptureWithStatus('docker', ['service', 'update', '--force', serviceName]);
+    }
+  }
+
   if (result.code === 0) {
     log(`forced update: ${serviceName}`);
     return true;
   }
   const output = (result.stderr || result.stdout || '').trim();
-  log(`forced update failed: ${serviceName} (exit ${result.code}) ${output}`);
+  const updateStatus = await inspectServiceUpdateStatus(serviceName);
+  const updateText = updateStatus
+    ? ` update=${updateStatus.state}${updateStatus.message ? ` (${updateStatus.message})` : ''}`
+    : '';
+  log(`forced update failed: ${serviceName} (exit ${result.code})${updateText} ${output}`);
   return false;
 }
 
@@ -2372,6 +2451,43 @@ async function processDeployment(recordPath: string) {
     }
   } else {
     log('post-deploy smoke checks skipped: no environment hostname available');
+  }
+
+  // Detect silent Swarm rollbacks / paused updates (otherwise smoke checks can pass on old tasks).
+  log('verifying deployed service images + update states');
+  const recordState = record as unknown as Record<string, unknown>;
+  const verifyTargets = [
+    { service: `${stackName}_nginx`, expected_tag: mageVersion },
+    { service: `${stackName}_php-fpm`, expected_tag: mageVersion },
+    { service: `${stackName}_php-fpm-admin`, expected_tag: mageVersion },
+  ];
+  const verifySnapshot: Record<string, unknown> = {};
+  const failures: string[] = [];
+  for (const target of verifyTargets) {
+    const image = await inspectServiceImage(target.service);
+    const updateStatus = await inspectServiceUpdateStatus(target.service);
+    verifySnapshot[target.service] = {
+      image,
+      update_status: updateStatus,
+    };
+
+    if (!image || !image.includes(`:${target.expected_tag}`)) {
+      failures.push(`${target.service} image mismatch`);
+    }
+    const state = (updateStatus?.state || '').toLowerCase();
+    if (state.includes('pause') || state.includes('rollback')) {
+      failures.push(`${target.service} update=${updateStatus?.state || 'unknown'}`);
+    }
+  }
+  recordState.post_deploy_image_verification = {
+    ok: failures.length === 0,
+    failures,
+    services: verifySnapshot,
+    verified_at: new Date().toISOString(),
+  };
+  writeJsonFileBestEffort(recordPath, recordState);
+  if (failures.length) {
+    throw new Error(`Deploy verification failed: ${failures.join('; ')}.`);
   }
 
   await reportDeploymentStatus(baseUrl, nodeId, nodeSecret, {
