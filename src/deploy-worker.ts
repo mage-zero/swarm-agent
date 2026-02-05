@@ -115,6 +115,10 @@ const DEPLOY_CLEANUP_ENABLED = (process.env.MZ_DEPLOY_CLEANUP_ENABLED || '1') !=
 const DEPLOY_SMOKE_AUTO_HEAL_ENABLED = (process.env.MZ_DEPLOY_SMOKE_AUTO_HEAL_ENABLED || '1') !== '0';
 const DEPLOY_SMOKE_AUTO_HEAL_ROUNDS = Math.max(0, Number(process.env.MZ_DEPLOY_SMOKE_AUTO_HEAL_ROUNDS || 1));
 const DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED = (process.env.MZ_DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED || '0') === '1';
+const RELEASE_COHORT_GATE_ENABLED = (process.env.MZ_RELEASE_COHORT_GATE_ENABLED || '1') !== '0';
+const RELEASE_COHORT_GATE_TIMEOUT_MS = Math.max(10_000, Number(process.env.MZ_RELEASE_COHORT_GATE_TIMEOUT_MS || 5 * 60 * 1000));
+const RELEASE_COHORT_LABEL_KEY = process.env.MZ_RELEASE_COHORT_LABEL_KEY || 'mz.release.cohort';
+const RELEASE_COHORT_LABEL_VALUE = process.env.MZ_RELEASE_COHORT_LABEL_VALUE || 'magento';
 const REGISTRY_CLEANUP_ENABLED = (process.env.MZ_REGISTRY_CLEANUP_ENABLED || '1') !== '0';
 const REGISTRY_CLEANUP_HOST = process.env.MZ_REGISTRY_CLEANUP_HOST || process.env.REGISTRY_PUSH_HOST || '127.0.0.1';
 const REGISTRY_CLEANUP_PORT = process.env.MZ_REGISTRY_CLEANUP_PORT || process.env.REGISTRY_PORT || '5000';
@@ -1722,6 +1726,23 @@ type ServiceUpdateStatus = {
   message: string;
 };
 
+type ServiceInspectSummary = {
+  name: string;
+  image: string;
+  labels: Record<string, string>;
+  replicas: number | null;
+};
+
+type ServiceTaskRow = {
+  id: string;
+  name: string;
+  node: string;
+  desired_state: string;
+  current_state: string;
+  error: string;
+  image: string;
+};
+
 async function inspectServiceUpdateStatus(serviceName: string): Promise<ServiceUpdateStatus | null> {
   const result = await runCommandCaptureWithStatus('docker', ['service', 'inspect', serviceName, '--format', '{{json .UpdateStatus}}']);
   if (result.code !== 0) {
@@ -1780,6 +1801,261 @@ async function inspectServiceImage(serviceName: string): Promise<string | null> 
     return null;
   }
   return (result.stdout || '').trim() || null;
+}
+
+function parseDockerJsonLines(raw: string): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        out.push(parsed);
+      }
+    } catch {
+      continue;
+    }
+  }
+  return out;
+}
+
+async function listStackServices(stackName: string): Promise<string[]> {
+  const result = await runCommandCaptureWithStatus('docker', [
+    'service',
+    'ls',
+    '--filter',
+    `label=com.docker.stack.namespace=${stackName}`,
+    '--format',
+    '{{.Name}}',
+  ]);
+  if (result.code !== 0) {
+    return [];
+  }
+  return result.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+}
+
+function parseReplicasFromServiceInspect(mode: any): number | null {
+  const replicas = mode?.Replicated?.Replicas;
+  if (typeof replicas === 'number' && Number.isFinite(replicas)) {
+    return replicas;
+  }
+  if (typeof replicas === 'string' && replicas.trim() && Number.isFinite(Number(replicas))) {
+    return Number(replicas);
+  }
+  return null;
+}
+
+async function inspectServices(serviceNames: string[]): Promise<ServiceInspectSummary[]> {
+  if (!serviceNames.length) return [];
+  const result = await runCommandCaptureWithStatus('docker', [
+    'service',
+    'inspect',
+    ...serviceNames,
+    '--format',
+    '{{json .}}',
+  ]);
+  if (result.code !== 0) {
+    return [];
+  }
+  return parseDockerJsonLines(result.stdout)
+    .map((row) => {
+      const spec = (row as any).Spec || {};
+      const name = String(spec?.Name || '').trim();
+      const image = String(spec?.TaskTemplate?.ContainerSpec?.Image || '').trim();
+      const labelsRaw = spec?.Labels && typeof spec.Labels === 'object' ? spec.Labels : {};
+      const labels: Record<string, string> = {};
+      for (const [key, value] of Object.entries(labelsRaw as Record<string, unknown>)) {
+        labels[String(key)] = String(value ?? '');
+      }
+      const replicas = parseReplicasFromServiceInspect(spec?.Mode);
+      return { name, image, labels, replicas };
+    })
+    .filter((entry) => entry.name !== '');
+}
+
+async function listServiceTasksWithImages(serviceName: string): Promise<ServiceTaskRow[]> {
+  const result = await runCommandCaptureWithStatus('docker', [
+    'service',
+    'ps',
+    serviceName,
+    '--no-trunc',
+    '--format',
+    '{{json .}}',
+  ]);
+  if (result.code !== 0) {
+    return [];
+  }
+  return parseDockerJsonLines(result.stdout)
+    .map((row) => {
+      const id = String((row as any).ID || '').trim();
+      const name = String((row as any).Name || '').trim();
+      const node = String((row as any).Node || '').trim();
+      const desiredState = String((row as any).DesiredState || '').trim();
+      const currentState = String((row as any).CurrentState || '').trim();
+      const error = String((row as any).Error || '').trim();
+      const image = String((row as any).Image || '').trim();
+      return { id, name, node, desired_state: desiredState, current_state: currentState, error, image };
+    })
+    .filter((task) => task.id !== '' && task.name !== '');
+}
+
+function summarizeReleaseServiceState(tasks: ServiceTaskRow[], expectedTag: string): {
+  ok: boolean;
+  desired_running: number;
+  running: number;
+  images_ok: boolean;
+  issues: string[];
+} {
+  const desiredRunning = tasks.filter((t) => t.desired_state.toLowerCase() === 'running');
+  const running = desiredRunning.filter((t) => t.current_state.startsWith('Running'));
+  const imagesOk = running.length > 0 && running.every((t) => parseImageReference(t.image).tag === expectedTag);
+  const nonRunning = desiredRunning.filter((t) => !t.current_state.startsWith('Running'));
+  const issues: string[] = [];
+  for (const task of nonRunning.slice(0, 5)) {
+    const suffix = task.error ? ` (${task.error})` : '';
+    issues.push(`${task.name} on ${task.node || '(unknown)'}: ${task.current_state}${suffix}`.trim());
+  }
+  if (desiredRunning.length === 0) {
+    issues.push('No tasks desired to be Running.');
+  }
+  if (!imagesOk && running.length) {
+    const mismatched = running
+      .filter((t) => parseImageReference(t.image).tag !== expectedTag)
+      .slice(0, 5)
+      .map((t) => `${t.name} image=${parseImageReference(t.image).tag || '(none)'}`);
+    if (mismatched.length) {
+      issues.push(`Image tag mismatch: ${mismatched.join(', ')}`);
+    }
+  }
+  const ok = desiredRunning.length > 0 && nonRunning.length === 0 && imagesOk;
+  return {
+    ok,
+    desired_running: desiredRunning.length,
+    running: running.length,
+    images_ok: imagesOk,
+    issues,
+  };
+}
+
+async function resolveReleaseCohortServices(stackName: string): Promise<string[]> {
+  const stackServices = await listStackServices(stackName);
+  if (!stackServices.length) {
+    return [];
+  }
+  const inspected = await inspectServices(stackServices);
+  const labelled = inspected
+    .filter((svc) => String(svc.labels?.[RELEASE_COHORT_LABEL_KEY] || '').trim() === RELEASE_COHORT_LABEL_VALUE)
+    .map((svc) => svc.name)
+    .filter(Boolean)
+    .sort();
+  if (labelled.length) {
+    return labelled;
+  }
+  const fallback = ['nginx', 'php-fpm', 'php-fpm-admin', 'cron']
+    .map((svc) => `${stackName}_${svc}`)
+    .filter((name) => stackServices.includes(name));
+  return fallback;
+}
+
+async function captureReleaseCohortSnapshot(services: string[]): Promise<{
+  tags_by_service: Record<string, string>;
+  tag: string | null;
+  images_by_service: Record<string, string>;
+}> {
+  const inspected = await inspectServices(services);
+  const tagsByService: Record<string, string> = {};
+  const imagesByService: Record<string, string> = {};
+  const tagSet = new Set<string>();
+  for (const svc of inspected) {
+    const image = String(svc.image || '').trim();
+    if (!image) continue;
+    imagesByService[svc.name] = image;
+    const tag = parseImageReference(image).tag || '';
+    if (tag) {
+      tagsByService[svc.name] = tag;
+      tagSet.add(tag);
+    }
+  }
+  const tag = tagSet.size === 1 ? Array.from(tagSet)[0] : null;
+  return { tags_by_service: tagsByService, tag, images_by_service: imagesByService };
+}
+
+async function waitForReleaseCohort(expectedTag: string, services: string[], log: (message: string) => void, timeoutMs: number): Promise<{
+  ok: boolean;
+  summary: string;
+  snapshot: Record<string, unknown>;
+}> {
+  const startedAt = Date.now();
+  let lastSummary = '';
+  let lastSnapshot: Record<string, unknown> = {};
+  while (Date.now() - startedAt < timeoutMs) {
+    const snapshot: Record<string, unknown> = {};
+    const issues: string[] = [];
+    for (const serviceName of services) {
+      const image = await inspectServiceImage(serviceName);
+      const specTag = image ? parseImageReference(image).tag : '';
+      const updateStatus = await inspectServiceUpdateStatus(serviceName);
+      const state = (updateStatus?.state || '').toLowerCase();
+      const tasks = await listServiceTasksWithImages(serviceName);
+      const taskSummary = summarizeReleaseServiceState(tasks, expectedTag);
+      snapshot[serviceName] = {
+        spec_tag: specTag || null,
+        update_status: updateStatus,
+        tasks: {
+          desired_running: taskSummary.desired_running,
+          running: taskSummary.running,
+          images_ok: taskSummary.images_ok,
+          issues: taskSummary.issues,
+        },
+      };
+
+      const updatePaused = state.includes('pause');
+      const updateRolledBack = state.includes('rollback');
+      if (updatePaused) {
+        issues.push(`${serviceName} update=${updateStatus?.state || 'unknown'}`);
+        continue;
+      }
+      if (updateRolledBack && specTag !== expectedTag) {
+        issues.push(`${serviceName} update=${updateStatus?.state || 'unknown'}`);
+        continue;
+      }
+      if (specTag !== expectedTag) {
+        issues.push(`${serviceName} tag=${specTag || '(none)'}`);
+        continue;
+      }
+      if (!taskSummary.ok) {
+        issues.push(`${serviceName} tasks not ready`);
+        continue;
+      }
+    }
+    lastSnapshot = snapshot;
+    if (issues.length === 0) {
+      return { ok: true, summary: 'release cohort ready', snapshot };
+    }
+    lastSummary = issues.join('; ');
+    log(`release cohort not ready: ${lastSummary}`);
+    await delay(3000);
+  }
+  return { ok: false, summary: lastSummary || 'release cohort not ready', snapshot: lastSnapshot };
+}
+
+async function rollbackReleaseCohort(services: string[], log: (message: string) => void): Promise<Record<string, unknown>> {
+  const snapshot: Record<string, unknown> = {};
+  for (const serviceName of services) {
+    let result = await runCommandCaptureWithStatus('docker', ['service', 'update', '--rollback', serviceName]);
+    const output = `${result.stderr || ''}\n${result.stdout || ''}`.toLowerCase();
+    if (result.code !== 0 && (output.includes('update paused') || output.includes('paused'))) {
+      await resumePausedServiceUpdate(serviceName, log);
+      result = await runCommandCaptureWithStatus('docker', ['service', 'update', '--rollback', serviceName]);
+    }
+    snapshot[serviceName] = {
+      ok: result.code === 0,
+      exit_code: result.code,
+      output: (result.stderr || result.stdout || '').trim() || null,
+    };
+  }
+  return snapshot;
 }
 
 async function tryForceUpdateService(serviceName: string, log: (message: string) => void): Promise<boolean> {
@@ -2037,6 +2313,7 @@ async function processDeployment(recordPath: string) {
   }
   log(`start stack=${stackId} env=${environmentId} artifact=${artifactKey}`);
   const stackName = `mz-env-${environmentId}`;
+  const recordMeta = record as unknown as Record<string, unknown>;
 
   const config = readConfig();
   const baseUrl = (config.mz_control_base_url || process.env.MZ_CONTROL_BASE_URL || '').trim();
@@ -2231,6 +2508,19 @@ async function processDeployment(recordPath: string) {
   );
   log('built magento images');
 
+  const cohortServicesPre = await resolveReleaseCohortServices(stackName);
+  const cohortSnapshotPre = await captureReleaseCohortSnapshot(cohortServicesPre);
+  recordMeta.release_cohort = {
+    label_key: RELEASE_COHORT_LABEL_KEY,
+    label_value: RELEASE_COHORT_LABEL_VALUE,
+    services: cohortServicesPre,
+    previous_tag: cohortSnapshotPre.tag,
+    previous_tags_by_service: cohortSnapshotPre.tags_by_service,
+    previous_images_by_service: cohortSnapshotPre.images_by_service,
+    captured_at: new Date().toISOString(),
+  };
+  writeJsonFileBestEffort(recordPath, recordMeta);
+
   await runCommandLogged('docker', [
     'stack',
     'deploy',
@@ -2240,6 +2530,54 @@ async function processDeployment(recordPath: string) {
     stackName,
   ], { env: envVars, logDir, label: 'stack-deploy' });
   log('stack deployed');
+
+  if (RELEASE_COHORT_GATE_ENABLED) {
+    const cohortServices = await resolveReleaseCohortServices(stackName);
+    if (!cohortServices.length) {
+      log('release cohort gate skipped: no cohort services found');
+    } else {
+      log(`release cohort gate: waiting for ${cohortServices.length} services to converge to ${mageVersion}`);
+      const gate = await waitForReleaseCohort(mageVersion, cohortServices, log, RELEASE_COHORT_GATE_TIMEOUT_MS);
+      recordMeta.release_cohort_gate = {
+        ok: gate.ok,
+        expected_tag: mageVersion,
+        services: cohortServices,
+        summary: gate.summary,
+        snapshot: gate.snapshot,
+        checked_at: new Date().toISOString(),
+      };
+      writeJsonFileBestEffort(recordPath, recordMeta);
+
+      if (!gate.ok) {
+        log('release cohort gate failed; rolling back cohort');
+        const rollbackIssued = await rollbackReleaseCohort(cohortServices, log);
+        const rollbackTargetTag = cohortSnapshotPre.tag;
+
+        let rollbackGate: { ok: boolean; summary: string; snapshot: Record<string, unknown> } | null = null;
+        if (rollbackTargetTag) {
+          log(`release cohort rollback: waiting for services to converge to previous tag ${rollbackTargetTag}`);
+          rollbackGate = await waitForReleaseCohort(rollbackTargetTag, cohortServices, log, RELEASE_COHORT_GATE_TIMEOUT_MS);
+        } else {
+          const post = await captureReleaseCohortSnapshot(cohortServices);
+          if (post.tag) {
+            log(`release cohort rollback: previous tag unknown, observed tag ${post.tag}; waiting for convergence`);
+            rollbackGate = await waitForReleaseCohort(post.tag, cohortServices, log, RELEASE_COHORT_GATE_TIMEOUT_MS);
+          }
+        }
+
+        recordMeta.release_cohort_rollback = {
+          issued_at: new Date().toISOString(),
+          issued: rollbackIssued,
+          expected_tag: rollbackTargetTag,
+          gate: rollbackGate,
+        };
+        writeJsonFileBestEffort(recordPath, recordMeta);
+
+        const rollbackNote = rollbackTargetTag ? `Rolled back to ${rollbackTargetTag}.` : 'Rollback attempted.';
+        throw new Error(`Release cohort did not converge to ${mageVersion}: ${gate.summary}. ${rollbackNote}`);
+      }
+    }
+  }
 
   let dbContainerId = await waitForContainer(stackName, 'database', 5 * 60 * 1000);
   await waitForDatabase(dbContainerId, 5 * 60 * 1000);
@@ -2460,22 +2798,34 @@ async function processDeployment(recordPath: string) {
     { service: `${stackName}_nginx`, expected_tag: mageVersion },
     { service: `${stackName}_php-fpm`, expected_tag: mageVersion },
     { service: `${stackName}_php-fpm-admin`, expected_tag: mageVersion },
+    { service: `${stackName}_cron`, expected_tag: mageVersion },
   ];
   const verifySnapshot: Record<string, unknown> = {};
   const failures: string[] = [];
   for (const target of verifyTargets) {
     const image = await inspectServiceImage(target.service);
     const updateStatus = await inspectServiceUpdateStatus(target.service);
+    const tasks = await listServiceTasksWithImages(target.service);
+    const taskSummary = summarizeReleaseServiceState(tasks, target.expected_tag);
     verifySnapshot[target.service] = {
       image,
       update_status: updateStatus,
+      tasks: {
+        desired_running: taskSummary.desired_running,
+        running: taskSummary.running,
+        images_ok: taskSummary.images_ok,
+        issues: taskSummary.issues,
+      },
     };
 
     if (!image || !image.includes(`:${target.expected_tag}`)) {
       failures.push(`${target.service} image mismatch`);
     }
+    if (!taskSummary.ok) {
+      failures.push(`${target.service} tasks not aligned`);
+    }
     const state = (updateStatus?.state || '').toLowerCase();
-    if (state.includes('pause') || state.includes('rollback')) {
+    if (state.includes('pause') || (state.includes('rollback') && (!image || !image.includes(`:${target.expected_tag}`)))) {
       failures.push(`${target.service} update=${updateStatus?.state || 'unknown'}`);
     }
   }
