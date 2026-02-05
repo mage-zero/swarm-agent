@@ -14,6 +14,7 @@ import {
 import { handleMeshJoinRequest } from './mesh.js';
 import { handleDeployLogsBundle } from './deploy-logs.js';
 import { executeRunbook, handleServiceRestart, listRunbooks } from './support-runbooks.js';
+import { cleanupOrphanedRunbookJobs } from './swarm.js';
 import { Readable } from 'stream';
 
 export const createApp = () => {
@@ -95,6 +96,11 @@ export const createApp = () => {
     if (result.error) {
       return c.json({ error: result.error }, (result.status || 500) as ContentfulStatusCode);
     }
+    return c.json(result);
+  });
+
+  app.post('/v1/support/cleanup-jobs', async (c) => {
+    const result = await cleanupOrphanedRunbookJobs();
     return c.json(result);
   });
 

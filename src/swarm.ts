@@ -386,30 +386,34 @@ export async function runSwarmJob(options: SwarmJobOptions): Promise<SwarmJobRes
     };
   }
 
-  const startedAt = Date.now();
-  const details: string[] = [];
   let finalState = 'unknown';
-  while (Date.now() - startedAt < timeoutMs) {
-    const ps = await runCommand('docker', ['service', 'ps', options.name, '--no-trunc', '--format', '{{.CurrentState}}|{{.Error}}'], 12_000);
-    const lines = ps.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
-    if (lines.length) {
-      details.splice(0, details.length, ...lines.slice(0, 5));
-      const [stateRaw] = (lines[0] || '').split('|');
-      const stateWord = (stateRaw || '').trim().split(' ')[0] || '';
-      if (stateWord) {
-        finalState = stateWord;
+  let logs = '';
+  const details: string[] = [];
+
+  try {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const ps = await runCommand('docker', ['service', 'ps', options.name, '--no-trunc', '--format', '{{.CurrentState}}|{{.Error}}'], 12_000);
+      const lines = ps.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+      if (lines.length) {
+        details.splice(0, details.length, ...lines.slice(0, 5));
+        const [stateRaw] = (lines[0] || '').split('|');
+        const stateWord = (stateRaw || '').trim().split(' ')[0] || '';
+        if (stateWord) {
+          finalState = stateWord;
+        }
+        if (stateWord === 'Complete' || stateWord === 'Failed' || stateWord === 'Rejected') {
+          break;
+        }
       }
-      if (stateWord === 'Complete' || stateWord === 'Failed' || stateWord === 'Rejected') {
-        break;
-      }
+      await new Promise((r) => setTimeout(r, 500));
     }
-    await new Promise((r) => setTimeout(r, 500));
+
+    const logResult = await runCommand('docker', ['service', 'logs', options.name, '--raw', '--no-task-ids'], 30_000);
+    logs = (logResult.stdout || logResult.stderr || '').trim();
+  } finally {
+    await runCommand('docker', ['service', 'rm', options.name], 12_000);
   }
-
-  const logResult = await runCommand('docker', ['service', 'logs', options.name, '--raw', '--no-task-ids'], 30_000);
-  const logs = (logResult.stdout || logResult.stderr || '').trim();
-
-  await runCommand('docker', ['service', 'rm', options.name], 12_000);
 
   const ok = finalState === 'Complete';
   if (!ok && finalState === 'unknown') {
@@ -429,4 +433,28 @@ export async function runSwarmJob(options: SwarmJobOptions): Promise<SwarmJobRes
     error: ok ? undefined : `swarm job ended with state: ${finalState}`,
     details,
   };
+}
+
+export async function cleanupOrphanedRunbookJobs(): Promise<{ removed: string[]; failed: string[] }> {
+  const result = await runCommand('docker', ['service', 'ls', '--format', '{{.Name}}'], 12_000);
+  if (result.code !== 0) return { removed: [], failed: [] };
+
+  const services = result.stdout
+    .split('\n')
+    .map((s) => s.trim())
+    .filter((s) => s.startsWith('mz-rb-'));
+
+  const removed: string[] = [];
+  const failed: string[] = [];
+
+  for (const service of services) {
+    const rm = await runCommand('docker', ['service', 'rm', service], 12_000);
+    if (rm.code === 0) {
+      removed.push(service);
+    } else {
+      failed.push(service);
+    }
+  }
+
+  return { removed, failed };
 }

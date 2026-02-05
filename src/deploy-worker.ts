@@ -123,6 +123,10 @@ const REGISTRY_CLEANUP_ENABLED = (process.env.MZ_REGISTRY_CLEANUP_ENABLED || '1'
 const REGISTRY_CLEANUP_HOST = process.env.MZ_REGISTRY_CLEANUP_HOST || process.env.REGISTRY_PUSH_HOST || '127.0.0.1';
 const REGISTRY_CLEANUP_PORT = process.env.MZ_REGISTRY_CLEANUP_PORT || process.env.REGISTRY_PORT || '5000';
 const DEPLOY_MIN_FREE_GB = Number(process.env.MZ_DEPLOY_MIN_FREE_GB || 15);
+const DEPLOY_AGGRESSIVE_PRUNE_ENABLED = (process.env.MZ_DEPLOY_AGGRESSIVE_PRUNE_ENABLED || '1') !== '0';
+const DEPLOY_AGGRESSIVE_PRUNE_MIN_FREE_GB = Number(
+  process.env.MZ_DEPLOY_AGGRESSIVE_PRUNE_MIN_FREE_GB || DEPLOY_MIN_FREE_GB
+);
 const REGISTRY_GC_ENABLED = (process.env.MZ_REGISTRY_GC_ENABLED || '0') === '1';
 const REGISTRY_GC_SCRIPT = process.env.MZ_REGISTRY_GC_SCRIPT
   || path.join(process.env.MZ_CLOUD_SWARM_DIR || '/opt/mage-zero/cloud-swarm', 'scripts/registry-gc.sh');
@@ -308,6 +312,10 @@ async function getFreeSpaceGb(target: string) {
   } catch {
     return null;
   }
+}
+
+async function getDeployFreeSpaceGb(): Promise<number | null> {
+  return (await getFreeSpaceGb('/var/lib/docker')) ?? (await getFreeSpaceGb('/')) ?? null;
 }
 
 async function listStackImageTags(stackName: string) {
@@ -503,6 +511,41 @@ async function runRegistryGc() {
   }
 }
 
+async function maybeAggressivePrune(stage: string) {
+  if (!DEPLOY_AGGRESSIVE_PRUNE_ENABLED || DEPLOY_AGGRESSIVE_PRUNE_MIN_FREE_GB <= 0) {
+    return;
+  }
+  const freeGb = await getDeployFreeSpaceGb();
+  if (freeGb === null) {
+    console.warn(`cleanup: ${stage}: free space unknown; skipping aggressive prune`);
+    return;
+  }
+  if (freeGb >= DEPLOY_AGGRESSIVE_PRUNE_MIN_FREE_GB) {
+    return;
+  }
+
+  console.warn(
+    `cleanup: ${stage}: free space ${freeGb}GB < ${DEPLOY_AGGRESSIVE_PRUNE_MIN_FREE_GB}GB; running docker prune`
+  );
+  try {
+    await runCommand('docker', ['system', 'prune', '-a', '--volumes', '-f']);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`cleanup: docker system prune failed: ${message}`);
+  }
+  try {
+    await runCommand('docker', ['builder', 'prune', '-a', '-f']);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`cleanup: docker builder prune failed: ${message}`);
+  }
+
+  const afterGb = await getDeployFreeSpaceGb();
+  if (afterGb !== null) {
+    console.warn(`cleanup: ${stage}: free space now ${afterGb}GB`);
+  }
+}
+
 async function cleanupDeploymentResources(params: {
   environmentId: number;
   repository: string;
@@ -540,13 +583,6 @@ async function cleanupDeploymentResources(params: {
     }
   }
 
-  if (DEPLOY_MIN_FREE_GB > 0) {
-    const freeGb = (await getFreeSpaceGb('/var/lib/docker')) ?? (await getFreeSpaceGb('/')) ?? null;
-    if (freeGb !== null && freeGb >= DEPLOY_MIN_FREE_GB) {
-      return;
-    }
-  }
-
   const keepImageTagSet = new Set(keepImageTags);
   const removedImageTagSet = new Set(removedImageTags);
   const removals = await cleanupLocalImages(params.environmentId, keepImageTagSet, params.stackName);
@@ -555,6 +591,8 @@ async function cleanupDeploymentResources(params: {
     await cleanupRegistryImages(filtered);
     await runRegistryGc();
   }
+
+  await maybeAggressivePrune('post-deploy');
 }
 
 function listQueueFiles(): string[] {
@@ -2330,6 +2368,8 @@ async function processDeployment(recordPath: string) {
   });
   log('reported deploying status');
 
+  await maybeAggressivePrune('pre-deploy');
+
   await ensureCloudSwarmRepo();
   log('cloud-swarm repo updated');
 
@@ -2862,6 +2902,49 @@ async function processDeployment(recordPath: string) {
   }
 }
 
+async function cleanupFailedArtifact(record: Record<string, any>) {
+  try {
+    const payload = (record?.payload || {}) as Record<string, any>;
+    const environmentId = Number(payload.environment_id ?? 0) || 0;
+    const rawArtifact = String(payload.artifact || '').trim();
+    if (!environmentId || !rawArtifact) {
+      return;
+    }
+
+    if (rawArtifact.startsWith('http://') || rawArtifact.startsWith('https://')) {
+      console.warn('cleanup skip: artifact is a URL (expected object key)');
+      return;
+    }
+
+    const normalizedArtifactKey = rawArtifact.replace(/^\/+/, '');
+    const repository = String(payload.repository || '').trim() || inferRepositoryFromArtifactKey(normalizedArtifactKey) || 'unknown';
+    const history = readDeploymentHistory();
+    const key = `env:${environmentId}:${repository}`;
+    const entry = history[key] || { artifacts: [] };
+    const keepSet = new Set(
+      (Array.isArray(entry.artifacts) ? entry.artifacts : [])
+        .map((item) => String(item || '').replace(/^\/+/, '').trim())
+        .filter(Boolean)
+    );
+
+    if (keepSet.has(normalizedArtifactKey)) {
+      return;
+    }
+
+    const r2 = readR2CredFile(environmentId);
+    if (!r2?.backups) {
+      console.warn('cleanup skip: missing R2 backup credentials');
+      return;
+    }
+
+    await deleteR2Object(r2.backups, normalizedArtifactKey);
+    console.warn(`cleanup: deleted failed artifact ${normalizedArtifactKey}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`cleanup failed artifact error: ${message}`);
+  }
+}
+
 async function handleDeploymentFile(recordPath: string) {
   const failedDir = path.join(DEPLOY_QUEUE_DIR, 'failed');
   ensureDir(failedDir);
@@ -2888,6 +2971,7 @@ async function handleDeploymentFile(recordPath: string) {
     } catch {
       // ignore
     }
+    await cleanupFailedArtifact(merged);
     cleanupFailedWorkDirs();
 
     const config = readConfig();
