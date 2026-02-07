@@ -121,8 +121,11 @@ const RELEASE_COHORT_GATE_TIMEOUT_MS = Math.max(10_000, Number(process.env.MZ_RE
 const RELEASE_COHORT_LABEL_KEY = process.env.MZ_RELEASE_COHORT_LABEL_KEY || 'mz.release.cohort';
 const RELEASE_COHORT_LABEL_VALUE = process.env.MZ_RELEASE_COHORT_LABEL_VALUE || 'magento';
 const REGISTRY_CLEANUP_ENABLED = (process.env.MZ_REGISTRY_CLEANUP_ENABLED || '1') !== '0';
-const REGISTRY_CLEANUP_HOST = process.env.MZ_REGISTRY_CLEANUP_HOST || process.env.REGISTRY_PUSH_HOST || '127.0.0.1';
-const REGISTRY_CLEANUP_PORT = process.env.MZ_REGISTRY_CLEANUP_PORT || process.env.REGISTRY_PORT || '5000';
+// Registry cleanup should hit the host-published registry port by default.
+// Do not couple cleanup to REGISTRY_PUSH_HOST because Buildx pushes can occur
+// from inside the BuildKit container (where loopback/service DNS differ).
+const REGISTRY_CLEANUP_HOST = process.env.MZ_REGISTRY_CLEANUP_HOST || '127.0.0.1';
+const REGISTRY_CLEANUP_PORT = process.env.MZ_REGISTRY_CLEANUP_PORT || '5000';
 const DEPLOY_MIN_FREE_GB = Number(process.env.MZ_DEPLOY_MIN_FREE_GB || 15);
 const DEPLOY_AGGRESSIVE_PRUNE_ENABLED = (process.env.MZ_DEPLOY_AGGRESSIVE_PRUNE_ENABLED || '1') !== '0';
 const DEPLOY_AGGRESSIVE_PRUNE_MIN_FREE_GB = Number(
@@ -2553,15 +2556,17 @@ async function processDeployment(recordPath: string) {
     ...overrideVersions,
     ...plannerResourceEnv,
     ...configEnv,
-    // Default to pushing directly from Buildx to reduce local-disk pressure.
-    // Can be overridden for local/dev usage.
-    BUILDX_OUTPUT: process.env.BUILDX_OUTPUT || 'push',
-    REGISTRY_HOST: 'registry',
-    REGISTRY_PUSH_HOST: '127.0.0.1',
-    REGISTRY_PORT: '5000',
-    SECRET_VERSION,
-    MAGE_VERSION: mageVersion,
-    MYSQL_DATABASE: process.env.MYSQL_DATABASE || 'magento',
+	    // Default to pushing directly from Buildx to reduce local-disk pressure.
+	    // Can be overridden for local/dev usage.
+	    BUILDX_OUTPUT: process.env.BUILDX_OUTPUT || 'push',
+	    REGISTRY_HOST: 'registry',
+	    // Buildx uses the docker-container driver, so pushes happen from inside the BuildKit container.
+	    // Use the swarm service DNS name so the builder can reach the registry on the overlay network.
+	    REGISTRY_PUSH_HOST: 'registry',
+	    REGISTRY_PORT: '5000',
+	    SECRET_VERSION,
+	    MAGE_VERSION: mageVersion,
+	    MYSQL_DATABASE: process.env.MYSQL_DATABASE || 'magento',
     MYSQL_USER: process.env.MYSQL_USER || 'magento',
     MZ_DB_HOST: stackService('proxysql'),
     MZ_DB_PORT: '6033',
