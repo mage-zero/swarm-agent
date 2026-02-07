@@ -53,6 +53,71 @@ export function presignS3Url(params: {
   return `${endpointUrl.origin}${canonicalUri}?${finalQuery}`;
 }
 
+export function presignS3ListObjectsV2Url(params: {
+  endpoint: string;
+  bucket: string;
+  prefix: string;
+  continuationToken?: string;
+  maxKeys?: number;
+  accessKeyId: string;
+  secretAccessKey: string;
+  region: string;
+  expiresIn: number;
+}) {
+  const endpointUrl = new URL(params.endpoint);
+  const host = endpointUrl.host;
+  const now = new Date();
+  const amzDate = toAmzDate(now);
+  const dateStamp = amzDate.slice(0, 8);
+  const credentialScope = `${dateStamp}/${params.region}/s3/aws4_request`;
+  const signedHeaders = 'host';
+
+  const canonicalUri = `/${encodePath(params.bucket)}`;
+  const prefix = params.prefix.replace(/^\/+/, '');
+  const queryParams: Array<[string, string]> = [
+    ['list-type', '2'],
+    ['prefix', prefix],
+  ];
+  if (params.maxKeys) {
+    queryParams.push(['max-keys', String(params.maxKeys)]);
+  }
+  if (params.continuationToken) {
+    queryParams.push(['continuation-token', params.continuationToken]);
+  }
+  queryParams.push(
+    ['X-Amz-Algorithm', 'AWS4-HMAC-SHA256'],
+    ['X-Amz-Credential', `${params.accessKeyId}/${credentialScope}`],
+    ['X-Amz-Date', amzDate],
+    ['X-Amz-Expires', String(params.expiresIn)],
+    ['X-Amz-SignedHeaders', signedHeaders],
+    ['X-Amz-Content-Sha256', 'UNSIGNED-PAYLOAD'],
+  );
+  const canonicalQuery = buildCanonicalQuery(queryParams);
+
+  const canonicalHeaders = `host:${host}\n`;
+  const canonicalRequest = [
+    'GET',
+    canonicalUri,
+    canonicalQuery,
+    canonicalHeaders,
+    signedHeaders,
+    'UNSIGNED-PAYLOAD',
+  ].join('\n');
+
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    hashHex(canonicalRequest),
+  ].join('\n');
+
+  const signingKey = getSigningKey(params.secretAccessKey, dateStamp, params.region, 's3');
+  const signature = hmac(signingKey, stringToSign).toString('hex');
+
+  const finalQuery = `${canonicalQuery}&X-Amz-Signature=${signature}`;
+  return `${endpointUrl.origin}${canonicalUri}?${finalQuery}`;
+}
+
 function toAmzDate(date: Date) {
   const pad = (value: number) => String(value).padStart(2, '0');
   return `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}T${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}Z`;

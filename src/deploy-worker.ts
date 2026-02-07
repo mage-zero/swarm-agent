@@ -4,9 +4,10 @@ import path from 'path';
 import readline from 'readline';
 import { spawn } from 'child_process';
 import { isDeployPaused } from './deploy-pause.js';
-import { presignS3Url } from './r2-presign.js';
+import { presignS3ListObjectsV2Url, presignS3Url } from './r2-presign.js';
 import { buildCapacityPayload, buildPlannerPayload, isSwarmManager, readConfig } from './status.js';
 import { enforceCommandPolicy } from './command-policy.js';
+import { parseListObjectsV2Xml } from './r2-list.js';
 
 type DeployPayload = {
   artifact?: string;
@@ -453,7 +454,130 @@ async function deleteR2Object(creds: R2Credentials, objectKey: string) {
     region: creds.region || 'auto',
     expiresIn: 3600,
   });
-  await runCommand('curl', ['-fsSL', '-X', 'DELETE', url]);
+  const { stdout } = await runCommandCapture('curl', ['-sS', '-o', '/dev/null', '-w', '%{http_code}', '-X', 'DELETE', url]);
+  const code = Number(String(stdout || '').trim());
+  if (code >= 200 && code < 300) {
+    return;
+  }
+  // Treat missing objects as idempotent deletes.
+  if (code === 404) {
+    return;
+  }
+  throw new Error(`R2 delete failed: http ${code || 'unknown'} (${normalizedKey})`);
+}
+
+async function listR2ObjectsV2(creds: R2Credentials, prefix: string): Promise<Array<{ key: string; lastModified: string }>> {
+  const normalizedPrefix = prefix.replace(/^\/+/, '');
+  const objects: Array<{ key: string; lastModified: string }> = [];
+  let token: string | undefined;
+  let guard = 0;
+  while (guard < 50) {
+    guard += 1;
+    const url = presignS3ListObjectsV2Url({
+      endpoint: creds.endpoint,
+      bucket: creds.bucket,
+      prefix: normalizedPrefix,
+      continuationToken: token,
+      maxKeys: 1000,
+      accessKeyId: creds.accessKeyId,
+      secretAccessKey: creds.secretAccessKey,
+      region: creds.region || 'auto',
+      expiresIn: 3600,
+    });
+
+    const marker = 'MZ_HTTP_CODE:';
+    const { stdout } = await runCommandCapture('curl', ['-sS', '-w', `\\n${marker}%{http_code}`, url]);
+    const out = String(stdout || '');
+    const idx = out.lastIndexOf(marker);
+    const body = idx === -1 ? out : out.slice(0, Math.max(0, idx - 1));
+    const codeRaw = idx === -1 ? '' : out.slice(idx + marker.length).trim();
+    const code = Number(codeRaw);
+    if (code < 200 || code >= 300) {
+      throw new Error(`R2 list failed: http ${code || 'unknown'}`);
+    }
+
+    const parsed = parseListObjectsV2Xml(body);
+    objects.push(...parsed.objects);
+    if (!parsed.isTruncated) {
+      break;
+    }
+    token = parsed.nextContinuationToken || undefined;
+    if (!token) {
+      break;
+    }
+  }
+  return objects;
+}
+
+async function enforceBuildArtifactRetentionInR2(params: {
+  creds: R2Credentials;
+  artifactKey: string;
+  keepArtifacts: string[];
+  retainCount: number;
+}) {
+  const normalizedArtifactKey = params.artifactKey.replace(/^\/+/, '');
+  if (!normalizedArtifactKey.startsWith('builds/') || !normalizedArtifactKey.endsWith('.tar.zst')) {
+    return;
+  }
+
+  const prefix = `${path.posix.dirname(normalizedArtifactKey)}/`;
+  let listed: Array<{ key: string; lastModified: string }> = [];
+  try {
+    listed = await listR2ObjectsV2(params.creds, prefix);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`cleanup: r2 list failed for ${prefix}: ${message}`);
+    return;
+  }
+
+  const candidates = listed
+    .map((item) => ({
+      key: String(item.key || '').replace(/^\/+/, ''),
+      lastModified: String(item.lastModified || ''),
+      mtimeMs: Date.parse(String(item.lastModified || '')) || 0,
+    }))
+    .filter((item) => item.key.startsWith(prefix))
+    .filter((item) => item.key.endsWith('.tar.zst'))
+    .filter((item) => path.posix.basename(item.key).startsWith('build-'));
+
+  if (candidates.length <= params.retainCount) {
+    return;
+  }
+
+  const keepSet = new Set(
+    params.keepArtifacts
+      .map((key) => String(key || '').replace(/^\/+/, '').trim())
+      .filter((key) => key.startsWith(prefix))
+      .filter((key) => key.endsWith('.tar.zst'))
+  );
+
+  // If history is missing/partial, keep newest objects by LastModified to ensure we keep at least N.
+  if (keepSet.size < params.retainCount) {
+    const sorted = [...candidates].sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const item of sorted) {
+      if (keepSet.size >= params.retainCount) break;
+      keepSet.add(item.key);
+    }
+  }
+
+  const deletions = candidates
+    .map((item) => item.key)
+    .filter((key) => !keepSet.has(key))
+    .sort((a, b) => a.localeCompare(b));
+
+  if (!deletions.length) {
+    return;
+  }
+
+  console.warn(`cleanup: r2 builds retention prefix=${prefix} keep=${keepSet.size} delete=${deletions.length}`);
+  for (const key of deletions) {
+    try {
+      await deleteR2Object(params.creds, key);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`cleanup: r2 delete failed for ${key}: ${message}`);
+    }
+  }
 }
 
 async function cleanupLocalImages(
@@ -603,6 +727,16 @@ async function cleanupDeploymentResources(params: {
         // ignore cleanup errors
       }
     }
+
+    // Builds uploaded to R2 under `builds/<owner>/<repo>/` can accumulate if history is lost or
+    // uploads happen without deploy completion. After a successful deploy, enforce a hard cap of
+    // `DEPLOY_RETAIN_COUNT` build artifacts in the build prefix (current + previous by default).
+    await enforceBuildArtifactRetentionInR2({
+      creds: params.r2.backups,
+      artifactKey: normalizedArtifactKey,
+      keepArtifacts,
+      retainCount: DEPLOY_RETAIN_COUNT,
+    });
   }
 
   const keepImageTagSet = new Set(keepImageTags);
