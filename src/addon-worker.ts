@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
 import { presignS3Url } from './r2-presign.js';
+import { enforceCommandPolicy } from './command-policy.js';
 
 type AddonDeployPayload = {
   stack_id?: number;
@@ -206,6 +207,7 @@ type RunOptions = {
 
 function runCommand(command: string, args: string[], options: RunOptions = {}): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
+    enforceCommandPolicy(command, args, { source: 'addon-worker.runCommand' });
     const child = spawn(command, args, { cwd: options.cwd, env: options.env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';

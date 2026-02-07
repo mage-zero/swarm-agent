@@ -6,6 +6,7 @@ import { spawn } from 'child_process';
 import { isDeployPaused } from './deploy-pause.js';
 import { presignS3Url } from './r2-presign.js';
 import { buildCapacityPayload, buildPlannerPayload, isSwarmManager, readConfig } from './status.js';
+import { enforceCommandPolicy } from './command-policy.js';
 
 type DeployPayload = {
   artifact?: string;
@@ -703,6 +704,7 @@ async function initiateShutdown(signal: string) {
 
 async function runCommand(command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) {
   // TODO: Harden command execution with an allowlist or explicit wrappers before production.
+  enforceCommandPolicy(command, args, { source: 'deploy-worker.runCommand' });
   await new Promise<void>((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
@@ -725,6 +727,7 @@ async function runCommandLogged(
   args: string[],
   options: { cwd?: string; env?: NodeJS.ProcessEnv; logDir: string; label: string }
 ) {
+  enforceCommandPolicy(command, args, { source: 'deploy-worker.runCommandLogged' });
   ensureDir(options.logDir);
   const safeLabel = options.label.replace(/[^a-z0-9._-]/gi, '_');
   const stdoutPath = path.join(options.logDir, `${safeLabel}.stdout.log`);
@@ -797,6 +800,7 @@ async function runCommandLoggedWithRetry(
 }
 
 async function runCommandCapture(command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) {
+  enforceCommandPolicy(command, args, { source: 'deploy-worker.runCommandCapture' });
   return await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
@@ -823,6 +827,7 @@ async function runCommandCaptureWithStatus(
   args: string[],
   options: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
 ) {
+  enforceCommandPolicy(command, args, { source: 'deploy-worker.runCommandCaptureWithStatus' });
   return await new Promise<{ stdout: string; stderr: string; code: number }>((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
@@ -1395,7 +1400,7 @@ async function restoreDatabase(
   await stripDefiners(sqlPath, sanitizedPath);
 
   await runCommand('docker', ['cp', sanitizedPath, `${containerId}:/tmp/mz-restore.sql`]);
-  const safeDbName = dbName.replace(/`/g, '``');
+  const safeDbName = assertSafeIdentifier(dbName, 'database name');
   await runCommand('docker', [
     'exec',
     containerId,
@@ -1409,7 +1414,7 @@ async function restoreDatabase(
 }
 
 async function syncDatabaseUser(containerId: string, dbName: string, dbUser: string) {
-  const safeDbName = dbName.replace(/`/g, '``');
+  const safeDbName = assertSafeIdentifier(dbName, 'database name');
   const safeDbUser = dbUser.replace(/'/g, "''");
   const grantStatement =
     'GRANT ALL PRIVILEGES ON ' +
@@ -1504,8 +1509,9 @@ async function setSearchEngine(
   dbName: string,
   engine: string
 ): Promise<string> {
-  const safeDbName = dbName.replace(/`/g, '``');
-  const command = `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -D ${safeDbName} -e "INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/engine', '${engine}') ON DUPLICATE KEY UPDATE value=VALUES(value);"`;
+  const safeDbName = assertSafeIdentifier(dbName, 'database name').replace(/`/g, '``');
+  const safeEngine = escapeSqlValue(String(engine || ''));
+  const command = `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -D ${safeDbName} -e "INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/engine', '${safeEngine}') ON DUPLICATE KEY UPDATE value=VALUES(value);"`;
   return runDatabaseCommandWithRetry(stackName, containerId, command);
 }
 
@@ -1513,7 +1519,16 @@ function escapeSqlValue(value: string): string {
   return value.replace(/'/g, "''");
 }
 
+function assertSafeIdentifier(value: string, label: string) {
+  const trimmed = String(value || '').trim();
+  if (!/^[a-zA-Z0-9_]+$/.test(trimmed)) {
+    throw new Error(`Unsafe ${label} value: ${value}`);
+  }
+  return trimmed;
+}
+
 async function databaseHasTables(containerId: string, dbName: string): Promise<boolean> {
+  assertSafeIdentifier(dbName, 'database name');
   const safeSchema = escapeSqlValue(dbName);
   const result = await runCommandCapture('docker', [
     'exec',
@@ -1530,7 +1545,7 @@ async function databaseHasTables(containerId: string, dbName: string): Promise<b
 }
 
 async function setFullPageCacheConfig(containerId: string, dbName: string, ttlSeconds: number) {
-  const safeDbName = dbName.replace(/`/g, '``');
+  const safeDbName = assertSafeIdentifier(dbName, 'database name').replace(/`/g, '``');
   const ttl = Number.isFinite(ttlSeconds) ? Math.max(60, Math.floor(ttlSeconds)) : 86400;
   const statements = [
     `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'system/full_page_cache/caching_application', '2') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
@@ -1553,12 +1568,16 @@ async function setVarnishConfig(
   accessList: string,
   gracePeriod: string
 ) {
-  const safeDbName = dbName.replace(/`/g, '``');
+  const safeDbName = assertSafeIdentifier(dbName, 'database name').replace(/`/g, '``');
+  const safeBackendHost = escapeSqlValue(String(backendHost || ''));
+  const safeBackendPort = escapeSqlValue(String(backendPort || ''));
+  const safeAccessList = escapeSqlValue(String(accessList || ''));
+  const safeGrace = escapeSqlValue(String(gracePeriod || ''));
   const statements = [
-    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'system/full_page_cache/varnish/backend_host', '${backendHost}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
-    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'system/full_page_cache/varnish/backend_port', '${backendPort}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
-    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'system/full_page_cache/varnish/access_list', '${accessList}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
-    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'system/full_page_cache/varnish/grace_period', '${gracePeriod}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'system/full_page_cache/varnish/backend_host', '${safeBackendHost}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'system/full_page_cache/varnish/backend_port', '${safeBackendPort}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'system/full_page_cache/varnish/access_list', '${safeAccessList}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'system/full_page_cache/varnish/grace_period', '${safeGrace}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
   ].join('; ');
   await runCommand('docker', [
     'exec',
@@ -1570,13 +1589,29 @@ async function setVarnishConfig(
 }
 
 async function setBaseUrls(containerId: string, dbName: string, baseUrl: string) {
-  const safeDbName = dbName.replace(/`/g, '``');
+  const safeDbName = assertSafeIdentifier(dbName, 'database name').replace(/`/g, '``');
   const normalized = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
+  const safeNormalized = escapeSqlValue(normalized);
   const statements = [
-    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'web/unsecure/base_url', '${normalized}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
-    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'web/secure/base_url', '${normalized}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'web/unsecure/base_url', '${safeNormalized}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'web/secure/base_url', '${safeNormalized}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
     `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'web/secure/use_in_frontend', '1') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
     `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'web/secure/use_in_adminhtml', '1') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+  ].join('; ');
+  await runCommand('docker', [
+    'exec',
+    containerId,
+    'sh',
+    '-c',
+    `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -D ${safeDbName} -e "${statements};"`,
+  ]);
+}
+
+async function setSecureOffloaderConfig(containerId: string, dbName: string) {
+  const safeDbName = assertSafeIdentifier(dbName, 'database name').replace(/`/g, '``');
+  const statements = [
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'web/secure/offloader_header', 'X-Forwarded-Proto') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'web/secure/offloader_header_value', 'https') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
   ].join('; ');
   await runCommand('docker', [
     'exec',
@@ -1595,11 +1630,14 @@ async function setOpensearchSystemConfig(
   port: string,
   timeout: string
 ): Promise<string> {
-  const safeDbName = dbName.replace(/`/g, '``');
+  const safeDbName = assertSafeIdentifier(dbName, 'database name').replace(/`/g, '``');
+  const safeHost = escapeSqlValue(String(host || ''));
+  const safePort = escapeSqlValue(String(port || ''));
+  const safeTimeout = escapeSqlValue(String(timeout || ''));
   const statements = [
-    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/opensearch_server_hostname', '${host}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
-    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/opensearch_server_port', '${port}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
-    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/opensearch_server_timeout', '${timeout}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/opensearch_server_hostname', '${safeHost}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/opensearch_server_port', '${safePort}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/opensearch_server_timeout', '${safeTimeout}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
   ].join('; ');
   const command = `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -D ${safeDbName} -e "${statements};"`;
   return runDatabaseCommandWithRetry(stackName, containerId, command);
@@ -2515,6 +2553,9 @@ async function processDeployment(recordPath: string) {
     ...overrideVersions,
     ...plannerResourceEnv,
     ...configEnv,
+    // Default to pushing directly from Buildx to reduce local-disk pressure.
+    // Can be overridden for local/dev usage.
+    BUILDX_OUTPUT: process.env.BUILDX_OUTPUT || 'push',
     REGISTRY_HOST: 'registry',
     REGISTRY_PUSH_HOST: '127.0.0.1',
     REGISTRY_PORT: '5000',
@@ -2703,7 +2744,9 @@ async function processDeployment(recordPath: string) {
     const encryptedBackupPath = path.join(workDir, path.basename(objectKey));
     await downloadArtifact(r2.backups, objectKey, encryptedBackupPath);
     await restoreDatabase(dbContainerId, encryptedBackupPath, workDir, dbName);
+    await setSecureOffloaderConfig(dbContainerId, dbName);
     log('database restored');
+    log('secure offloader config applied');
   }
   await syncDatabaseUser(
     dbContainerId,

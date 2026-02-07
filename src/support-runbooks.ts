@@ -2,8 +2,9 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { buildSignature } from './node-hmac.js';
+import { presignS3Url } from './r2-presign.js';
 import { getDeployPauseFilePath, isDeployPaused, readDeployPausedAt, setDeployPaused } from './deploy-pause.js';
-import { runCommand } from './exec.js';
+import { runCommand, runCommandToFile } from './exec.js';
 import {
   buildJobName,
   envServiceName,
@@ -30,6 +31,8 @@ const DEPLOY_META_DIR = path.join(DEPLOY_QUEUE_DIR, 'meta');
 const DEPLOY_HISTORY_FILE = process.env.MZ_DEPLOY_HISTORY_FILE || path.join(DEPLOY_META_DIR, 'history.json');
 const DEPLOY_RECORD_FILENAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i;
 const DEPLOY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const R2_CRED_DIR = process.env.MZ_R2_CRED_DIR || '/opt/mage-zero/r2';
+const STACK_MASTER_PUBLIC_KEY_PATH = process.env.MZ_STACK_MASTER_PUBLIC_KEY_PATH || '/etc/magezero/stack_master_ssh.pub';
 
 type RunbookDefinition = {
   id: string;
@@ -49,6 +52,19 @@ type RunbookResult = {
     attempted: boolean;
     actions: string[];
   };
+};
+
+type R2Credentials = {
+  accessKeyId: string;
+  secretAccessKey: string;
+  bucket: string;
+  endpoint: string;
+  region?: string;
+};
+
+type R2CredFile = {
+  backups?: R2Credentials;
+  media?: R2Credentials;
 };
 
 const RUNBOOKS: RunbookDefinition[] = [
@@ -248,7 +264,107 @@ const RUNBOOKS: RunbookDefinition[] = [
     safe: false,
     supports_remediation: true,
   },
+  {
+    id: 'environment_teardown',
+    name: 'Environment teardown',
+    description: 'Backup the database, upload to R2, and remove the environment stack + volumes.',
+    safe: false,
+    supports_remediation: true,
+  },
 ];
+
+function readR2CredFile(environmentId: number): R2CredFile | null {
+  try {
+    const raw = fs.readFileSync(path.join(R2_CRED_DIR, `env-${environmentId}.json`), 'utf8');
+    return JSON.parse(raw) as R2CredFile;
+  } catch {
+    return null;
+  }
+}
+
+function resolveStackMasterPublicKeyPath(): string | null {
+  const candidates = [
+    STACK_MASTER_PUBLIC_KEY_PATH,
+    path.join(NODE_DIR, 'stack_master_ssh.pub'),
+  ];
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function formatTimestamp(date = new Date()): string {
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}_${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}`;
+}
+
+async function uploadArtifact(creds: R2Credentials, objectKey: string, sourcePath: string): Promise<void> {
+  const normalizedKey = objectKey.replace(/^\/+/, '');
+  const url = presignS3Url({
+    method: 'PUT',
+    endpoint: creds.endpoint,
+    bucket: creds.bucket,
+    key: normalizedKey,
+    accessKeyId: creds.accessKeyId,
+    secretAccessKey: creds.secretAccessKey,
+    region: creds.region || 'auto',
+    expiresIn: 3600,
+  });
+  const result = await runCommand('curl', ['-fsSL', '-X', 'PUT', '-T', sourcePath, url], 120_000);
+  if (result.code !== 0) {
+    const detail = (result.stderr || result.stdout || '').trim();
+    throw new Error(detail ? `R2 upload failed: ${detail}` : 'R2 upload failed');
+  }
+}
+
+async function findServiceContainerId(serviceName: string): Promise<string | null> {
+  const result = await runCommand(
+    'docker',
+    ['ps', '--filter', `label=com.docker.swarm.service.name=${serviceName}`, '--format', '{{.ID}}'],
+    12_000
+  );
+  if (result.code !== 0) return null;
+  const id = result.stdout.split('\n').map((line) => line.trim()).filter(Boolean)[0];
+  return id || null;
+}
+
+async function waitForEnvironmentServicesGone(environmentId: number, timeoutMs = 120_000): Promise<{ ok: boolean; remaining: string[] }> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const services = await listEnvironmentServices(environmentId);
+    if (!services.length) {
+      return { ok: true, remaining: [] };
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  const remaining = await listEnvironmentServices(environmentId);
+  return { ok: false, remaining: remaining.map((service) => service.name) };
+}
+
+async function removeEnvironmentVolumes(environmentId: number): Promise<{ removed: string[]; failed: string[] }> {
+  const prefix = `mz-env-${environmentId}_`;
+  const result = await runCommand('docker', ['volume', 'ls', '--format', '{{.Name}}'], 12_000);
+  if (result.code !== 0) {
+    return { removed: [], failed: [] };
+  }
+  const volumes = result.stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((name) => name.startsWith(prefix));
+  const removed: string[] = [];
+  const failed: string[] = [];
+  for (const volume of volumes) {
+    const rm = await runCommand('docker', ['volume', 'rm', '-f', volume], 30_000);
+    if (rm.code === 0) {
+      removed.push(volume);
+    } else {
+      failed.push(volume);
+    }
+  }
+  return { removed, failed };
+}
 
 function readNodeFile(filename: string): string {
   try {
@@ -297,6 +413,10 @@ async function validateNodeRequest(request: Request): Promise<boolean> {
 
 function escapeForShellDoubleQuotes(value: string) {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, ' ');
+}
+
+function quoteShell(value: string) {
+  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
 async function dbQueryScalar(environmentId: number, host: string, sql: string, timeoutMs = 60_000): Promise<string | null> {
@@ -1556,6 +1676,8 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
       return runMagentoMaintenance(environmentId, 'enable');
     case 'magento_maintenance_disable':
       return runMagentoMaintenance(environmentId, 'disable');
+    case 'environment_teardown':
+      return runEnvironmentTeardown(environmentId, input);
     case 'proxysql_restart':
       return runServiceRestart(environmentId, '_proxysql', 'proxysql_restart', 'ProxySQL');
     case 'cloudflared_restart':
@@ -2644,6 +2766,274 @@ async function runMagentoMaintenance(environmentId: number, mode: 'enable' | 'di
     ].filter(Boolean),
     remediation: { attempted: true, actions: [`Magento maintenance:${mode}`] },
     data: { service: serviceFullName, ok, state: job.state },
+  };
+}
+
+async function runMagentoCommand(
+  environmentId: number,
+  command: string,
+  jobPrefix: string,
+  timeoutMs = 90_000
+): Promise<{ ok: boolean; logs: string; error?: string; state: string; service: string; node?: string }> {
+  const hasAdmin = Boolean(await inspectServiceSpec(envServiceName(environmentId, 'php-fpm-admin')));
+  const targetService = hasAdmin ? 'php-fpm-admin' : 'php-fpm';
+  const serviceFullName = envServiceName(environmentId, targetService);
+  if (!(await inspectServiceSpec(serviceFullName))) {
+    return {
+      ok: false,
+      logs: '',
+      error: `Missing service: ${serviceFullName}`,
+      state: 'missing_service',
+      service: serviceFullName,
+    };
+  }
+
+  const job = await runServiceJob(
+    environmentId,
+    targetService,
+    jobPrefix,
+    `cd /var/www/html/magento && ${command}`,
+    { timeout_ms: timeoutMs }
+  );
+
+  return {
+    ok: job.ok,
+    logs: job.logs || '',
+    error: job.error,
+    state: job.state,
+    service: job.service || serviceFullName,
+    node: job.node,
+  };
+}
+
+async function runEnvironmentTeardown(environmentId: number, input: Record<string, unknown>): Promise<RunbookResult> {
+  const runbookId = 'environment_teardown';
+  const observations: string[] = [];
+  const actions: string[] = [];
+
+  const activeDeploy = await runDeployActiveSummary(environmentId);
+  if (activeDeploy.status === 'warning') {
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Deploy is active; teardown aborted.',
+      observations: activeDeploy.observations,
+    };
+  }
+
+  const maintenance = await runMagentoMaintenance(environmentId, 'enable');
+  observations.push(`Maintenance: ${maintenance.summary}`);
+  observations.push(...maintenance.observations.map((line) => `Maintenance: ${line}`));
+  if (maintenance.status !== 'ok') {
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Failed to enable maintenance mode; teardown aborted.',
+      observations,
+    };
+  }
+
+  const cacheFlush = await runMagentoCommand(environmentId, 'php bin/magento cache:flush --no-interaction', 'cache-flush', 120_000);
+  observations.push(`Cache flush: ${cacheFlush.ok ? 'ok' : 'failed'}`);
+  if (cacheFlush.logs.trim()) {
+    observations.push(`Cache flush logs: ${tailLines(cacheFlush.logs.trim(), 20)}`);
+  }
+  if (!cacheFlush.ok) {
+    const maintenanceOff = await runMagentoMaintenance(environmentId, 'disable');
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Cache flush failed; teardown aborted.',
+      observations: [
+        ...observations,
+        cacheFlush.error ? `Cache flush error: ${cacheFlush.error}` : '',
+        `Maintenance: ${maintenanceOff.summary}`,
+        ...maintenanceOff.observations.map((line) => `Maintenance: ${line}`),
+      ].filter(Boolean),
+    };
+  }
+
+  const maintenanceStatus = await runMagentoCommand(environmentId, 'php bin/magento maintenance:status --no-interaction', 'maintenance-status', 60_000);
+  const maintenanceOutput = maintenanceStatus.logs.toLowerCase();
+  const maintenanceEnabled = maintenanceStatus.ok
+    && maintenanceOutput.includes('enabled')
+    && !maintenanceOutput.includes('disabled');
+  observations.push(`Maintenance status: ${maintenanceEnabled ? 'enabled' : 'not enabled'}`);
+  if (!maintenanceStatus.ok || !maintenanceEnabled) {
+    const maintenanceOff = await runMagentoMaintenance(environmentId, 'disable');
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Maintenance mode not confirmed; teardown aborted.',
+      observations: [
+        ...observations,
+        maintenanceStatus.logs.trim() ? `Maintenance status logs: ${tailLines(maintenanceStatus.logs.trim(), 20)}` : '',
+        maintenanceStatus.error ? `Maintenance status error: ${maintenanceStatus.error}` : '',
+        `Maintenance: ${maintenanceOff.summary}`,
+        ...maintenanceOff.observations.map((line) => `Maintenance: ${line}`),
+      ].filter(Boolean),
+    };
+  }
+
+  const r2 = readR2CredFile(environmentId);
+  if (!r2?.backups) {
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Missing R2 backups credentials.',
+      observations: [`Expected file: ${path.join(R2_CRED_DIR, `env-${environmentId}.json`)}`],
+    };
+  }
+
+  const backupObjectRaw = typeof input.backup_object === 'string' ? input.backup_object.trim() : '';
+  const backupObject = (backupObjectRaw || 'provisioning-database.sql.zst.age').replace(/^\/+/, '');
+  const backupBucket = r2.backups.bucket;
+
+  const publicKeyPath = resolveStackMasterPublicKeyPath();
+  if (!publicKeyPath) {
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Missing stack master public key for encryption.',
+      observations: [
+        `Checked: ${STACK_MASTER_PUBLIC_KEY_PATH}`,
+        `Checked: ${path.join(NODE_DIR, 'stack_master_ssh.pub')}`,
+      ],
+    };
+  }
+
+  const dbServiceName = envServiceName(environmentId, 'database');
+  const dbSpec = await inspectServiceSpec(dbServiceName);
+  if (!dbSpec) {
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Database service not found; backup aborted.',
+      observations: [`Service missing: ${dbServiceName}`],
+    };
+  }
+
+  const dbName = String(dbSpec.env.MYSQL_DATABASE || 'magento').trim() || 'magento';
+  const containerId = await findServiceContainerId(dbServiceName);
+  if (!containerId) {
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Database container not running; backup aborted.',
+      observations: [`Service: ${dbServiceName}`],
+    };
+  }
+
+  const timestamp = formatTimestamp();
+  const workDir = path.join(DEPLOY_WORK_DIR, `teardown-${environmentId}-${timestamp}`);
+  ensureDir(workDir);
+  const dumpPath = path.join(workDir, `db-${timestamp}.sql`);
+  const zstPath = `${dumpPath}.zst`;
+  const agePath = `${zstPath}.age`;
+
+  try {
+    const dumpInner = [
+      'set -euo pipefail',
+      'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+      `mariadb-dump -uroot -p"$ROOT_PASS" --single-transaction --quick --routines --events --triggers --hex-blob --databases ${quoteShell(
+        dbName
+      )}`,
+    ].join(' && ');
+    const dumpResult = await runCommandToFile('docker', ['exec', containerId, 'sh', '-c', dumpInner], dumpPath, 10 * 60_000);
+    if (dumpResult.code !== 0) {
+      const output = (dumpResult.stderr || '').trim();
+      throw new Error(output ? `Database dump failed: ${output}` : 'Database dump failed.');
+    }
+
+    const zstdResult = await runCommand('zstd', ['-19', '-f', '-o', zstPath, dumpPath], 10 * 60_000);
+    if (zstdResult.code !== 0) {
+      const output = (zstdResult.stderr || zstdResult.stdout || '').trim();
+      throw new Error(output ? `zstd failed: ${output}` : 'zstd failed.');
+    }
+
+    const ageResult = await runCommand('age', ['-R', publicKeyPath, '-o', agePath, zstPath], 60_000);
+    if (ageResult.code !== 0) {
+      const output = (ageResult.stderr || ageResult.stdout || '').trim();
+      throw new Error(output ? `age encryption failed: ${output}` : 'age encryption failed.');
+    }
+
+    await uploadArtifact(r2.backups, backupObject, agePath);
+    actions.push(`Uploaded backup to ${backupBucket}/${backupObject}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const maintenanceOff = await runMagentoMaintenance(environmentId, 'disable');
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Database backup failed; teardown aborted.',
+      observations: [
+        message,
+        `Maintenance: ${maintenanceOff.summary}`,
+        ...maintenanceOff.observations.map((line) => `Maintenance: ${line}`),
+      ],
+    };
+  } finally {
+    for (const filePath of [dumpPath, zstPath, agePath]) {
+      try {
+        if (fs.existsSync(filePath)) {
+          fs.rmSync(filePath, { force: true });
+        }
+      } catch {
+        // ignore cleanup failures
+      }
+    }
+  }
+
+  const stackName = `mz-env-${environmentId}`;
+  const stackRemove = await runCommand('docker', ['stack', 'rm', stackName], 60_000);
+  if (stackRemove.code === 0) {
+    actions.push(`Removed stack ${stackName}`);
+  } else {
+    const output = (stackRemove.stderr || stackRemove.stdout || '').trim();
+    const missing = output.toLowerCase().includes('nothing found') || output.toLowerCase().includes('not found');
+    if (!missing) {
+      return {
+        runbook_id: runbookId,
+        status: 'failed',
+        summary: 'Failed to remove environment stack.',
+        observations: [output || `stack rm failed for ${stackName}`],
+      };
+    }
+    observations.push(`Stack ${stackName} already removed.`);
+  }
+
+  const wait = await waitForEnvironmentServicesGone(environmentId, 180_000);
+  if (!wait.ok) {
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Environment services did not stop in time.',
+      observations: wait.remaining.length ? [`Remaining services: ${wait.remaining.join(', ')}`] : [],
+    };
+  }
+  actions.push('All environment services removed.');
+
+  const volumes = await removeEnvironmentVolumes(environmentId);
+  if (volumes.removed.length) {
+    actions.push(`Removed volumes: ${volumes.removed.join(', ')}`);
+  }
+  if (volumes.failed.length) {
+    observations.push(`Failed to remove volumes: ${volumes.failed.join(', ')}`);
+  }
+
+  const status: RunbookResult['status'] = volumes.failed.length ? 'warning' : 'ok';
+  return {
+    runbook_id: runbookId,
+    status,
+    summary: 'Environment teardown completed.',
+    observations,
+    data: {
+      backup_bucket: backupBucket,
+      backup_object: backupObject,
+      removed_volumes: volumes.removed,
+      failed_volumes: volumes.failed,
+    },
+    remediation: { attempted: true, actions },
   };
 }
 
