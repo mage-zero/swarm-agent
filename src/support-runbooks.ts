@@ -271,6 +271,13 @@ const RUNBOOKS: RunbookDefinition[] = [
     safe: false,
     supports_remediation: true,
   },
+  {
+    id: 'db_backup',
+    name: 'Database backup',
+    description: 'Create an encrypted logical database backup (mysqldump) and upload it to R2.',
+    safe: false,
+    supports_remediation: true,
+  },
 ];
 
 function readR2CredFile(environmentId: number): R2CredFile | null {
@@ -1676,6 +1683,8 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
       return runMagentoMaintenance(environmentId, 'enable');
     case 'magento_maintenance_disable':
       return runMagentoMaintenance(environmentId, 'disable');
+    case 'db_backup':
+      return runDbBackup(environmentId, input);
     case 'environment_teardown':
       return runEnvironmentTeardown(environmentId, input);
     case 'proxysql_restart':
@@ -1687,6 +1696,221 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
     default:
       return { error: 'unknown_runbook', status: 404 };
   }
+}
+
+async function runDbBackup(environmentId: number, input: Record<string, unknown>): Promise<RunbookResult> {
+  const runbookId = 'db_backup';
+  const actions: string[] = [];
+  const observations: string[] = [];
+
+  const method = String(input.method ?? 'mysqldump').trim().toLowerCase() || 'mysqldump';
+  if (method !== 'mysqldump') {
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Unsupported backup method.',
+      observations: ['Supported methods: mysqldump', `Requested: ${method}`],
+    };
+  }
+
+  const r2 = readR2CredFile(environmentId);
+  if (!r2?.backups) {
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Missing R2 backups credentials.',
+      observations: [`Expected file: ${path.join(R2_CRED_DIR, `env-${environmentId}.json`)}`],
+    };
+  }
+
+  const publicKeyPath = resolveStackMasterPublicKeyPath();
+  if (!publicKeyPath) {
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Missing stack master public key for encryption.',
+      observations: [
+        `Checked: ${STACK_MASTER_PUBLIC_KEY_PATH}`,
+        `Checked: ${path.join(NODE_DIR, 'stack_master_ssh.pub')}`,
+      ],
+    };
+  }
+
+  const backupObjectRaw = typeof input.backup_object === 'string' ? input.backup_object.trim() : '';
+  // Keep "latest" in R2 by default. (Local history retention is planned separately.)
+  const backupObjectDefault = `db-backups/env-${environmentId}/latest.sql.zst.age`;
+  const backupObject = (backupObjectRaw || backupObjectDefault).replace(/^\/+/, '');
+
+  const dbServiceName = envServiceName(environmentId, 'database');
+  const dbReplicaServiceName = envServiceName(environmentId, 'database-replica');
+  const dbSpec = await inspectServiceSpec(dbServiceName);
+  if (!dbSpec) {
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Database service not found; backup aborted.',
+      observations: [`Service missing: ${dbServiceName}`],
+    };
+  }
+
+  const dbName = String(dbSpec.env.MYSQL_DATABASE || 'magento').trim() || 'magento';
+
+  // Best-effort: put the site into maintenance mode and pause cron to reduce writes.
+  const maintenance = await runMagentoMaintenance(environmentId, 'enable');
+  actions.push('Enabled Magento maintenance mode');
+  observations.push(...maintenance.observations.map((line) => `Maintenance: ${line}`));
+  if (maintenance.status !== 'ok') {
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Failed to enable maintenance mode; backup aborted.',
+      observations,
+      remediation: { attempted: true, actions },
+    };
+  }
+
+  const cronDown = await scaleEnvironmentService(environmentId, 'cron', 0);
+  actions.push(cronDown.ok ? 'Scaled cron service to 0' : `Failed to scale cron service: ${cronDown.note || ''}`.trim());
+
+  const timestamp = formatTimestamp();
+  const workDir = path.join(DEPLOY_WORK_DIR, `db-backup-${environmentId}-${timestamp}`);
+  ensureDir(workDir);
+  const dumpPath = path.join(workDir, `db-${timestamp}.sql`);
+  const zstPath = `${dumpPath}.zst`;
+  const agePath = `${zstPath}.age`;
+
+  let uploaded = false;
+  let dumpSource = '';
+  try {
+    // Prefer dumping from the current writer if we can detect it and it is local.
+    // NOTE: This currently uses docker exec on the local node. If the database container
+    // is scheduled on a different node, this will fail. In that case, we should migrate
+    // this runbook to use a dedicated backup job image that can run on the DB node.
+    const primaryHost = dbServiceName;
+    const replicaHost = await inspectServiceSpec(dbReplicaServiceName) ? dbReplicaServiceName : '';
+    const primaryReadOnly = await dbGetReadOnly(environmentId, primaryHost);
+    const primarySlave = await dbGetSlaveStatus(environmentId, primaryHost);
+    const replicaReadOnly = replicaHost ? await dbGetReadOnly(environmentId, replicaHost) : null;
+    const replicaSlave = replicaHost ? await dbGetSlaveStatus(environmentId, replicaHost) : null;
+
+    let targetService = dbServiceName;
+    if (primaryReadOnly === false && !primarySlave) {
+      targetService = dbServiceName;
+    } else if (replicaHost && replicaReadOnly === false && !replicaSlave) {
+      targetService = dbReplicaServiceName;
+    }
+
+    const containerId = await findServiceContainerId(targetService);
+    if (!containerId && targetService !== dbServiceName) {
+      // Fallback to primary service if we chose replica but cannot exec it locally.
+      const fallback = await findServiceContainerId(dbServiceName);
+      if (fallback) {
+        dumpSource = dbServiceName;
+        const dumpInner = [
+          'set -euo pipefail',
+          'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+          `mariadb-dump -uroot -p\"$ROOT_PASS\" --single-transaction --quick --routines --events --triggers --hex-blob --databases ${quoteShell(
+            dbName
+          )}`,
+        ].join(' && ');
+        const dumpResult = await runCommandToFile('docker', ['exec', fallback, 'sh', '-c', dumpInner], dumpPath, 15 * 60_000);
+        if (dumpResult.code !== 0) {
+          const output = (dumpResult.stderr || '').trim();
+          throw new Error(output ? `Database dump failed: ${output}` : 'Database dump failed.');
+        }
+      } else {
+        throw new Error(`Database container not found on this node (service: ${targetService}).`);
+      }
+    } else if (!containerId) {
+      throw new Error(`Database container not found on this node (service: ${targetService}).`);
+    } else {
+      dumpSource = targetService;
+      const dumpInner = [
+        'set -euo pipefail',
+        'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+        `mariadb-dump -uroot -p\"$ROOT_PASS\" --single-transaction --quick --routines --events --triggers --hex-blob --databases ${quoteShell(
+          dbName
+        )}`,
+      ].join(' && ');
+      const dumpResult = await runCommandToFile('docker', ['exec', containerId, 'sh', '-c', dumpInner], dumpPath, 15 * 60_000);
+      if (dumpResult.code !== 0) {
+        const output = (dumpResult.stderr || '').trim();
+        throw new Error(output ? `Database dump failed: ${output}` : 'Database dump failed.');
+      }
+    }
+
+    const zstdResult = await runCommand('zstd', ['-19', '-f', '-o', zstPath, dumpPath], 15 * 60_000);
+    if (zstdResult.code !== 0) {
+      const output = (zstdResult.stderr || zstdResult.stdout || '').trim();
+      throw new Error(output ? `zstd failed: ${output}` : 'zstd failed.');
+    }
+
+    const ageResult = await runCommand('age', ['-R', publicKeyPath, '-o', agePath, zstPath], 2 * 60_000);
+    if (ageResult.code !== 0) {
+      const output = (ageResult.stderr || ageResult.stdout || '').trim();
+      throw new Error(output ? `age encryption failed: ${output}` : 'age encryption failed.');
+    }
+
+    await uploadArtifact(r2.backups, backupObject, agePath);
+    uploaded = true;
+    actions.push(`Uploaded backup to ${r2.backups.bucket}/${backupObject}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    observations.push(message);
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Database backup failed.',
+      observations,
+      remediation: { attempted: true, actions },
+      data: {
+        method,
+        db: { name: dbName, dump_source: dumpSource || null },
+        backup_bucket: r2.backups.bucket,
+        backup_object: backupObject,
+      },
+    };
+  } finally {
+    // Always try to re-enable cron and disable maintenance mode.
+    const cronUp = await scaleEnvironmentService(environmentId, 'cron', 1);
+    actions.push(cronUp.ok ? 'Scaled cron service to 1' : `Failed to scale cron service: ${cronUp.note || ''}`.trim());
+
+    const maintenanceOff = await runMagentoMaintenance(environmentId, 'disable');
+    actions.push('Disabled Magento maintenance mode');
+    observations.push(...maintenanceOff.observations.map((line) => `Maintenance: ${line}`));
+
+    // Cleanup working files
+    for (const filePath of [dumpPath, zstPath, agePath]) {
+      try {
+        if (fs.existsSync(filePath)) {
+          fs.rmSync(filePath, { force: true });
+        }
+      } catch {
+        // ignore cleanup failures
+      }
+    }
+    try {
+      if (fs.existsSync(workDir)) {
+        fs.rmSync(workDir, { recursive: true, force: true });
+      }
+    } catch {
+      // ignore cleanup failures
+    }
+  }
+
+  return {
+    runbook_id: runbookId,
+    status: uploaded ? 'ok' : 'warning',
+    summary: uploaded ? 'Database backup uploaded to R2.' : 'Database backup completed with warnings.',
+    observations,
+    remediation: { attempted: true, actions },
+    data: {
+      method,
+      db: { name: dbName, dump_source: dumpSource || null },
+      backup_bucket: r2.backups.bucket,
+      backup_object: backupObject,
+    },
+  };
 }
 
 async function runDiskUsageSummary(): Promise<RunbookResult> {
