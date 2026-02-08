@@ -26,6 +26,9 @@ const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
 const ENV_STATE_DIR = process.env.MZ_ENV_STATE_DIR || '/etc/magezero/env-sync';
 const R2_CRED_DIR = process.env.MZ_R2_CRED_DIR || '/opt/mage-zero/r2';
 const SYNC_INTERVAL_MS = Number(process.env.MZ_ENV_SYNC_INTERVAL_MS || 60000);
+// Refresh credentials periodically even when markers exist (e.g. after switching
+// credential strategy away from per-bucket tokens).
+const R2_REFRESH_INTERVAL_MS = Number(process.env.MZ_R2_REFRESH_INTERVAL_MS || 30 * 60 * 1000);
 
 let cachedDockerApiVersion: string | null = null;
 let cachedDockerApiVersionAt = 0;
@@ -52,6 +55,17 @@ function ensureR2Dir() {
 
 function getR2CredPath(environmentId: number) {
   return `${R2_CRED_DIR}/env-${environmentId}.json`;
+}
+
+function shouldRefreshCredFile(environmentId: number): boolean {
+  const filePath = getR2CredPath(environmentId);
+  try {
+    const st = fs.statSync(filePath);
+    const age = Date.now() - st.mtimeMs;
+    return age > R2_REFRESH_INTERVAL_MS;
+  } catch {
+    return true;
+  }
 }
 
 function writeR2CredFile(environmentId: number, backups: R2Credentials, media: R2Credentials) {
@@ -415,8 +429,9 @@ async function syncEnvironmentCredentials() {
       && existingSecrets.has(mediaAccessName)
       && existingSecrets.has(mediaSecretName);
     const hasCredFile = fs.existsSync(getR2CredPath(environmentId));
+    const refreshFile = hasCredFile && shouldRefreshCredFile(environmentId);
 
-    if (hasAllSecrets && hasCredFile) {
+    if (hasAllSecrets && hasCredFile && !refreshFile) {
       if (!hasEnvMarker(environmentId)) {
         writeEnvMarker(environmentId);
       }
@@ -448,10 +463,20 @@ async function syncEnvironmentCredentials() {
         'mz.managed': 'true',
       };
 
-      await ensureSecret(backupAccessName, creds.backups.accessKeyId, labels, existingSecrets);
-      await ensureSecret(backupSecretName, creds.backups.secretAccessKey, labels, existingSecrets);
-      await ensureSecret(mediaAccessName, creds.media.accessKeyId, labels, existingSecrets);
-      await ensureSecret(mediaSecretName, creds.media.secretAccessKey, labels, existingSecrets);
+      // Docker secrets are immutable; only create if missing.
+      // The swarm-agent itself reads /opt/mage-zero/r2/env-<id>.json for deploy operations.
+      if (!existingSecrets.has(backupAccessName)) {
+        await ensureSecret(backupAccessName, creds.backups.accessKeyId, labels, existingSecrets);
+      }
+      if (!existingSecrets.has(backupSecretName)) {
+        await ensureSecret(backupSecretName, creds.backups.secretAccessKey, labels, existingSecrets);
+      }
+      if (!existingSecrets.has(mediaAccessName)) {
+        await ensureSecret(mediaAccessName, creds.media.accessKeyId, labels, existingSecrets);
+      }
+      if (!existingSecrets.has(mediaSecretName)) {
+        await ensureSecret(mediaSecretName, creds.media.secretAccessKey, labels, existingSecrets);
+      }
 
       writeR2CredFile(environmentId, creds.backups, creds.media);
       writeEnvMarker(environmentId);
