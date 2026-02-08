@@ -402,7 +402,10 @@ function inferCommitShaFromArtifactKey(artifactKey: string): string {
   }
 
   key = key.replace(/^\/+/, '');
-  const match = key.match(/-([0-9a-f]{7,64})\.tar(?:\.zst|\.gz|\.bz2|\.xz)?$/i);
+  const file = key.split('/').pop() || '';
+  const match =
+    file.match(/^([0-9a-f]{7,64})\.tar(?:\.(?:zst|gz|bz2|xz))?$/i) ||
+    file.match(/[-_]([0-9a-f]{7,64})\.tar(?:\.(?:zst|gz|bz2|xz))?$/i);
   return match ? match[1] : '';
 }
 
@@ -3587,7 +3590,11 @@ async function processDeployment(recordPath: string) {
     deployment_id: deploymentId,
     environment_id: environmentId,
     status: 'active',
-    deployed_commit_sha: inferCommitShaFromArtifactKey(artifactKey) || undefined,
+    deployed_commit_sha: (
+      inferCommitShaFromArtifactKey(artifactKey)
+      || (/^[0-9a-f]{7,64}$/i.test(ref) ? ref : '')
+      || undefined
+    ),
   });
 
   try {
