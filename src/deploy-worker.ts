@@ -143,6 +143,7 @@ const CLOUD_SWARM_REPO = process.env.MZ_CLOUD_SWARM_REPO || 'git@github.com:mage
 const CLOUD_SWARM_KEY_PATH = process.env.MZ_CLOUD_SWARM_KEY_PATH || '/opt/mage-zero/keys/cloud-swarm-deploy';
 const R2_CRED_DIR = process.env.MZ_R2_CRED_DIR || '/opt/mage-zero/r2';
 const STACK_MASTER_KEY_PATH = process.env.MZ_STACK_MASTER_KEY_PATH || '/etc/magezero/stack_master_ssh';
+const STACK_MASTER_PUBLIC_KEY_PATH = process.env.MZ_STACK_MASTER_PUBLIC_KEY_PATH || '/etc/magezero/stack_master_ssh.pub';
 const DEFAULT_DB_BACKUP_OBJECT = process.env.MZ_DB_BACKUP_OBJECT || 'provisioning-database.sql.zst.age';
 const SECRET_VERSION = process.env.MZ_SECRET_VERSION || '1';
 const DEPLOY_INTERVAL_MS = Number(process.env.MZ_DEPLOY_WORKER_INTERVAL_MS || 5000);
@@ -1410,6 +1411,21 @@ async function downloadArtifact(creds: R2Credentials, objectKey: string, targetP
   await runCommand('curl', ['-fsSL', url, '-o', targetPath]);
 }
 
+async function uploadArtifact(creds: R2Credentials, objectKey: string, sourcePath: string) {
+  const normalizedKey = objectKey.replace(/^\/+/, '');
+  const url = presignS3Url({
+    method: 'PUT',
+    endpoint: creds.endpoint,
+    bucket: creds.bucket,
+    key: normalizedKey,
+    accessKeyId: creds.accessKeyId,
+    secretAccessKey: creds.secretAccessKey,
+    region: creds.region || 'auto',
+    expiresIn: 3600,
+  });
+  await runCommand('curl', ['-fsSL', '-X', 'PUT', '-T', sourcePath, url]);
+}
+
 async function extractArtifact(archivePath: string, targetDir: string) {
   ensureDir(targetDir);
   await runCommand('tar', ['-I', 'zstd -d', '-xf', archivePath, '-C', targetDir]);
@@ -1857,6 +1873,20 @@ async function ensureMagentoEnvWrapperWithRetry(
     }
   }
   return currentId;
+}
+
+function resolveStackMasterPublicKeyPath(): string | null {
+  const candidates = [
+    STACK_MASTER_PUBLIC_KEY_PATH,
+    `${STACK_MASTER_KEY_PATH}.pub`,
+    path.join(NODE_DIR, 'stack_master_ssh.pub'),
+  ];
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
 }
 
 async function runMagentoCommandCapture(
@@ -2557,6 +2587,144 @@ async function runSetupUpgradeWithRetry(
   throw lastError || new Error('setup:upgrade failed after retries');
 }
 
+async function setMagentoMaintenanceMode(
+  containerId: string,
+  stackName: string,
+  mode: 'enable' | 'disable',
+  log: (message: string) => void,
+) {
+  let currentId = containerId;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    currentId = await ensureMagentoEnvWrapperWithRetry(currentId, stackName, log);
+    const result = await runMagentoCommandWithStatus(
+      currentId,
+      stackName,
+      `php bin/magento maintenance:${mode} --no-interaction`,
+    );
+    if (result.code === 0) {
+      log(`maintenance:${mode} ok`);
+      return currentId;
+    }
+    const output = (result.stderr || result.stdout || '').trim();
+    if (!output || output.includes('No such container') || output.includes('is not running')) {
+      log(`maintenance:${mode} retry ${attempt}: ${output || `exit ${result.code}`}`);
+      currentId = await waitForContainer(stackName, 'php-fpm-admin', 60 * 1000);
+      await delay(2000);
+      continue;
+    }
+    throw new Error(`maintenance:${mode} failed (exit ${result.code}): ${output}`);
+  }
+  return currentId;
+}
+
+async function runSetupDbStatus(
+  containerId: string,
+  stackName: string,
+  log: (message: string) => void,
+): Promise<{ needed: boolean; exitCode: number; output: string; containerId: string }> {
+  let currentId = containerId;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    currentId = await ensureMagentoEnvWrapperWithRetry(currentId, stackName, log);
+    const result = await runMagentoCommandWithStatus(currentId, stackName, 'php bin/magento setup:db:status');
+    const output = (result.stderr || result.stdout || '').trim();
+    const exitCode = result.code;
+    if (exitCode === 0) {
+      return { needed: false, exitCode, output, containerId: currentId };
+    }
+    if (exitCode === 1 || exitCode === 2) {
+      return { needed: true, exitCode, output, containerId: currentId };
+    }
+    if (output && output.toLowerCase().includes('setup:upgrade is required')) {
+      return { needed: true, exitCode, output, containerId: currentId };
+    }
+    if (!output || output.includes('No such container') || output.includes('is not running')) {
+      log(`setup:db:status retry ${attempt}: ${output || `exit ${exitCode}`}`);
+      currentId = await waitForContainer(stackName, 'php-fpm-admin', 60 * 1000);
+      await delay(2000);
+      continue;
+    }
+    log(`setup:db:status unexpected exit=${exitCode}: ${output}`);
+    return { needed: true, exitCode, output, containerId: currentId };
+  }
+  return { needed: true, exitCode: 1, output: 'setup:db:status retries exhausted', containerId: currentId };
+}
+
+async function flushMagentoCache(
+  containerId: string,
+  stackName: string,
+  log: (message: string) => void,
+) {
+  let currentId = containerId;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    currentId = await ensureMagentoEnvWrapperWithRetry(currentId, stackName, log);
+    const result = await runMagentoCommandWithStatus(currentId, stackName, 'php bin/magento cache:flush');
+    if (result.code === 0) {
+      log('cache:flush ok');
+      return currentId;
+    }
+    const output = (result.stderr || result.stdout || '').trim();
+    if (!output || output.includes('No such container') || output.includes('is not running')) {
+      log(`cache:flush retry ${attempt}: ${output || `exit ${result.code}`}`);
+      currentId = await waitForContainer(stackName, 'php-fpm-admin', 60 * 1000);
+      await delay(2000);
+      continue;
+    }
+    throw new Error(`cache:flush failed (exit ${result.code}): ${output}`);
+  }
+  return currentId;
+}
+
+async function backupDatabasePreUpgrade(params: {
+  dbContainerId: string;
+  dbName: string;
+  r2: R2Credentials;
+  objectKey: string;
+  log: (message: string) => void;
+}) {
+  const publicKeyPath = resolveStackMasterPublicKeyPath();
+  if (!publicKeyPath) {
+    throw new Error('Missing stack master public key for backup encryption.');
+  }
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '').replace('T', '_').replace('Z', 'Z');
+  const workDir = path.join(DEPLOY_WORK_DIR, `db-backup-${timestamp}`);
+  ensureDir(workDir);
+  const dumpPath = path.join(workDir, 'db.sql');
+  const zstPath = `${dumpPath}.zst`;
+  const agePath = `${zstPath}.age`;
+  const containerTmp = '/tmp/mz-pre-upgrade.sql';
+
+  try {
+    const safeDbName = assertSafeIdentifier(params.dbName, 'database name');
+    const dumpCmd = [
+      'set -euo pipefail',
+      'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+      `mariadb-dump -uroot -p\"$ROOT_PASS\" --single-transaction --quick --routines --events --triggers --hex-blob --databases ${safeDbName} > ${containerTmp}`,
+    ].join(' && ');
+    await runCommand('docker', ['exec', params.dbContainerId, 'sh', '-lc', dumpCmd]);
+    await runCommand('docker', ['cp', `${params.dbContainerId}:${containerTmp}`, dumpPath]);
+    await runCommand('docker', ['exec', params.dbContainerId, 'sh', '-lc', `rm -f ${containerTmp} || true`]).catch(() => {});
+
+    await runCommand('zstd', ['-19', '-f', '-o', zstPath, dumpPath]);
+    await runCommand('age', ['-R', publicKeyPath, '-o', agePath, zstPath]);
+    await uploadArtifact(params.r2, params.objectKey, agePath);
+    params.log(`db backup uploaded: ${params.r2.bucket}/${params.objectKey}`);
+  } finally {
+    for (const filePath of [dumpPath, zstPath, agePath]) {
+      try {
+        if (fs.existsSync(filePath)) fs.rmSync(filePath, { force: true });
+      } catch {
+        // ignore
+      }
+    }
+    try {
+      if (fs.existsSync(workDir)) fs.rmSync(workDir, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  }
+}
+
 async function reportDeploymentStatus(
   baseUrl: string,
   nodeId: string,
@@ -2589,6 +2757,7 @@ async function processDeployment(recordPath: string) {
   const artifactKey = String(payload.artifact || '').trim();
   const stackId = Number(payload.stack_id ?? 0);
   const environmentId = Number(payload.environment_id ?? 0);
+  const repository = String(payload.repository || '').trim() || inferRepositoryFromArtifactKey(artifactKey);
   const ref = String(payload.ref || '').trim();
   const logPrefix = `[deploy ${deploymentId}]`;
   const log = (message: string) => {
@@ -2995,16 +3164,64 @@ async function processDeployment(recordPath: string) {
   await waitForProxySql(adminContainerId, stackName, 5 * 60 * 1000);
   await waitForRedisCache(adminContainerId, stackName, 5 * 60 * 1000);
   adminContainerId = await ensureMagentoEnvWrapperWithRetry(adminContainerId, stackName, log);
+  const dbStatus = await runSetupDbStatus(adminContainerId, stackName, log);
+  adminContainerId = dbStatus.containerId;
+  recordMeta.magento_setup_db_status = {
+    exit_code: dbStatus.exitCode,
+    needed: dbStatus.needed,
+    output: dbStatus.output || null,
+    checked_at: new Date().toISOString(),
+  };
+  writeJsonFileBestEffort(recordPath, recordMeta);
+
+  let maintenanceEnabled = false;
   try {
-    const upgradeResult = await runSetupUpgradeWithRetry(adminContainerId, stackName, log);
-    upgradeWarning = upgradeResult.warning;
-    if (upgradeWarning && upgradeResult.message) {
-      console.warn(`${logPrefix} setup:upgrade warning: ${upgradeResult.message}`);
+    if (!dbStatus.needed) {
+      log('setup:upgrade not required; flushing cache only');
+      adminContainerId = await flushMagentoCache(adminContainerId, stackName, log);
+    } else {
+      log('setup:upgrade required; enabling maintenance + pre-upgrade DB backup');
+      adminContainerId = await setMagentoMaintenanceMode(adminContainerId, stackName, 'enable', log);
+      maintenanceEnabled = true;
+
+      const prevArtifactKey = repository ? chooseLastKnownGoodArtifact(environmentId, repository) : null;
+      const prevTag = inferCommitShaFromArtifactKey(prevArtifactKey || '') || 'unknown';
+      const safeRepo = (repository || 'unknown-repo').replace(/[^A-Za-z0-9_.\\/-]/g, '_');
+      const backupObjectKey = `db-backups/env-${environmentId}/${safeRepo}/pre-upgrade/${prevTag}-${deploymentId.slice(0, 8)}.sql.zst.age`;
+
+      await backupDatabasePreUpgrade({
+        dbContainerId,
+        dbName: envVars.MYSQL_DATABASE || 'magento',
+        r2: r2.backups,
+        objectKey: backupObjectKey,
+        log,
+      });
+      recordMeta.pre_upgrade_db_backup = {
+        bucket: r2.backups.bucket,
+        object_key: backupObjectKey,
+        previous_artifact: prevArtifactKey || null,
+        previous_tag: prevTag,
+        created_at: new Date().toISOString(),
+      };
+      writeJsonFileBestEffort(recordPath, recordMeta);
+
+      const upgradeResult = await runSetupUpgradeWithRetry(adminContainerId, stackName, log);
+      upgradeWarning = upgradeResult.warning;
+      if (upgradeWarning && upgradeResult.message) {
+        console.warn(`${logPrefix} setup:upgrade warning: ${upgradeResult.message}`);
+      }
+      adminContainerId = await flushMagentoCache(adminContainerId, stackName, log);
     }
-  } catch (error) {
-    throw error;
   } finally {
     dbContainerId = await setSearchEngine(stackName, dbContainerId, envVars.MYSQL_DATABASE || 'magento', searchEngine);
+    if (maintenanceEnabled) {
+      try {
+        adminContainerId = await setMagentoMaintenanceMode(adminContainerId, stackName, 'disable', log);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        log(`maintenance:disable failed: ${message}`);
+      }
+    }
   }
   if (!upgradeWarning) {
     await setFullPageCacheConfig(
@@ -3023,7 +3240,7 @@ async function processDeployment(recordPath: string) {
   }
   adminContainerId = await ensureMagentoEnvWrapperWithRetry(adminContainerId, stackName, log);
   await enforceMagentoPerformance(adminContainerId, stackName, log);
-  log('magento upgrade complete');
+  log('magento deploy steps complete');
 
   if (envHostname) {
     const smoke = await runPostDeploySmokeChecks(stackName, envHostname, log);
