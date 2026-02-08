@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { getHealthStatus } from './health.js';
 import { handleDeployAddon, handleDeployArtifact, handleDeployKey, handleR2Presign } from './deploy.js';
+import { handleDeployProgress, handleRunbookProgress } from './deploy-progress.js';
 import {
   buildCapacityPayload,
   buildPlannerPayload,
@@ -111,6 +112,16 @@ export const createApp = () => {
     }
     const stream = Readable.toWeb(result.stream) as unknown as ReadableStream;
     return new Response(stream, { status: result.status, headers: result.headers });
+  });
+
+  app.get('/v1/deploy/progress/:deploymentId', async (c) => {
+    const result = await handleDeployProgress(c);
+    return c.json(result.body, result.status as ContentfulStatusCode);
+  });
+
+  app.get('/v1/runbook/progress', async (c) => {
+    const result = await handleRunbookProgress(c);
+    return c.json(result.body, result.status as ContentfulStatusCode);
   });
 
   app.get('/v1/services', async (c) => {

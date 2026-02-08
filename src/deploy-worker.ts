@@ -151,6 +151,177 @@ const FETCH_TIMEOUT_MS = Number(process.env.MZ_FETCH_TIMEOUT_MS || 30000);
 const MIB = 1024 * 1024;
 const GIB = 1024 * 1024 * 1024;
 
+type DeployProgressStepStatus = 'pending' | 'running' | 'ok' | 'failed' | 'skipped';
+type DeployProgressStep = {
+  index: number;
+  id: string;
+  label: string;
+  status: DeployProgressStepStatus;
+  started_at?: string;
+  finished_at?: string;
+  took_ms?: number;
+  detail?: string;
+  error?: string;
+};
+type DeployProgressState = {
+  runbook_id: string;
+  deployment_id: string;
+  environment_id: number;
+  status: 'running' | 'ok' | 'failed';
+  started_at: string;
+  updated_at: string;
+  current?: {
+    index: number;
+    total: number;
+    id: string;
+    label: string;
+    started_at: string;
+    detail?: string;
+  };
+  steps: DeployProgressStep[];
+  last_error?: string;
+};
+
+function writeJsonAtomic(filePath: string, payload: unknown) {
+  try {
+    const dir = path.dirname(filePath);
+    ensureDir(dir);
+    const tmp = `${filePath}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8');
+    fs.renameSync(tmp, filePath);
+  } catch {
+    // best-effort; do not fail deploy on progress logging issues
+  }
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+class DeployProgress {
+  private state: DeployProgressState;
+  private progressPath: string;
+
+  constructor(
+    progressPath: string,
+    runbookId: string,
+    deploymentId: string,
+    environmentId: number,
+    steps: Array<{ id: string; label: string }>
+  ) {
+    this.progressPath = progressPath;
+    const startedAt = nowIso();
+    this.state = {
+      runbook_id: runbookId,
+      deployment_id: deploymentId,
+      environment_id: environmentId,
+      status: 'running',
+      started_at: startedAt,
+      updated_at: startedAt,
+      steps: steps.map((s, idx) => ({
+        index: idx + 1,
+        id: s.id,
+        label: s.label,
+        status: 'pending',
+      })),
+    };
+    this.flush();
+  }
+
+  private flush() {
+    this.state.updated_at = nowIso();
+    writeJsonAtomic(this.progressPath, this.state);
+  }
+
+  private findStep(id: string) {
+    return this.state.steps.find((s) => s.id === id) || null;
+  }
+
+  start(id: string, detail?: string) {
+    const step = this.findStep(id);
+    if (!step) return;
+    if (step.status === 'ok' || step.status === 'failed' || step.status === 'skipped') {
+      return;
+    }
+    step.status = 'running';
+    step.started_at = nowIso();
+    if (detail) step.detail = detail;
+    this.state.current = {
+      index: step.index,
+      total: this.state.steps.length,
+      id: step.id,
+      label: step.label,
+      started_at: step.started_at,
+      detail: step.detail,
+    };
+    this.flush();
+  }
+
+  detail(id: string, detail: string) {
+    const step = this.findStep(id);
+    if (!step || step.status !== 'running') return;
+    step.detail = detail;
+    if (this.state.current && this.state.current.id === id) {
+      this.state.current.detail = detail;
+    }
+    this.flush();
+  }
+
+  ok(id: string, detail?: string) {
+    const step = this.findStep(id);
+    if (!step) return;
+    if (step.status === 'ok') return;
+    if (detail) step.detail = detail;
+    step.status = 'ok';
+    step.finished_at = nowIso();
+    if (step.started_at) {
+      const took = Date.parse(step.finished_at) - Date.parse(step.started_at);
+      if (Number.isFinite(took)) step.took_ms = Math.max(0, took);
+    }
+    if (this.state.current && this.state.current.id === id) {
+      delete this.state.current;
+    }
+    this.flush();
+  }
+
+  skipped(id: string, reason: string) {
+    const step = this.findStep(id);
+    if (!step) return;
+    step.status = 'skipped';
+    step.detail = reason;
+    step.finished_at = nowIso();
+    if (this.state.current && this.state.current.id === id) {
+      delete this.state.current;
+    }
+    this.flush();
+  }
+
+  fail(id: string, error: string) {
+    const step = this.findStep(id);
+    if (step) {
+      step.status = 'failed';
+      step.error = error;
+      step.finished_at = nowIso();
+      if (step.started_at) {
+        const took = Date.parse(step.finished_at) - Date.parse(step.started_at);
+        if (Number.isFinite(took)) step.took_ms = Math.max(0, took);
+      }
+    }
+    this.state.status = 'failed';
+    this.state.last_error = error;
+    if (this.state.current && this.state.current.id === id) {
+      this.state.current.detail = error;
+    }
+    this.flush();
+  }
+
+  doneOk() {
+    this.state.status = 'ok';
+    delete this.state.current;
+    this.flush();
+  }
+}
+
 const RESOURCE_ENV_MAP = [
   { service: 'varnish', prefix: 'MZ_VARNISH' },
   { service: 'nginx', prefix: 'MZ_NGINX' },
@@ -2812,11 +2983,29 @@ async function processDeployment(recordPath: string) {
   const objectKey = String(envRecord?.db_backup_object || DEFAULT_DB_BACKUP_OBJECT).replace(/^\/+/, '');
   const workDir = path.join(DEPLOY_WORK_DIR, deploymentId);
   ensureDir(workDir);
+  const progress = new DeployProgress(
+    path.join(workDir, 'progress.json'),
+    'deploy',
+    deploymentId,
+    environmentId,
+    [
+      { id: 'download_artifact', label: 'Download build artifact' },
+      { id: 'build_images', label: 'Build images' },
+      { id: 'deploy_stack', label: 'Deploy stack' },
+      { id: 'db_prepare', label: 'Prepare database' },
+      { id: 'magento_steps', label: 'Run Magento deploy steps' },
+      { id: 'smoke_checks', label: 'Post-deploy smoke checks' },
+      { id: 'verify', label: 'Verify services' },
+      { id: 'finalize', label: 'Finalize deploy' },
+    ],
+  );
 
   const artifactPath = path.join(workDir, path.basename(artifactKey));
   log('downloading build artifact');
+  progress.start('download_artifact');
   await downloadArtifact(r2.backups, artifactKey, artifactPath);
   log('downloaded build artifact');
+  progress.ok('download_artifact');
 
   const logDir = path.join(workDir, 'logs');
   ensureDir(logDir);
@@ -2959,6 +3148,7 @@ async function processDeployment(recordPath: string) {
   await ensureDockerSecret(mageSecretName, secrets.crypt_key, workDir);
   log('docker secrets ready');
 
+  progress.start('build_images');
   await runCommandLoggedWithRetry(
     'bash',
     [path.join(CLOUD_SWARM_DIR, 'scripts/build-services.sh')],
@@ -2987,6 +3177,7 @@ async function processDeployment(recordPath: string) {
     }
   );
   log('built magento images');
+  progress.ok('build_images');
 
   const cohortServicesPre = await resolveReleaseCohortServices(stackName);
   const cohortSnapshotPre = await captureReleaseCohortSnapshot(cohortServicesPre);
@@ -3001,6 +3192,7 @@ async function processDeployment(recordPath: string) {
   };
   writeJsonFileBestEffort(recordPath, recordMeta);
 
+  progress.start('deploy_stack');
   await runCommandLogged('docker', [
     'stack',
     'deploy',
@@ -3012,6 +3204,7 @@ async function processDeployment(recordPath: string) {
   log('stack deployed');
 
   if (RELEASE_COHORT_GATE_ENABLED) {
+    progress.detail('deploy_stack', 'Waiting for Swarm services to converge');
     const cohortServices = await resolveReleaseCohortServices(stackName);
     if (!cohortServices.length) {
       log('release cohort gate skipped: no cohort services found');
@@ -3058,7 +3251,9 @@ async function processDeployment(recordPath: string) {
       }
     }
   }
+  progress.ok('deploy_stack');
 
+  progress.start('db_prepare');
   let dbContainerId = await waitForContainer(stackName, 'database', 5 * 60 * 1000);
   await waitForDatabase(dbContainerId, 5 * 60 * 1000);
 
@@ -3066,7 +3261,9 @@ async function processDeployment(recordPath: string) {
   const hasTables = await databaseHasTables(dbContainerId, dbName);
   if (hasTables) {
     log('database already populated; skipping restore');
+    progress.detail('db_prepare', 'Database already populated; skipping restore');
   } else {
+    progress.detail('db_prepare', 'Restoring database from provisioning backup');
     const encryptedBackupPath = path.join(workDir, path.basename(objectKey));
     await downloadArtifact(r2.backups, objectKey, encryptedBackupPath);
     await restoreDatabase(dbContainerId, encryptedBackupPath, workDir, dbName);
@@ -3086,6 +3283,7 @@ async function processDeployment(recordPath: string) {
     await setBaseUrls(dbContainerId, envVars.MYSQL_DATABASE || 'magento', envBaseUrl);
     log(`base URLs set to ${envBaseUrl}`);
   }
+  progress.ok('db_prepare');
 
   if (replicaServiceName === 'database-replica') {
     try {
@@ -3164,6 +3362,8 @@ async function processDeployment(recordPath: string) {
   await waitForProxySql(adminContainerId, stackName, 5 * 60 * 1000);
   await waitForRedisCache(adminContainerId, stackName, 5 * 60 * 1000);
   adminContainerId = await ensureMagentoEnvWrapperWithRetry(adminContainerId, stackName, log);
+
+  progress.start('magento_steps');
   const dbStatus = await runSetupDbStatus(adminContainerId, stackName, log);
   adminContainerId = dbStatus.containerId;
   recordMeta.magento_setup_db_status = {
@@ -3178,9 +3378,11 @@ async function processDeployment(recordPath: string) {
   try {
     if (!dbStatus.needed) {
       log('setup:upgrade not required; flushing cache only');
+      progress.detail('magento_steps', 'setup:upgrade not required; flushing cache');
       adminContainerId = await flushMagentoCache(adminContainerId, stackName, log);
     } else {
       log('setup:upgrade required; enabling maintenance + pre-upgrade DB backup');
+      progress.detail('magento_steps', 'setup:upgrade required; enabling maintenance + DB backup');
       adminContainerId = await setMagentoMaintenanceMode(adminContainerId, stackName, 'enable', log);
       maintenanceEnabled = true;
 
@@ -3210,12 +3412,14 @@ async function processDeployment(recordPath: string) {
       if (upgradeWarning && upgradeResult.message) {
         console.warn(`${logPrefix} setup:upgrade warning: ${upgradeResult.message}`);
       }
+      progress.detail('magento_steps', 'setup:upgrade complete; flushing cache');
       adminContainerId = await flushMagentoCache(adminContainerId, stackName, log);
     }
   } finally {
     dbContainerId = await setSearchEngine(stackName, dbContainerId, envVars.MYSQL_DATABASE || 'magento', searchEngine);
     if (maintenanceEnabled) {
       try {
+        progress.detail('magento_steps', 'Disabling maintenance mode');
         adminContainerId = await setMagentoMaintenanceMode(adminContainerId, stackName, 'disable', log);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -3241,8 +3445,10 @@ async function processDeployment(recordPath: string) {
   adminContainerId = await ensureMagentoEnvWrapperWithRetry(adminContainerId, stackName, log);
   await enforceMagentoPerformance(adminContainerId, stackName, log);
   log('magento deploy steps complete');
+  progress.ok('magento_steps');
 
   if (envHostname) {
+    progress.start('smoke_checks');
     const smoke = await runPostDeploySmokeChecks(stackName, envHostname, log);
     if (!smoke.ok) {
       const recordState = record as unknown as Record<string, unknown>;
@@ -3262,6 +3468,7 @@ async function processDeployment(recordPath: string) {
 
       if (DEPLOY_SMOKE_AUTO_HEAL_ENABLED && DEPLOY_SMOKE_AUTO_HEAL_ROUNDS > 0) {
         log('post-deploy smoke checks failed; attempting auto-heal');
+        progress.detail('smoke_checks', 'Smoke checks failed; attempting auto-heal');
         const healed = await autoHealPostDeploySmokeFailure({
           stackName,
           envHostname,
@@ -3317,12 +3524,15 @@ async function processDeployment(recordPath: string) {
         throw new Error(`Post-deploy smoke checks failed: ${smoke.summary}`);
       }
     }
+    progress.ok('smoke_checks');
   } else {
     log('post-deploy smoke checks skipped: no environment hostname available');
+    progress.skipped('smoke_checks', 'No environment hostname available');
   }
 
   // Detect silent Swarm rollbacks / paused updates (otherwise smoke checks can pass on old tasks).
   log('verifying deployed service images + update states');
+  progress.start('verify');
   const recordState = record as unknown as Record<string, unknown>;
   const verifyTargets = [
     { service: `${stackName}_nginx`, expected_tag: mageVersion },
@@ -3367,9 +3577,12 @@ async function processDeployment(recordPath: string) {
   };
   writeJsonFileBestEffort(recordPath, recordState);
   if (failures.length) {
+    progress.fail('verify', failures.join('; '));
     throw new Error(`Deploy verification failed: ${failures.join('; ')}.`);
   }
+  progress.ok('verify');
 
+  progress.start('finalize');
   await reportDeploymentStatus(baseUrl, nodeId, nodeSecret, {
     deployment_id: deploymentId,
     environment_id: environmentId,
@@ -3391,6 +3604,8 @@ async function processDeployment(recordPath: string) {
     const message = error instanceof Error ? error.message : String(error);
     log(`cleanup skipped: ${message}`);
   }
+  progress.ok('finalize');
+  progress.doneOk();
 }
 
 async function cleanupFailedArtifact(record: Record<string, any>) {
