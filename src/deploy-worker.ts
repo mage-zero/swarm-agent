@@ -216,6 +216,24 @@ function inferRepositoryFromArtifactKey(artifactKey: string) {
   return '';
 }
 
+function inferCommitShaFromArtifactKey(artifactKey: string): string {
+  if (!artifactKey) return '';
+
+  let key = artifactKey.trim();
+  try {
+    if (key.startsWith('http://') || key.startsWith('https://')) {
+      const url = new URL(key);
+      key = url.pathname.replace(/^\/+/, '');
+    }
+  } catch {
+    // ignore URL parse failures; treat as object key
+  }
+
+  key = key.replace(/^\/+/, '');
+  const match = key.match(/-([0-9a-f]{7,64})\.tar(?:\.zst|\.gz|\.bz2|\.xz)?$/i);
+  return match ? match[1] : '';
+}
+
 function readDeploymentHistory(): DeployHistory {
   const candidates = [DEPLOY_HISTORY_FILE, LEGACY_DEPLOY_HISTORY_FILE];
   for (const file of candidates) {
@@ -2543,7 +2561,7 @@ async function reportDeploymentStatus(
   baseUrl: string,
   nodeId: string,
   nodeSecret: string,
-  payload: { deployment_id: string; environment_id: number; status: string; message?: string }
+  payload: { deployment_id: string; environment_id: number; status: string; message?: string; deployed_commit_sha?: string }
 ) {
   const body = JSON.stringify(payload);
   const url = new URL('/v1/deploy/status', baseUrl);
@@ -3139,6 +3157,7 @@ async function processDeployment(recordPath: string) {
     deployment_id: deploymentId,
     environment_id: environmentId,
     status: 'active',
+    deployed_commit_sha: inferCommitShaFromArtifactKey(artifactKey) || undefined,
   });
 
   try {
