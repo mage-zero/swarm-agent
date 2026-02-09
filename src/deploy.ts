@@ -2,7 +2,6 @@ import crypto from 'crypto';
 import fs from 'fs';
 import { spawn, spawnSync } from 'child_process';
 import { isSwarmManager, readConfig } from './status.js';
-import { presignS3Url } from './r2-presign.js';
 
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/deployments';
@@ -10,11 +9,8 @@ const ADDON_QUEUE_DIR = process.env.MZ_ADDON_QUEUE_DIR || '/opt/mage-zero/addons
 const DEPLOY_SCRIPT = process.env.MZ_DEPLOY_SCRIPT || '';
 const CLOUD_SWARM_KEY_PATH = process.env.MZ_CLOUD_SWARM_KEY_PATH || '/opt/mage-zero/keys/cloud-swarm-deploy';
 const CLOUD_SWARM_BOOTSTRAP = process.env.MZ_CLOUD_SWARM_BOOTSTRAP || '1';
-const R2_CRED_DIR = process.env.MZ_R2_CRED_DIR || '/opt/mage-zero/r2';
 const MAX_SKEW_SECONDS = 300;
 const NONCE_TTL_MS = 10 * 60 * 1000;
-const DEFAULT_PRESIGN_EXPIRES = 1800;
-const MAX_PRESIGN_EXPIRES = 3600;
 
 const nonceCache = new Map<string, number>();
 
@@ -36,35 +32,11 @@ type AddonDeployPayload = {
   image_tag?: string;
 };
 
-type R2Credentials = {
-  accessKeyId: string;
-  secretAccessKey: string;
-  bucket: string;
-  endpoint: string;
-  region?: string;
-};
-
-type R2CredFile = {
-  environment_id?: number;
-  backups?: R2Credentials;
-  media?: R2Credentials;
-  updated_at?: string;
-};
-
 function readNodeFile(name: string) {
   try {
     return fs.readFileSync(`${NODE_DIR}/${name}`, 'utf8').trim();
   } catch {
     return '';
-  }
-}
-
-function readR2CredFile(environmentId: number): R2CredFile | null {
-  try {
-    const raw = fs.readFileSync(`${R2_CRED_DIR}/env-${environmentId}.json`, 'utf8');
-    return JSON.parse(raw) as R2CredFile;
-  } catch {
-    return null;
   }
 }
 
@@ -248,74 +220,6 @@ export async function handleDeployKey(c: { req: { raw: Request; header: (name: s
   return {
     status: 200,
     body: { public_key: publicKey, key_path: keyPath },
-  } as const;
-}
-
-export async function handleR2Presign(c: { req: { raw: Request; header: (name: string) => string | undefined } }) {
-  const validated = await validateRequest(c);
-  if ('status' in validated) {
-    return validated;
-  }
-
-  if (!(await isSwarmManager())) {
-    return { status: 403, body: { error: 'not_manager' } } as const;
-  }
-
-  const body = await c.req.raw.json().catch(() => null) as {
-    environment_id?: number;
-    bucket?: 'backups' | 'media';
-    object_key?: string;
-    method?: 'PUT' | 'GET';
-    expires_in?: number;
-  } | null;
-
-  const environmentId = Number(body?.environment_id ?? 0);
-  if (!environmentId) {
-    return { status: 400, body: { error: 'missing_environment_id' } } as const;
-  }
-
-  const objectKey = String(body?.object_key ?? '').replace(/^\/+/, '');
-  if (!objectKey) {
-    return { status: 400, body: { error: 'missing_object_key' } } as const;
-  }
-
-  const bucketKind = body?.bucket === 'media' ? 'media' : 'backups';
-  const method = body?.method === 'GET' ? 'GET' : 'PUT';
-  const expiresIn = Math.min(
-    Math.max(Number(body?.expires_in ?? DEFAULT_PRESIGN_EXPIRES) || DEFAULT_PRESIGN_EXPIRES, 60),
-    MAX_PRESIGN_EXPIRES
-  );
-
-  const file = readR2CredFile(environmentId);
-  if (!file) {
-    return { status: 404, body: { error: 'missing_r2_credentials' } } as const;
-  }
-
-  const creds = bucketKind === 'media' ? file.media : file.backups;
-  if (!creds?.accessKeyId || !creds.secretAccessKey || !creds.bucket || !creds.endpoint) {
-    return { status: 404, body: { error: 'incomplete_r2_credentials' } } as const;
-  }
-
-  const url = presignS3Url({
-    method,
-    endpoint: creds.endpoint,
-    bucket: creds.bucket,
-    key: objectKey,
-    accessKeyId: creds.accessKeyId,
-    secretAccessKey: creds.secretAccessKey,
-    region: creds.region || 'auto',
-    expiresIn,
-  });
-
-  return {
-    status: 200,
-    body: {
-      url,
-      method,
-      expires_in: expiresIn,
-      bucket: creds.bucket,
-      object_key: objectKey,
-    },
   } as const;
 }
 

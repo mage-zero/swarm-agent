@@ -1,8 +1,8 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { buildSignature } from './node-hmac.js';
-import { presignS3Url } from './r2-presign.js';
+import { buildNodeHeaders, buildSignature } from './node-hmac.js';
+import { readConfig } from './status.js';
 import { getDeployPauseFilePath, isDeployPaused, readDeployPausedAt, setDeployPaused } from './deploy-pause.js';
 import { runCommand, runCommandToFile } from './exec.js';
 import {
@@ -31,7 +31,6 @@ const DEPLOY_META_DIR = path.join(DEPLOY_QUEUE_DIR, 'meta');
 const DEPLOY_HISTORY_FILE = process.env.MZ_DEPLOY_HISTORY_FILE || path.join(DEPLOY_META_DIR, 'history.json');
 const DEPLOY_RECORD_FILENAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i;
 const DEPLOY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const R2_CRED_DIR = process.env.MZ_R2_CRED_DIR || '/opt/mage-zero/r2';
 const STACK_MASTER_PUBLIC_KEY_PATH = process.env.MZ_STACK_MASTER_PUBLIC_KEY_PATH || '/etc/magezero/stack_master_ssh.pub';
 
 type RunbookDefinition = {
@@ -54,17 +53,17 @@ type RunbookResult = {
   };
 };
 
-type R2Credentials = {
-  accessKeyId: string;
-  secretAccessKey: string;
-  bucket: string;
-  endpoint: string;
-  region?: string;
+type R2PresignContext = {
+  baseUrl: string;
+  nodeId: string;
+  nodeSecret: string;
+  stackId: number;
+  environmentId: number;
 };
 
-type R2CredFile = {
-  backups?: R2Credentials;
-  media?: R2Credentials;
+type EnvironmentRecord = {
+  environment_id?: number;
+  db_backup_bucket?: string;
 };
 
 const RUNBOOKS: RunbookDefinition[] = [
@@ -280,15 +279,6 @@ const RUNBOOKS: RunbookDefinition[] = [
   },
 ];
 
-function readR2CredFile(environmentId: number): R2CredFile | null {
-  try {
-    const raw = fs.readFileSync(path.join(R2_CRED_DIR, `env-${environmentId}.json`), 'utf8');
-    return JSON.parse(raw) as R2CredFile;
-  } catch {
-    return null;
-  }
-}
-
 function resolveStackMasterPublicKeyPath(): string | null {
   const candidates = [
     STACK_MASTER_PUBLIC_KEY_PATH,
@@ -307,18 +297,9 @@ function formatTimestamp(date = new Date()): string {
   return `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}_${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}`;
 }
 
-async function uploadArtifact(creds: R2Credentials, objectKey: string, sourcePath: string): Promise<void> {
+async function uploadArtifact(r2: R2PresignContext, objectKey: string, sourcePath: string): Promise<void> {
   const normalizedKey = objectKey.replace(/^\/+/, '');
-  const url = presignS3Url({
-    method: 'PUT',
-    endpoint: creds.endpoint,
-    bucket: creds.bucket,
-    key: normalizedKey,
-    accessKeyId: creds.accessKeyId,
-    secretAccessKey: creds.secretAccessKey,
-    region: creds.region || 'auto',
-    expiresIn: 3600,
-  });
+  const url = await presignR2ObjectUrl(r2, 'PUT', normalizedKey, 3600);
   const result = await runCommand('curl', ['-fsSL', '-X', 'PUT', '-T', sourcePath, url], 120_000);
   if (result.code !== 0) {
     const detail = (result.stderr || result.stdout || '').trim();
@@ -416,6 +397,89 @@ async function validateNodeRequest(request: Request): Promise<boolean> {
   const body = await request.clone().text();
   const expected = buildSignature(request.method, pathName, query, timestamp, nonce, body, nodeSecret);
   return timingSafeEquals(expected, signature);
+}
+
+function resolveR2Context(environmentId: number): R2PresignContext | null {
+  const config = readConfig();
+  const baseUrl = String((config as Record<string, unknown>).mz_control_base_url || process.env.MZ_CONTROL_BASE_URL || '').trim();
+  const stackId = Number((config as Record<string, unknown>).stack_id ?? 0) || 0;
+  const nodeId = readNodeFile('node-id');
+  const nodeSecret = readNodeFile('node-secret');
+  if (!baseUrl || !stackId || !nodeId || !nodeSecret) {
+    return null;
+  }
+  return { baseUrl, nodeId, nodeSecret, stackId, environmentId };
+}
+
+async function fetchJson(baseUrl: string, pathName: string, method: string, body: string | null, nodeId: string, nodeSecret: string, timeoutMs = 30_000) {
+  const url = new URL(pathName, baseUrl);
+  const query = url.search ? url.search.slice(1) : '';
+  const payload = body ?? '';
+  const headers = buildNodeHeaders(method, url.pathname, query, payload, nodeId, nodeSecret);
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  let response: Response;
+  try {
+    response = await fetch(url.toString(), {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        ...headers,
+      },
+      body: payload || undefined,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`mz-control request failed: ${response.status} - ${errorBody}`);
+  }
+  return response.json() as Promise<any>;
+}
+
+async function fetchEnvironmentRecord(r2: R2PresignContext): Promise<EnvironmentRecord | null> {
+  const payload = await fetchJson(
+    r2.baseUrl,
+    `/v1/agent/stack/${r2.stackId}/environments`,
+    'GET',
+    null,
+    r2.nodeId,
+    r2.nodeSecret,
+  );
+  const environments = Array.isArray(payload?.environments) ? payload.environments as EnvironmentRecord[] : [];
+  return environments.find((env) => Number(env.environment_id ?? 0) === r2.environmentId) || null;
+}
+
+async function presignR2ObjectUrl(
+  r2: R2PresignContext,
+  method: 'PUT' | 'GET' | 'DELETE',
+  objectKey: string,
+  expiresIn: number,
+) {
+  const payload = JSON.stringify({
+    bucket: 'backups',
+    method,
+    object_key: objectKey,
+    expires_in: expiresIn,
+  });
+  const response = await fetchJson(
+    r2.baseUrl,
+    `/v1/agent/environment/${r2.environmentId}/r2-presign`,
+    'POST',
+    payload,
+    r2.nodeId,
+    r2.nodeSecret,
+  );
+  const url = String((response as any)?.url || '').trim();
+  if (!url) {
+    throw new Error('mz-control r2-presign did not return url');
+  }
+  return url;
 }
 
 function escapeForShellDoubleQuotes(value: string) {
@@ -1713,15 +1777,21 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
     };
   }
 
-  const r2 = readR2CredFile(environmentId);
-  if (!r2?.backups) {
+  const r2 = resolveR2Context(environmentId);
+  if (!r2) {
     return {
       runbook_id: runbookId,
       status: 'failed',
-      summary: 'Missing R2 backups credentials.',
-      observations: [`Expected file: ${path.join(R2_CRED_DIR, `env-${environmentId}.json`)}`],
+      summary: 'Missing mz-control connection details for R2 presign.',
+      observations: [
+        `Expected: ${path.join(NODE_DIR, 'node-id')}`,
+        `Expected: ${path.join(NODE_DIR, 'node-secret')}`,
+        `Expected: ${path.join(NODE_DIR, 'config.json')} with stack_id + mz_control_base_url (or env var MZ_CONTROL_BASE_URL)`,
+      ],
     };
   }
+  const envRecord = await fetchEnvironmentRecord(r2).catch(() => null);
+  const backupBucket = String(envRecord?.db_backup_bucket || '').trim();
 
   const publicKeyPath = resolveStackMasterPublicKeyPath();
   if (!publicKeyPath) {
@@ -1851,9 +1921,9 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
       throw new Error(output ? `age encryption failed: ${output}` : 'age encryption failed.');
     }
 
-    await uploadArtifact(r2.backups, backupObject, agePath);
+    await uploadArtifact(r2, backupObject, agePath);
     uploaded = true;
-    actions.push(`Uploaded backup to ${r2.backups.bucket}/${backupObject}`);
+    actions.push(backupBucket ? `Uploaded backup to ${backupBucket}/${backupObject}` : `Uploaded backup to ${backupObject}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     observations.push(message);
@@ -1866,7 +1936,7 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
       data: {
         method,
         db: { name: dbName, dump_source: dumpSource || null },
-        backup_bucket: r2.backups.bucket,
+        backup_bucket: backupBucket,
         backup_object: backupObject,
       },
     };
@@ -1907,7 +1977,7 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
     data: {
       method,
       db: { name: dbName, dump_source: dumpSource || null },
-      backup_bucket: r2.backups.bucket,
+      backup_bucket: backupBucket,
       backup_object: backupObject,
     },
   };
@@ -2196,6 +2266,8 @@ async function runDbReplicaEnable(environmentId: number): Promise<RunbookResult>
       `i=0; until mariadb -uroot -p"$ROOT_PASS" -h ${primaryHost} -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 30 ]; then echo "primary not ready" >&2; exit 1; fi; sleep 1; done`,
       `i=0; until mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 30 ]; then echo "replica not ready" >&2; exit 1; fi; sleep 1; done`,
       `mariadb -uroot -p"$ROOT_PASS" -h ${primaryHost} -e "${escapeForShellDoubleQuotes(ensureReplicaUserSql)}"`,
+      // Grant SLAVE MONITOR so ProxySQL monitor can run SHOW SLAVE STATUS to check replication lag.
+      `mariadb -uroot -p"$ROOT_PASS" -h ${primaryHost} -e "GRANT SLAVE MONITOR ON *.* TO 'magento'@'%';"`,
       `mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "${escapeForShellDoubleQuotes(changeMasterSql)}"`,
       `mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "SET GLOBAL read_only=1;" || true`,
       'echo "CONFIGURED=1"',
@@ -2342,6 +2414,8 @@ async function runDbReplicaRepair(environmentId: number): Promise<RunbookResult>
     `i=0; until mariadb -uroot -p"$ROOT_PASS" -h ${primaryHost} -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 30 ]; then echo "primary not ready" >&2; exit 1; fi; sleep 1; done`,
     `i=0; until mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 30 ]; then echo "replica not ready" >&2; exit 1; fi; sleep 1; done`,
     `mariadb -uroot -p"$ROOT_PASS" -h ${primaryHost} -e "${escapeForShellDoubleQuotes(ensureReplicaUserSql)}"`,
+    // Grant SLAVE MONITOR so ProxySQL monitor can run SHOW SLAVE STATUS to check replication lag.
+    `mariadb -uroot -p"$ROOT_PASS" -h ${primaryHost} -e "GRANT SLAVE MONITOR ON *.* TO 'magento'@'%';"`,
     `mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "STOP SLAVE; RESET SLAVE ALL;" || true`,
     `mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "${escapeForShellDoubleQuotes(changeMasterSql)}"`,
     `mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "SET GLOBAL read_only=1;" || true`,
@@ -2547,6 +2621,9 @@ async function runDbReplicaReseed(environmentId: number): Promise<RunbookResult>
     `mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} -e "STOP SLAVE; RESET SLAVE ALL;" || true`,
     // Ensure replication user exists on primary.
     `mariadb -uroot -p"$ROOT_PASS" -h ${primaryHost} -e "${escapeForShellDoubleQuotes(ensureReplicaUserSql)}"`,
+    // Grant SLAVE MONITOR so ProxySQL monitor can run SHOW SLAVE STATUS to check replication lag.
+    // Granted on primary so it's captured in the --all-databases dump below.
+    `mariadb -uroot -p"$ROOT_PASS" -h ${primaryHost} -e "GRANT SLAVE MONITOR ON *.* TO 'magento'@'%';"`,
     // Import snapshot (no binlogging) so replica GTID sequence does not jump ahead of primary.
     `mariadb-dump -uroot -p"$ROOT_PASS" -h ${primaryHost} --single-transaction --quick --routines --events --triggers --hex-blob --gtid --master-data=1 --all-databases | mariadb -uroot -p"$ROOT_PASS" -h ${replicaHost} --init-command="SET SESSION sql_log_bin=0;"`,
     // Configure and start replication.
@@ -3099,19 +3176,24 @@ async function runEnvironmentTeardown(environmentId: number, input: Record<strin
     };
   }
 
-  const r2 = readR2CredFile(environmentId);
-  if (!r2?.backups) {
+  const r2 = resolveR2Context(environmentId);
+  if (!r2) {
     return {
       runbook_id: runbookId,
       status: 'failed',
-      summary: 'Missing R2 backups credentials.',
-      observations: [`Expected file: ${path.join(R2_CRED_DIR, `env-${environmentId}.json`)}`],
+      summary: 'Missing mz-control connection details for R2 presign.',
+      observations: [
+        `Expected: ${path.join(NODE_DIR, 'node-id')}`,
+        `Expected: ${path.join(NODE_DIR, 'node-secret')}`,
+        `Expected: ${path.join(NODE_DIR, 'config.json')} with stack_id + mz_control_base_url (or env var MZ_CONTROL_BASE_URL)`,
+      ],
     };
   }
+  const envRecord = await fetchEnvironmentRecord(r2).catch(() => null);
+  const backupBucket = String(envRecord?.db_backup_bucket || '').trim();
 
   const backupObjectRaw = typeof input.backup_object === 'string' ? input.backup_object.trim() : '';
   const backupObject = (backupObjectRaw || 'provisioning-database.sql.zst.age').replace(/^\/+/, '');
-  const backupBucket = r2.backups.bucket;
 
   const publicKeyPath = resolveStackMasterPublicKeyPath();
   if (!publicKeyPath) {
@@ -3181,8 +3263,8 @@ async function runEnvironmentTeardown(environmentId: number, input: Record<strin
       throw new Error(output ? `age encryption failed: ${output}` : 'age encryption failed.');
     }
 
-    await uploadArtifact(r2.backups, backupObject, agePath);
-    actions.push(`Uploaded backup to ${backupBucket}/${backupObject}`);
+    await uploadArtifact(r2, backupObject, agePath);
+    actions.push(backupBucket ? `Uploaded backup to ${backupBucket}/${backupObject}` : `Uploaded backup to ${backupObject}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const maintenanceOff = await runMagentoMaintenance(environmentId, 'disable');

@@ -4,7 +4,6 @@ import path from 'path';
 import readline from 'readline';
 import { spawn } from 'child_process';
 import { isDeployPaused } from './deploy-pause.js';
-import { presignS3ListObjectsV2Url, presignS3Url } from './r2-presign.js';
 import { buildCapacityPayload, buildPlannerPayload, isSwarmManager, readConfig } from './status.js';
 import { enforceCommandPolicy } from './command-policy.js';
 import { parseListObjectsV2Xml } from './r2-list.js';
@@ -24,19 +23,11 @@ type DeploymentRecord = {
   payload?: DeployPayload;
 };
 
-type R2Credentials = {
-  accessKeyId: string;
-  secretAccessKey: string;
-  bucket: string;
-  endpoint: string;
-  region?: string;
-};
-
-type R2CredFile = {
-  environment_id?: number;
-  backups?: R2Credentials;
-  media?: R2Credentials;
-  updated_at?: string;
+type R2PresignContext = {
+  baseUrl: string;
+  nodeId: string;
+  nodeSecret: string;
+  environmentId: number;
 };
 
 type EnvironmentSecrets = {
@@ -141,7 +132,6 @@ const SHUTDOWN_GRACE_MS = Number(process.env.MZ_SHUTDOWN_GRACE_MS || 10 * 60 * 1
 const CLOUD_SWARM_DIR = process.env.MZ_CLOUD_SWARM_DIR || '/opt/mage-zero/cloud-swarm';
 const CLOUD_SWARM_REPO = process.env.MZ_CLOUD_SWARM_REPO || 'git@github.com:mage-zero/cloud-swarm.git';
 const CLOUD_SWARM_KEY_PATH = process.env.MZ_CLOUD_SWARM_KEY_PATH || '/opt/mage-zero/keys/cloud-swarm-deploy';
-const R2_CRED_DIR = process.env.MZ_R2_CRED_DIR || '/opt/mage-zero/r2';
 const STACK_MASTER_KEY_PATH = process.env.MZ_STACK_MASTER_KEY_PATH || '/etc/magezero/stack_master_ssh';
 const STACK_MASTER_PUBLIC_KEY_PATH = process.env.MZ_STACK_MASTER_PUBLIC_KEY_PATH || '/etc/magezero/stack_master_ssh.pub';
 const DEFAULT_DB_BACKUP_OBJECT = process.env.MZ_DB_BACKUP_OBJECT || 'provisioning-database.sql.zst.age';
@@ -635,18 +625,9 @@ function cleanupFailedWorkDirs() {
   }
 }
 
-async function deleteR2Object(creds: R2Credentials, objectKey: string) {
+async function deleteR2Object(r2: R2PresignContext, objectKey: string) {
   const normalizedKey = objectKey.replace(/^\/+/, '');
-  const url = presignS3Url({
-    method: 'DELETE',
-    endpoint: creds.endpoint,
-    bucket: creds.bucket,
-    key: normalizedKey,
-    accessKeyId: creds.accessKeyId,
-    secretAccessKey: creds.secretAccessKey,
-    region: creds.region || 'auto',
-    expiresIn: 3600,
-  });
+  const url = await presignR2ObjectUrl(r2, 'DELETE', normalizedKey, 3600);
   const { stdout } = await runCommandCapture('curl', ['-sS', '-o', '/dev/null', '-w', '%{http_code}', '-X', 'DELETE', url]);
   const code = Number(String(stdout || '').trim());
   if (code >= 200 && code < 300) {
@@ -659,24 +640,14 @@ async function deleteR2Object(creds: R2Credentials, objectKey: string) {
   throw new Error(`R2 delete failed: http ${code || 'unknown'} (${normalizedKey})`);
 }
 
-async function listR2ObjectsV2(creds: R2Credentials, prefix: string): Promise<Array<{ key: string; lastModified: string }>> {
+async function listR2ObjectsV2(r2: R2PresignContext, prefix: string): Promise<Array<{ key: string; lastModified: string }>> {
   const normalizedPrefix = prefix.replace(/^\/+/, '');
   const objects: Array<{ key: string; lastModified: string }> = [];
   let token: string | undefined;
   let guard = 0;
   while (guard < 50) {
     guard += 1;
-    const url = presignS3ListObjectsV2Url({
-      endpoint: creds.endpoint,
-      bucket: creds.bucket,
-      prefix: normalizedPrefix,
-      continuationToken: token,
-      maxKeys: 1000,
-      accessKeyId: creds.accessKeyId,
-      secretAccessKey: creds.secretAccessKey,
-      region: creds.region || 'auto',
-      expiresIn: 3600,
-    });
+    const url = await presignR2ListUrl(r2, normalizedPrefix, token, 1000, 3600);
 
     const marker = 'MZ_HTTP_CODE:';
     const { stdout } = await runCommandCapture('curl', ['-sS', '-w', `\\n${marker}%{http_code}`, url]);
@@ -703,7 +674,7 @@ async function listR2ObjectsV2(creds: R2Credentials, prefix: string): Promise<Ar
 }
 
 async function enforceBuildArtifactRetentionInR2(params: {
-  creds: R2Credentials;
+  r2: R2PresignContext;
   artifactKey: string;
   keepArtifacts: string[];
   retainCount: number;
@@ -716,7 +687,7 @@ async function enforceBuildArtifactRetentionInR2(params: {
   const prefix = `${path.posix.dirname(normalizedArtifactKey)}/`;
   let listed: Array<{ key: string; lastModified: string }> = [];
   try {
-    listed = await listR2ObjectsV2(params.creds, prefix);
+    listed = await listR2ObjectsV2(params.r2, prefix);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`cleanup: r2 list failed for ${prefix}: ${message}`);
@@ -765,7 +736,7 @@ async function enforceBuildArtifactRetentionInR2(params: {
   console.warn(`cleanup: r2 builds retention prefix=${prefix} keep=${keepSet.size} delete=${deletions.length}`);
   for (const key of deletions) {
     try {
-      await deleteR2Object(params.creds, key);
+      await deleteR2Object(params.r2, key);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`cleanup: r2 delete failed for ${key}: ${message}`);
@@ -891,7 +862,7 @@ async function cleanupDeploymentResources(params: {
   artifactKey: string;
   mageVersion: string;
   stackName: string;
-  r2: R2CredFile;
+  r2: R2PresignContext;
 }) {
   const history = readDeploymentHistory();
   const normalizedArtifactKey = params.artifactKey.replace(/^\/+/, '');
@@ -912,25 +883,23 @@ async function cleanupDeploymentResources(params: {
   const keepArtifactBases = new Set(keepArtifacts.map((item) => path.basename(item)));
   await cleanupWorkDirs(keepArtifactBases);
 
-  if (params.r2?.backups) {
-    for (const objectKey of removedArtifacts) {
-      try {
-        await deleteR2Object(params.r2.backups, objectKey);
-      } catch {
-        // ignore cleanup errors
-      }
+  for (const objectKey of removedArtifacts) {
+    try {
+      await deleteR2Object(params.r2, objectKey);
+    } catch {
+      // ignore cleanup errors
     }
-
-    // Builds uploaded to R2 under `builds/<owner>/<repo>/` can accumulate if history is lost or
-    // uploads happen without deploy completion. After a successful deploy, enforce a hard cap of
-    // `DEPLOY_RETAIN_COUNT` build artifacts in the build prefix (current + previous by default).
-    await enforceBuildArtifactRetentionInR2({
-      creds: params.r2.backups,
-      artifactKey: normalizedArtifactKey,
-      keepArtifacts,
-      retainCount: DEPLOY_RETAIN_COUNT,
-    });
   }
+
+  // Builds uploaded to R2 under `builds/<owner>/<repo>/` can accumulate if history is lost or
+  // uploads happen without deploy completion. After a successful deploy, enforce a hard cap of
+  // `DEPLOY_RETAIN_COUNT` build artifacts in the build prefix (current + previous by default).
+  await enforceBuildArtifactRetentionInR2({
+    r2: params.r2,
+    artifactKey: normalizedArtifactKey,
+    keepArtifacts,
+    retainCount: DEPLOY_RETAIN_COUNT,
+  });
 
   const keepImageTagSet = new Set(keepImageTags);
   const removedImageTagSet = new Set(removedImageTags);
@@ -1376,6 +1345,61 @@ const RESOURCE_ENV_KEYS = RESOURCE_ENV_MAP.flatMap((entry) => [
   `${entry.prefix}_RESERVE_MEMORY`,
 ]);
 
+/**
+ * Migrate a global (non-env-scoped) secret to a per-environment secret by
+ * reading the current value from a running container.  Returns true if the
+ * per-env secret already exists or was successfully created.  Returns false
+ * when no running container is available (fresh deploy – caller should fall
+ * through to ensureDockerSecret which generates a new random value).
+ */
+async function migrateGlobalSecret(
+  stackName: string,
+  containerService: string,
+  secretFileName: string,
+  newSecretName: string,
+  workDir: string,
+): Promise<boolean> {
+  try {
+    await runCommandCapture('docker', ['secret', 'inspect', newSecretName]);
+    return true; // already exists
+  } catch {
+    // not yet created
+  }
+
+  // Try to read the current value from a running container.
+  let containerId: string | undefined;
+  try {
+    const { stdout } = await runCommandCapture('docker', [
+      'ps', '--filter', `name=${stackName}_${containerService}`, '--format', '{{.ID}}',
+    ]);
+    containerId = stdout.trim().split('\n')[0] || undefined;
+  } catch {
+    // no running container
+  }
+  if (!containerId) return false;
+
+  let value: string;
+  try {
+    const { stdout } = await runCommandCapture('docker', [
+      'exec', containerId, 'cat', `/run/secrets/${secretFileName}`,
+    ]);
+    value = stdout.trim();
+  } catch {
+    return false;
+  }
+  if (!value) return false;
+
+  ensureDir(workDir);
+  const secretPath = path.join(workDir, `${newSecretName}.secret`);
+  fs.writeFileSync(secretPath, value, { mode: 0o600 });
+  try {
+    await runCommand('docker', ['secret', 'create', newSecretName, secretPath]);
+  } finally {
+    try { fs.unlinkSync(secretPath); } catch { /* ignore */ }
+  }
+  return true;
+}
+
 async function ensureDockerSecret(secretName: string, value: string, workDir: string) {
   if (!value) {
     throw new Error(`Missing secret value for ${secretName}`);
@@ -1398,15 +1422,6 @@ async function ensureDockerSecret(secretName: string, value: string, workDir: st
     } catch {
       // ignore cleanup failure
     }
-  }
-}
-
-function readR2CredFile(environmentId: number): R2CredFile | null {
-  try {
-    const raw = fs.readFileSync(path.join(R2_CRED_DIR, `env-${environmentId}.json`), 'utf8');
-    return JSON.parse(raw) as R2CredFile;
-  } catch {
-    return null;
   }
 }
 
@@ -1466,6 +1481,63 @@ async function fetchJson(baseUrl: string, pathName: string, method: string, body
   }
 
   return response.json() as Promise<any>;
+}
+
+async function presignR2ObjectUrl(
+  r2: R2PresignContext,
+  method: 'PUT' | 'GET' | 'DELETE',
+  objectKey: string,
+  expiresIn: number,
+) {
+  const payload = JSON.stringify({
+    bucket: 'backups',
+    method,
+    object_key: objectKey,
+    expires_in: expiresIn,
+  });
+  const response = await fetchJson(
+    r2.baseUrl,
+    `/v1/agent/environment/${r2.environmentId}/r2-presign`,
+    'POST',
+    payload,
+    r2.nodeId,
+    r2.nodeSecret,
+  );
+  const url = String((response as any)?.url || '').trim();
+  if (!url) {
+    throw new Error('mz-control r2-presign did not return url');
+  }
+  return url;
+}
+
+async function presignR2ListUrl(
+  r2: R2PresignContext,
+  prefix: string,
+  continuationToken: string | undefined,
+  maxKeys: number,
+  expiresIn: number,
+) {
+  const payload = JSON.stringify({
+    bucket: 'backups',
+    method: 'LIST',
+    prefix,
+    max_keys: maxKeys,
+    ...(continuationToken ? { continuation_token: continuationToken } : {}),
+    expires_in: expiresIn,
+  });
+  const response = await fetchJson(
+    r2.baseUrl,
+    `/v1/agent/environment/${r2.environmentId}/r2-presign`,
+    'POST',
+    payload,
+    r2.nodeId,
+    r2.nodeSecret,
+  );
+  const url = String((response as any)?.url || '').trim();
+  if (!url) {
+    throw new Error('mz-control r2-presign did not return url');
+  }
+  return url;
 }
 
 async function fetchEnvironmentRecord(stackId: number, environmentId: number, baseUrl: string, nodeId: string, nodeSecret: string) {
@@ -1571,32 +1643,22 @@ async function ensureCloudSwarmRepo() {
   await runCommand('git', ['-C', CLOUD_SWARM_DIR, 'checkout', '-B', 'main', 'origin/main', '--force'], { env: gitEnv });
 }
 
-async function downloadArtifact(creds: R2Credentials, objectKey: string, targetPath: string) {
-  const url = presignS3Url({
-    method: 'GET',
-    endpoint: creds.endpoint,
-    bucket: creds.bucket,
-    key: objectKey,
-    accessKeyId: creds.accessKeyId,
-    secretAccessKey: creds.secretAccessKey,
-    region: creds.region || 'auto',
-    expiresIn: 3600,
-  });
+async function downloadArtifact(r2: R2PresignContext, objectKeyOrUrl: string, targetPath: string) {
+  const source = String(objectKeyOrUrl || '').trim();
+  if (!source) {
+    throw new Error('Missing R2 object key');
+  }
+  const normalizedKey = source.replace(/^\/+/, '');
+  const url = source.startsWith('http://') || source.startsWith('https://')
+    ? source
+    : await presignR2ObjectUrl(r2, 'GET', normalizedKey, 3600);
+
   await runCommand('curl', ['-fsSL', url, '-o', targetPath]);
 }
 
-async function uploadArtifact(creds: R2Credentials, objectKey: string, sourcePath: string) {
+async function uploadArtifact(r2: R2PresignContext, objectKey: string, sourcePath: string) {
   const normalizedKey = objectKey.replace(/^\/+/, '');
-  const url = presignS3Url({
-    method: 'PUT',
-    endpoint: creds.endpoint,
-    bucket: creds.bucket,
-    key: normalizedKey,
-    accessKeyId: creds.accessKeyId,
-    secretAccessKey: creds.secretAccessKey,
-    region: creds.region || 'auto',
-    expiresIn: 3600,
-  });
+  const url = await presignR2ObjectUrl(r2, 'PUT', normalizedKey, 3600);
   await runCommand('curl', ['-fsSL', '-X', 'PUT', '-T', sourcePath, url]);
 }
 
@@ -2851,7 +2913,7 @@ async function flushMagentoCache(
 async function backupDatabasePreUpgrade(params: {
   dbContainerId: string;
   dbName: string;
-  r2: R2Credentials;
+  r2: R2PresignContext;
   objectKey: string;
   log: (message: string) => void;
 }) {
@@ -2882,7 +2944,7 @@ async function backupDatabasePreUpgrade(params: {
     await runCommand('zstd', ['-19', '-f', '-o', zstPath, dumpPath]);
     await runCommand('age', ['-R', publicKeyPath, '-o', agePath, zstPath]);
     await uploadArtifact(params.r2, params.objectKey, agePath);
-    params.log(`db backup uploaded: ${params.r2.bucket}/${params.objectKey}`);
+    params.log(`db backup uploaded: ${params.objectKey}`);
   } finally {
     for (const filePath of [dumpPath, zstPath, agePath]) {
       try {
@@ -2978,10 +3040,7 @@ async function processDeployment(recordPath: string) {
   const opensearchPort = process.env.MZ_OPENSEARCH_PORT || '9200';
   const opensearchTimeout = process.env.MZ_OPENSEARCH_TIMEOUT || '15';
 
-  const r2 = readR2CredFile(environmentId);
-  if (!r2?.backups) {
-    throw new Error('Missing R2 backup credentials');
-  }
+  const r2: R2PresignContext = { baseUrl, nodeId, nodeSecret, environmentId };
 
   const objectKey = String(envRecord?.db_backup_object || DEFAULT_DB_BACKUP_OBJECT).replace(/^\/+/, '');
   const workDir = path.join(DEPLOY_WORK_DIR, deploymentId);
@@ -3006,7 +3065,7 @@ async function processDeployment(recordPath: string) {
   const artifactPath = path.join(workDir, path.basename(artifactKey));
   log('downloading build artifact');
   progress.start('download_artifact');
-  await downloadArtifact(r2.backups, artifactKey, artifactPath);
+  await downloadArtifact(r2, artifactKey, artifactPath);
   log('downloaded build artifact');
   progress.ok('download_artifact');
 
@@ -3078,6 +3137,7 @@ async function processDeployment(recordPath: string) {
 	    REGISTRY_PUSH_HOST: 'registry',
 	    REGISTRY_PORT: '5000',
 	    SECRET_VERSION,
+	    MZ_ENV_ID: String(environmentId),
 	    MAGE_VERSION: mageVersion,
 	    MYSQL_DATABASE: process.env.MYSQL_DATABASE || 'magento',
     MYSQL_USER: process.env.MYSQL_USER || 'magento',
@@ -3133,13 +3193,18 @@ async function processDeployment(recordPath: string) {
 
   const secrets = envRecord?.environment_secrets ?? null;
   const envBaseUrl = envHostname ? `https://${envHostname.replace(/^https?:\/\//, '').replace(/\/+$/, '')}` : '';
-  const dbSecretName = `mz_db_password_v${SECRET_VERSION}`;
-  const dbRootSecretName = `mz_db_root_password_v${SECRET_VERSION}`;
-  const dbReplicationSecretName = `mz_db_replication_password_v${SECRET_VERSION}`;
-  const rabbitSecretName = `mz_rabbitmq_password_v${SECRET_VERSION}`;
-  const mageSecretName = `mz_mage_crypto_key_v${SECRET_VERSION}`;
+  const dbSecretName = `mz_env_${environmentId}_db_password_v${SECRET_VERSION}`;
+  const dbRootSecretName = `mz_env_${environmentId}_db_root_password_v${SECRET_VERSION}`;
+  const dbReplicationSecretName = `mz_env_${environmentId}_db_replication_password_v${SECRET_VERSION}`;
+  const rabbitSecretName = `mz_env_${environmentId}_rabbitmq_password_v${SECRET_VERSION}`;
+  const mageSecretName = `mz_env_${environmentId}_mage_crypto_key_v${SECRET_VERSION}`;
 
   log('ensuring docker secrets');
+  // Migrate existing global secrets to per-env secrets for already-deployed environments.
+  await migrateGlobalSecret(stackName, 'database', 'db_password', dbSecretName, workDir);
+  await migrateGlobalSecret(stackName, 'database', 'db_root_password', dbRootSecretName, workDir);
+  await migrateGlobalSecret(stackName, 'database', 'db_replication_password', dbReplicationSecretName, workDir);
+  await migrateGlobalSecret(stackName, 'rabbitmq', 'rabbitmq_password', rabbitSecretName, workDir);
   await ensureDockerSecret(dbSecretName, generateSecretHex(24), workDir);
   await ensureDockerSecret(dbRootSecretName, generateSecretHex(24), workDir);
   await ensureDockerSecret(dbReplicationSecretName, generateSecretHex(24), workDir);
@@ -3268,7 +3333,7 @@ async function processDeployment(recordPath: string) {
   } else {
     progress.detail('db_prepare', 'Restoring database from provisioning backup');
     const encryptedBackupPath = path.join(workDir, path.basename(objectKey));
-    await downloadArtifact(r2.backups, objectKey, encryptedBackupPath);
+    await downloadArtifact(r2, objectKey, encryptedBackupPath);
     await restoreDatabase(dbContainerId, encryptedBackupPath, workDir, dbName);
     await setSecureOffloaderConfig(dbContainerId, dbName);
     log('database restored');
@@ -3397,12 +3462,12 @@ async function processDeployment(recordPath: string) {
       await backupDatabasePreUpgrade({
         dbContainerId,
         dbName: envVars.MYSQL_DATABASE || 'magento',
-        r2: r2.backups,
+        r2,
         objectKey: backupObjectKey,
         log,
       });
       recordMeta.pre_upgrade_db_backup = {
-        bucket: r2.backups.bucket,
+        bucket: String(envRecord?.db_backup_bucket || ''),
         object_key: backupObjectKey,
         previous_artifact: prevArtifactKey || null,
         previous_tag: prevTag,
@@ -3644,13 +3709,17 @@ async function cleanupFailedArtifact(record: Record<string, any>) {
       return;
     }
 
-    const r2 = readR2CredFile(environmentId);
-    if (!r2?.backups) {
-      console.warn('cleanup skip: missing R2 backup credentials');
+    const config = readConfig();
+    const baseUrl = (config.mz_control_base_url || process.env.MZ_CONTROL_BASE_URL || '').trim();
+    const nodeId = readNodeFile('node-id');
+    const nodeSecret = readNodeFile('node-secret');
+    if (!baseUrl || !nodeId || !nodeSecret) {
+      console.warn('cleanup skip: missing mz-control base URL or node credentials');
       return;
     }
 
-    await deleteR2Object(r2.backups, normalizedArtifactKey);
+    const r2: R2PresignContext = { baseUrl, nodeId, nodeSecret, environmentId };
+    await deleteR2Object(r2, normalizedArtifactKey);
     console.warn(`cleanup: deleted failed artifact ${normalizedArtifactKey}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

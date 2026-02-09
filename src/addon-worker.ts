@@ -1,8 +1,9 @@
 import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
-import { presignS3Url } from './r2-presign.js';
 import { enforceCommandPolicy } from './command-policy.js';
+import { buildNodeHeaders } from './node-hmac.js';
+import { readConfig } from './status.js';
 
 type AddonDeployPayload = {
   stack_id?: number;
@@ -20,19 +21,11 @@ type DeploymentRecord = {
   payload?: AddonDeployPayload;
 };
 
-type R2Credentials = {
-  accessKeyId: string;
-  secretAccessKey: string;
-  bucket: string;
-  endpoint: string;
-  region?: string;
-};
-
-type R2CredFile = {
-  environment_id?: number;
-  backups?: R2Credentials;
-  media?: R2Credentials;
-  updated_at?: string;
+type R2PresignContext = {
+  baseUrl: string;
+  nodeId: string;
+  nodeSecret: string;
+  environmentId: number;
 };
 
 type PlannerResourceSpec = {
@@ -52,7 +45,6 @@ const GIB = 1024 * MIB;
 
 const ADDON_QUEUE_DIR = process.env.MZ_ADDON_QUEUE_DIR || '/opt/mage-zero/addons';
 const ADDON_WORK_DIR = process.env.MZ_ADDON_WORK_DIR || path.join(ADDON_QUEUE_DIR, 'work');
-const R2_CRED_DIR = process.env.MZ_R2_CRED_DIR || '/opt/mage-zero/r2';
 const SECRET_VERSION = process.env.MZ_SECRET_VERSION || '1';
 const ADDON_INTERVAL_MS = Number(process.env.MZ_ADDON_WORKER_INTERVAL_MS || 5000);
 const FETCH_TIMEOUT_MS = Number(process.env.MZ_ADDON_FETCH_TIMEOUT_MS || process.env.MZ_FETCH_TIMEOUT_MS || 10 * 60 * 1000);
@@ -111,13 +103,70 @@ function moveToDir(filePath: string, dir: string) {
   fs.renameSync(filePath, path.join(dir, base));
 }
 
-function readR2CredFile(environmentId: number): R2CredFile | null {
+function readNodeFile(name: string): string {
   try {
-    const raw = fs.readFileSync(`${R2_CRED_DIR}/env-${environmentId}.json`, 'utf8');
-    return JSON.parse(raw) as R2CredFile;
+    return fs.readFileSync(path.join(NODE_DIR, name), 'utf8').trim();
   } catch {
-    return null;
+    return '';
   }
+}
+
+async function fetchJson(baseUrl: string, pathName: string, method: string, body: string | null, nodeId: string, nodeSecret: string) {
+  const url = new URL(pathName, baseUrl);
+  const query = url.search ? url.search.slice(1) : '';
+  const payload = body ?? '';
+  const headers = buildNodeHeaders(method, url.pathname, query, payload, nodeId, nodeSecret);
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await fetch(url.toString(), {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        ...headers,
+      },
+      body: payload || undefined,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`mz-control request failed: ${response.status} - ${errorBody}`);
+  }
+  return response.json() as Promise<any>;
+}
+
+async function presignR2ObjectUrl(
+  r2: R2PresignContext,
+  method: 'PUT' | 'GET' | 'DELETE',
+  objectKey: string,
+  expiresIn: number,
+) {
+  const payload = JSON.stringify({
+    bucket: 'backups',
+    method,
+    object_key: objectKey,
+    expires_in: expiresIn,
+  });
+  const response = await fetchJson(
+    r2.baseUrl,
+    `/v1/agent/environment/${r2.environmentId}/r2-presign`,
+    'POST',
+    payload,
+    r2.nodeId,
+    r2.nodeSecret,
+  );
+  const url = String((response as any)?.url || '').trim();
+  if (!url) {
+    throw new Error('mz-control r2-presign did not return url');
+  }
+  return url;
 }
 
 function parseIsoDate(value: unknown): number {
@@ -251,17 +300,12 @@ function parseDockerLoadOutput(output: string) {
   return '';
 }
 
-async function downloadArtifact(creds: R2Credentials, objectKey: string, targetPath: string) {
-  const url = presignS3Url({
-    method: 'GET',
-    endpoint: creds.endpoint,
-    bucket: creds.bucket,
-    key: objectKey,
-    accessKeyId: creds.accessKeyId,
-    secretAccessKey: creds.secretAccessKey,
-    region: creds.region || 'auto',
-    expiresIn: 3600,
-  });
+async function downloadArtifact(r2: R2PresignContext, objectKey: string, targetPath: string) {
+  const normalizedKey = String(objectKey || '').replace(/^\/+/, '');
+  if (!normalizedKey) {
+    throw new Error('Missing artifact key');
+  }
+  const url = await presignR2ObjectUrl(r2, 'GET', normalizedKey, 3600);
   await runCommand('curl', ['-fsSL', '--max-time', String(Math.ceil(FETCH_TIMEOUT_MS / 1000)), url, '-o', targetPath], {
     timeoutMs: FETCH_TIMEOUT_MS + 5000,
   });
@@ -291,14 +335,17 @@ async function deployAddon(record: DeploymentRecord, deploymentId: string) {
 
   log('starting', { deployment_id: deploymentId, environment_id: environmentId, slug, artifact_key: artifactKey });
 
-  const r2 = readR2CredFile(environmentId);
-  const creds = r2?.backups;
-  if (!creds?.accessKeyId || !creds.secretAccessKey || !creds.bucket || !creds.endpoint) {
-    throw new Error('Missing R2 backups credentials for environment');
+  const config = readConfig();
+  const baseUrl = (config.mz_control_base_url || process.env.MZ_CONTROL_BASE_URL || '').trim();
+  const nodeId = readNodeFile('node-id');
+  const nodeSecret = readNodeFile('node-secret');
+  if (!baseUrl || !nodeId || !nodeSecret) {
+    throw new Error('Missing mz-control base URL or node credentials');
   }
+  const r2: R2PresignContext = { baseUrl, nodeId, nodeSecret, environmentId };
 
   log('downloading artifact', { object_key: artifactKey });
-  await downloadArtifact(creds, artifactKey, imageTar);
+  await downloadArtifact(r2, artifactKey, imageTar);
   log('artifact downloaded', { path: imageTar });
 
   log('docker load');
@@ -316,8 +363,8 @@ async function deployAddon(record: DeploymentRecord, deploymentId: string) {
   await runCommand('docker', ['tag', loadedRef, pushRef], { timeoutMs: 30_000 });
   await runCommand('docker', ['push', pushRef], { timeoutMs: DOCKER_PUSH_TIMEOUT_MS });
 
-  const dbSecretName = `mz_db_password_v${SECRET_VERSION}`;
-  const rabbitSecretName = `mz_rabbitmq_password_v${SECRET_VERSION}`;
+  const dbSecretName = `mz_env_${environmentId}_db_password_v${SECRET_VERSION}`;
+  const rabbitSecretName = `mz_env_${environmentId}_rabbitmq_password_v${SECRET_VERSION}`;
   const dbHost = stackServiceName(environmentId, 'proxysql');
   const rabbitHost = stackServiceName(environmentId, 'rabbitmq');
 

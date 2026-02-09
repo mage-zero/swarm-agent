@@ -9,26 +9,12 @@ type EnvironmentRecord = {
   stack_id?: number;
   hostname?: string;
   environment_hostname?: string;
-  db_backup_bucket?: string;
-  media_bucket?: string;
-};
-
-type R2Credentials = {
-  accessKeyId: string;
-  secretAccessKey: string;
-  bucket: string;
-  endpoint: string;
-  region?: string;
 };
 
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
 const ENV_STATE_DIR = process.env.MZ_ENV_STATE_DIR || '/etc/magezero/env-sync';
-const R2_CRED_DIR = process.env.MZ_R2_CRED_DIR || '/opt/mage-zero/r2';
 const SYNC_INTERVAL_MS = Number(process.env.MZ_ENV_SYNC_INTERVAL_MS || 60000);
-// Refresh credentials periodically even when markers exist (e.g. after switching
-// credential strategy away from per-bucket tokens).
-const R2_REFRESH_INTERVAL_MS = Number(process.env.MZ_R2_REFRESH_INTERVAL_MS || 30 * 60 * 1000);
 
 let cachedDockerApiVersion: string | null = null;
 let cachedDockerApiVersionAt = 0;
@@ -47,62 +33,12 @@ function ensureStateDir() {
   }
 }
 
-function ensureR2Dir() {
-  if (!fs.existsSync(R2_CRED_DIR)) {
-    fs.mkdirSync(R2_CRED_DIR, { recursive: true });
-  }
-}
-
-function getR2CredPath(environmentId: number) {
-  return `${R2_CRED_DIR}/env-${environmentId}.json`;
-}
-
-function shouldRefreshCredFile(environmentId: number): boolean {
-  const filePath = getR2CredPath(environmentId);
-  try {
-    const st = fs.statSync(filePath);
-    const age = Date.now() - st.mtimeMs;
-    return age > R2_REFRESH_INTERVAL_MS;
-  } catch {
-    return true;
-  }
-}
-
-function writeR2CredFile(environmentId: number, backups: R2Credentials, media: R2Credentials) {
-  ensureR2Dir();
-  const payload = {
-    environment_id: environmentId,
-    backups,
-    media,
-    updated_at: new Date().toISOString(),
-  };
-  const target = getR2CredPath(environmentId);
-  fs.writeFileSync(target, JSON.stringify(payload, null, 2), 'utf8');
-  fs.chmodSync(target, 0o600);
-}
-
-function getEnvMarkerPath(environmentId: number) {
-  return `${ENV_STATE_DIR}/env-${environmentId}-r2.done`;
-}
-
-function getEnvPendingPath(environmentId: number) {
-  return `${ENV_STATE_DIR}/env-${environmentId}-r2.pending`;
-}
-
 function getEnvDnsMarkerPath(environmentId: number) {
   return `${ENV_STATE_DIR}/env-${environmentId}-dns.done`;
 }
 
 function getEnvDnsPendingPath(environmentId: number) {
   return `${ENV_STATE_DIR}/env-${environmentId}-dns.pending`;
-}
-
-function hasEnvMarker(environmentId: number): boolean {
-  return fs.existsSync(getEnvMarkerPath(environmentId));
-}
-
-function hasEnvPending(environmentId: number): boolean {
-  return fs.existsSync(getEnvPendingPath(environmentId));
 }
 
 function hasEnvDnsMarker(environmentId: number): boolean {
@@ -123,16 +59,6 @@ function readEnvDnsMarker(environmentId: number): string {
   }
 }
 
-function writeEnvMarker(environmentId: number) {
-  ensureStateDir();
-  fs.writeFileSync(getEnvMarkerPath(environmentId), `${new Date().toISOString()}\n`, 'utf8');
-}
-
-function writeEnvPending(environmentId: number) {
-  ensureStateDir();
-  fs.writeFileSync(getEnvPendingPath(environmentId), `${new Date().toISOString()}\n`, 'utf8');
-}
-
 function writeEnvDnsMarker(environmentId: number, hostname: string) {
   ensureStateDir();
   const payload = {
@@ -145,22 +71,6 @@ function writeEnvDnsMarker(environmentId: number, hostname: string) {
 function writeEnvDnsPending(environmentId: number) {
   ensureStateDir();
   fs.writeFileSync(getEnvDnsPendingPath(environmentId), `${new Date().toISOString()}\n`, 'utf8');
-}
-
-function clearEnvMarker(environmentId: number) {
-  try {
-    fs.unlinkSync(getEnvMarkerPath(environmentId));
-  } catch {
-    // ignore
-  }
-}
-
-function clearEnvPending(environmentId: number) {
-  try {
-    fs.unlinkSync(getEnvPendingPath(environmentId));
-  } catch {
-    // ignore
-  }
 }
 
 function clearEnvDnsMarker(environmentId: number) {
@@ -373,8 +283,6 @@ async function syncEnvironmentCredentials() {
     return;
   }
 
-  const existingSecrets = await listSecretNames();
-
   for (const environment of environments) {
     const environmentId = Number(environment.environment_id ?? 0);
     if (!environmentId) {
@@ -407,81 +315,6 @@ async function syncEnvironmentCredentials() {
           clearEnvDnsPending(environmentId);
         }
       }
-    }
-    if (hasEnvPending(environmentId)) {
-      continue;
-    }
-
-    const backupBucket = String(environment.db_backup_bucket ?? '').trim();
-    const mediaBucket = String(environment.media_bucket ?? '').trim();
-    if (!backupBucket || !mediaBucket) {
-      continue;
-    }
-
-    const backupAccessName = `mz-env-${environmentId}-r2-backups-access-key`;
-    const backupSecretName = `mz-env-${environmentId}-r2-backups-secret-key`;
-    const mediaAccessName = `mz-env-${environmentId}-r2-media-access-key`;
-    const mediaSecretName = `mz-env-${environmentId}-r2-media-secret-key`;
-
-    const hasAllSecrets =
-      existingSecrets.has(backupAccessName)
-      && existingSecrets.has(backupSecretName)
-      && existingSecrets.has(mediaAccessName)
-      && existingSecrets.has(mediaSecretName);
-    const hasCredFile = fs.existsSync(getR2CredPath(environmentId));
-    const refreshFile = hasCredFile && shouldRefreshCredFile(environmentId);
-
-    if (hasAllSecrets && hasCredFile && !refreshFile) {
-      if (!hasEnvMarker(environmentId)) {
-        writeEnvMarker(environmentId);
-      }
-      continue;
-    }
-
-    if (hasEnvMarker(environmentId)) {
-      clearEnvMarker(environmentId);
-    }
-
-    writeEnvPending(environmentId);
-    try {
-      const creds = await fetchJson(
-        baseUrl,
-        `/v1/agent/environment/${environmentId}/r2-credentials`,
-        'POST',
-        JSON.stringify({ environment_id: environmentId }),
-        nodeId,
-        nodeSecret,
-      ) as { backups?: R2Credentials; media?: R2Credentials };
-
-      if (!creds?.backups || !creds?.media) {
-        continue;
-      }
-
-      const labels = {
-        'mz.environment_id': String(environmentId),
-        'mz.stack_id': String(stackId),
-        'mz.managed': 'true',
-      };
-
-      // Docker secrets are immutable; only create if missing.
-      // The swarm-agent itself reads /opt/mage-zero/r2/env-<id>.json for deploy operations.
-      if (!existingSecrets.has(backupAccessName)) {
-        await ensureSecret(backupAccessName, creds.backups.accessKeyId, labels, existingSecrets);
-      }
-      if (!existingSecrets.has(backupSecretName)) {
-        await ensureSecret(backupSecretName, creds.backups.secretAccessKey, labels, existingSecrets);
-      }
-      if (!existingSecrets.has(mediaAccessName)) {
-        await ensureSecret(mediaAccessName, creds.media.accessKeyId, labels, existingSecrets);
-      }
-      if (!existingSecrets.has(mediaSecretName)) {
-        await ensureSecret(mediaSecretName, creds.media.secretAccessKey, labels, existingSecrets);
-      }
-
-      writeR2CredFile(environmentId, creds.backups, creds.media);
-      writeEnvMarker(environmentId);
-    } finally {
-      clearEnvPending(environmentId);
     }
   }
 }

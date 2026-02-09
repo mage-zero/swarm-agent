@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { getHealthStatus } from './health.js';
-import { handleDeployAddon, handleDeployArtifact, handleDeployKey, handleR2Presign } from './deploy.js';
+import { handleDeployAddon, handleDeployArtifact, handleDeployKey } from './deploy.js';
 import { handleDeployProgress, handleRunbookProgress } from './deploy-progress.js';
 import {
   buildCapacityPayload,
@@ -41,11 +41,6 @@ export const createApp = () => {
 
   app.post('/deploy/cloud-swarm-key', async (c) => {
     const result = await handleDeployKey(c);
-    return c.json(result.body, result.status as ContentfulStatusCode);
-  });
-
-  app.post('/r2/presign', async (c) => {
-    const result = await handleR2Presign(c);
     return c.json(result.body, result.status as ContentfulStatusCode);
   });
 

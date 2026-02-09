@@ -155,8 +155,8 @@ export async function handleRunbookProgress(c: { req: { raw: Request; query: (na
     if (!read.ok) continue;
     const data = read.data;
 
-    // Backwards compatibility: treat missing runbook_id as deploy, since only deploy used to write progress.json.
-    const fileRunbook = String((data as any)?.runbook_id || 'deploy').trim();
+    const fileRunbook = String((data as any)?.runbook_id || '').trim();
+    if (!fileRunbook) continue;
     if (fileRunbook !== runbookId) continue;
 
     const fileEnvId = Number((data as any)?.environment_id ?? 0) || 0;
