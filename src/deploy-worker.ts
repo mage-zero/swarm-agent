@@ -3055,6 +3055,7 @@ async function processDeployment(recordPath: string) {
       { id: 'build_images', label: 'Build images' },
       { id: 'deploy_stack', label: 'Deploy stack' },
       { id: 'db_prepare', label: 'Prepare database' },
+      { id: 'app_prepare', label: 'Prepare application runtime' },
       { id: 'magento_steps', label: 'Run Magento deploy steps' },
       { id: 'smoke_checks', label: 'Post-deploy smoke checks' },
       { id: 'verify', label: 'Verify services' },
@@ -3353,6 +3354,7 @@ async function processDeployment(recordPath: string) {
   }
   progress.ok('db_prepare');
 
+  progress.start('app_prepare');
   if (replicaServiceName === 'database-replica') {
     try {
       const replicaContainerId = await waitForContainer(stackName, 'database-replica', 5 * 60 * 1000);
@@ -3430,6 +3432,7 @@ async function processDeployment(recordPath: string) {
   await waitForProxySql(adminContainerId, stackName, 5 * 60 * 1000);
   await waitForRedisCache(adminContainerId, stackName, 5 * 60 * 1000);
   adminContainerId = await ensureMagentoEnvWrapperWithRetry(adminContainerId, stackName, log);
+  progress.ok('app_prepare');
 
   progress.start('magento_steps');
   const dbStatus = await runSetupDbStatus(adminContainerId, stackName, log);
