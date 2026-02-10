@@ -53,6 +53,171 @@ type RunbookResult = {
   };
 };
 
+type RunbookProgressStep = {
+  index: number;
+  id: string;
+  label: string;
+  status: 'pending' | 'running' | 'ok' | 'failed' | 'skipped';
+  started_at?: string;
+  finished_at?: string;
+  took_ms?: number;
+  detail?: string;
+  error?: string;
+};
+
+type RunbookProgressState = {
+  runbook_id: string;
+  deployment_id: string;
+  environment_id: number;
+  status: 'running' | 'ok' | 'failed';
+  started_at: string;
+  updated_at: string;
+  current?: {
+    index: number;
+    total: number;
+    id: string;
+    label: string;
+    started_at: string;
+    detail?: string;
+  };
+  steps: RunbookProgressStep[];
+  last_error?: string;
+};
+
+function writeJsonAtomic(filePath: string, payload: unknown) {
+  try {
+    const dir = path.dirname(filePath);
+    ensureDir(dir);
+    const tmp = `${filePath}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8');
+    fs.renameSync(tmp, filePath);
+  } catch {
+    // best-effort; do not fail runbooks on progress logging issues
+  }
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+class RunbookProgress {
+  private state: RunbookProgressState;
+  private progressPath: string;
+
+  constructor(
+    progressPath: string,
+    runbookId: string,
+    runId: string,
+    environmentId: number,
+    steps: Array<{ id: string; label: string }>
+  ) {
+    this.progressPath = progressPath;
+    const startedAt = nowIso();
+    this.state = {
+      runbook_id: runbookId,
+      deployment_id: runId,
+      environment_id: environmentId,
+      status: 'running',
+      started_at: startedAt,
+      updated_at: startedAt,
+      steps: steps.map((s, idx) => ({
+        index: idx + 1,
+        id: s.id,
+        label: s.label,
+        status: 'pending',
+      })),
+    };
+    this.flush();
+  }
+
+  static create(runbookId: string, environmentId: number, steps: Array<{ id: string; label: string }>) {
+    const runId = crypto.randomUUID();
+    const progressPath = path.join(DEPLOY_WORK_DIR, 'runbooks', runId, 'progress.json');
+    return new RunbookProgress(progressPath, runbookId, runId, environmentId, steps);
+  }
+
+  private flush() {
+    this.state.updated_at = nowIso();
+    writeJsonAtomic(this.progressPath, this.state);
+  }
+
+  private findStep(id: string) {
+    return this.state.steps.find((s) => s.id === id) || null;
+  }
+
+  start(id: string, detail?: string) {
+    const step = this.findStep(id);
+    if (!step) return;
+    if (step.status === 'ok' || step.status === 'failed' || step.status === 'skipped') {
+      return;
+    }
+    step.status = 'running';
+    step.started_at = nowIso();
+    if (detail) step.detail = detail;
+    this.state.current = {
+      index: step.index,
+      total: this.state.steps.length,
+      id: step.id,
+      label: step.label,
+      started_at: step.started_at,
+      detail: step.detail,
+    };
+    this.flush();
+  }
+
+  detail(id: string, detail: string) {
+    const step = this.findStep(id);
+    if (!step || step.status !== 'running') return;
+    step.detail = detail;
+    if (this.state.current && this.state.current.id === id) {
+      this.state.current.detail = detail;
+    }
+    this.flush();
+  }
+
+  ok(id: string, detail?: string) {
+    const step = this.findStep(id);
+    if (!step) return;
+    if (step.status === 'ok') return;
+    if (detail) step.detail = detail;
+    step.status = 'ok';
+    step.finished_at = nowIso();
+    if (step.started_at) {
+      const took = Date.parse(step.finished_at) - Date.parse(step.started_at);
+      if (Number.isFinite(took)) step.took_ms = Math.max(0, took);
+    }
+    if (this.state.current && this.state.current.id === id) {
+      delete this.state.current;
+    }
+    this.flush();
+  }
+
+  fail(id: string, error: string) {
+    const step = this.findStep(id);
+    if (step) {
+      step.status = 'failed';
+      step.error = error;
+      step.finished_at = nowIso();
+      if (step.started_at) {
+        const took = Date.parse(step.finished_at) - Date.parse(step.started_at);
+        if (Number.isFinite(took)) step.took_ms = Math.max(0, took);
+      }
+    }
+    this.state.status = 'failed';
+    this.state.last_error = error;
+    if (this.state.current && this.state.current.id === id) {
+      this.state.current.detail = error;
+    }
+    this.flush();
+  }
+
+  doneOk() {
+    this.state.status = 'ok';
+    delete this.state.current;
+    this.flush();
+  }
+}
+
 type R2PresignContext = {
   baseUrl: string;
   nodeId: string;
@@ -1766,9 +1931,22 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
   const runbookId = 'db_backup';
   const actions: string[] = [];
   const observations: string[] = [];
+  const progress = RunbookProgress.create(runbookId, environmentId, [
+    { id: 'validate', label: 'Validate inputs' },
+    { id: 'maintenance_on', label: 'Enable maintenance mode' },
+    { id: 'cron_pause', label: 'Pause cron' },
+    { id: 'dump', label: 'Dump database' },
+    { id: 'compress', label: 'Compress backup' },
+    { id: 'encrypt', label: 'Encrypt backup' },
+    { id: 'upload', label: 'Upload to R2' },
+    { id: 'cron_resume', label: 'Resume cron' },
+    { id: 'maintenance_off', label: 'Disable maintenance mode' },
+  ]);
 
+  progress.start('validate');
   const method = String(input.method ?? 'mysqldump').trim().toLowerCase() || 'mysqldump';
   if (method !== 'mysqldump') {
+    progress.fail('validate', `Unsupported backup method: ${method}`);
     return {
       runbook_id: runbookId,
       status: 'failed',
@@ -1776,9 +1954,11 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
       observations: ['Supported methods: mysqldump', `Requested: ${method}`],
     };
   }
+  progress.ok('validate');
 
   const r2 = resolveR2Context(environmentId);
   if (!r2) {
+    progress.fail('validate', 'Missing mz-control connection details for R2 presign.');
     return {
       runbook_id: runbookId,
       status: 'failed',
@@ -1795,6 +1975,7 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
 
   const publicKeyPath = resolveStackMasterPublicKeyPath();
   if (!publicKeyPath) {
+    progress.fail('validate', 'Missing stack master public key for encryption.');
     return {
       runbook_id: runbookId,
       status: 'failed',
@@ -1815,6 +1996,7 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
   const dbReplicaServiceName = envServiceName(environmentId, 'database-replica');
   const dbSpec = await inspectServiceSpec(dbServiceName);
   if (!dbSpec) {
+    progress.fail('validate', `Database service missing: ${dbServiceName}`);
     return {
       runbook_id: runbookId,
       status: 'failed',
@@ -1826,10 +2008,12 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
   const dbName = String(dbSpec.env.MYSQL_DATABASE || 'magento').trim() || 'magento';
 
   // Best-effort: put the site into maintenance mode and pause cron to reduce writes.
+  progress.start('maintenance_on');
   const maintenance = await runMagentoMaintenance(environmentId, 'enable');
   actions.push('Enabled Magento maintenance mode');
   observations.push(...maintenance.observations.map((line) => `Maintenance: ${line}`));
   if (maintenance.status !== 'ok') {
+    progress.fail('maintenance_on', 'Failed to enable maintenance mode; backup aborted.');
     return {
       runbook_id: runbookId,
       status: 'failed',
@@ -1838,9 +2022,12 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
       remediation: { attempted: true, actions },
     };
   }
+  progress.ok('maintenance_on');
 
+  progress.start('cron_pause');
   const cronDown = await scaleEnvironmentService(environmentId, 'cron', 0);
   actions.push(cronDown.ok ? 'Scaled cron service to 0' : `Failed to scale cron service: ${cronDown.note || ''}`.trim());
+  progress.ok('cron_pause', cronDown.ok ? '' : 'Failed to scale cron service to 0');
 
   const timestamp = formatTimestamp();
   const workDir = path.join(DEPLOY_WORK_DIR, `db-backup-${environmentId}-${timestamp}`);
@@ -1852,6 +2039,7 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
   let uploaded = false;
   let dumpSource = '';
   try {
+    progress.start('dump');
     // Prefer dumping from the current writer if we can detect it and it is local.
     // NOTE: This currently uses docker exec on the local node. If the database container
     // is scheduled on a different node, this will fail. In that case, we should migrate
@@ -1877,7 +2065,9 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
       if (fallback) {
         dumpSource = dbServiceName;
         const dumpInner = [
-          'set -euo pipefail',
+          // `sh` on some distros is `dash`, which doesn't support `set -o pipefail`.
+          // We don't use pipes here, so `-eu` is sufficient.
+          'set -eu',
           'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
           `mariadb-dump -uroot -p\"$ROOT_PASS\" --single-transaction --quick --routines --events --triggers --hex-blob --databases ${quoteShell(
             dbName
@@ -1896,7 +2086,9 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
     } else {
       dumpSource = targetService;
       const dumpInner = [
-        'set -euo pipefail',
+        // `sh` on some distros is `dash`, which doesn't support `set -o pipefail`.
+        // We don't use pipes here, so `-eu` is sufficient.
+        'set -eu',
         'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
         `mariadb-dump -uroot -p\"$ROOT_PASS\" --single-transaction --quick --routines --events --triggers --hex-blob --databases ${quoteShell(
           dbName
@@ -1908,25 +2100,33 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
         throw new Error(output ? `Database dump failed: ${output}` : 'Database dump failed.');
       }
     }
+    progress.ok('dump', dumpSource ? `Source: ${dumpSource}` : '');
 
+    progress.start('compress');
     const zstdResult = await runCommand('zstd', ['-19', '-f', '-o', zstPath, dumpPath], 15 * 60_000);
     if (zstdResult.code !== 0) {
       const output = (zstdResult.stderr || zstdResult.stdout || '').trim();
       throw new Error(output ? `zstd failed: ${output}` : 'zstd failed.');
     }
+    progress.ok('compress');
 
+    progress.start('encrypt');
     const ageResult = await runCommand('age', ['-R', publicKeyPath, '-o', agePath, zstPath], 2 * 60_000);
     if (ageResult.code !== 0) {
       const output = (ageResult.stderr || ageResult.stdout || '').trim();
       throw new Error(output ? `age encryption failed: ${output}` : 'age encryption failed.');
     }
+    progress.ok('encrypt');
 
+    progress.start('upload');
     await uploadArtifact(r2, backupObject, agePath);
     uploaded = true;
     actions.push(backupBucket ? `Uploaded backup to ${backupBucket}/${backupObject}` : `Uploaded backup to ${backupObject}`);
+    progress.ok('upload');
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     observations.push(message);
+    progress.fail(progressStateForDbBackupFailure(message), message);
     return {
       runbook_id: runbookId,
       status: 'failed',
@@ -1942,12 +2142,16 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
     };
   } finally {
     // Always try to re-enable cron and disable maintenance mode.
+    progress.start('cron_resume');
     const cronUp = await scaleEnvironmentService(environmentId, 'cron', 1);
     actions.push(cronUp.ok ? 'Scaled cron service to 1' : `Failed to scale cron service: ${cronUp.note || ''}`.trim());
+    progress.ok('cron_resume', cronUp.ok ? '' : 'Failed to scale cron service to 1');
 
+    progress.start('maintenance_off');
     const maintenanceOff = await runMagentoMaintenance(environmentId, 'disable');
     actions.push('Disabled Magento maintenance mode');
     observations.push(...maintenanceOff.observations.map((line) => `Maintenance: ${line}`));
+    progress.ok('maintenance_off', maintenanceOff.status === 'ok' ? '' : 'Failed to disable maintenance mode');
 
     // Cleanup working files
     for (const filePath of [dumpPath, zstPath, agePath]) {
@@ -1968,6 +2172,9 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
     }
   }
 
+  if (uploaded) {
+    progress.doneOk();
+  }
   return {
     runbook_id: runbookId,
     status: uploaded ? 'ok' : 'warning',
@@ -1981,6 +2188,17 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
       backup_object: backupObject,
     },
   };
+}
+
+function progressStateForDbBackupFailure(message: string): string {
+  const lower = message.toLowerCase();
+  if (lower.includes('maintenance')) return 'maintenance_on';
+  if (lower.includes('cron')) return 'cron_pause';
+  if (lower.includes('zstd')) return 'compress';
+  if (lower.includes('age')) return 'encrypt';
+  if (lower.includes('upload') || lower.includes('r2')) return 'upload';
+  if (lower.includes('dump') || lower.includes('database')) return 'dump';
+  return 'dump';
 }
 
 async function runDiskUsageSummary(): Promise<RunbookResult> {
@@ -3037,15 +3255,24 @@ async function runDeployRollbackPrevious(environmentId: number, input: Record<st
 
 async function runMagentoMaintenance(environmentId: number, mode: 'enable' | 'disable'): Promise<RunbookResult> {
   const runbookId = mode === 'enable' ? 'magento_maintenance_enable' : 'magento_maintenance_disable';
+  // Important: maintenance mode is represented by a flag file under `var/`.
+  // In this stack, `var/` is tmpfs and therefore NOT shared between php-fpm and php-fpm-admin.
+  // To ensure the storefront actually enters maintenance mode, we must apply the flag on php-fpm
+  // (and best-effort mirror it on php-fpm-admin).
+  const hasFrontend = Boolean(await inspectServiceSpec(envServiceName(environmentId, 'php-fpm')));
   const hasAdmin = Boolean(await inspectServiceSpec(envServiceName(environmentId, 'php-fpm-admin')));
-  const targetService = hasAdmin ? 'php-fpm-admin' : 'php-fpm';
-  const serviceFullName = envServiceName(environmentId, targetService);
-  if (!(await inspectServiceSpec(serviceFullName))) {
+  const services: Array<'php-fpm' | 'php-fpm-admin'> = [];
+  if (hasFrontend) services.push('php-fpm');
+  if (hasAdmin) services.push('php-fpm-admin');
+  if (!services.length) {
     return {
       runbook_id: runbookId,
       status: 'failed',
       summary: 'php-fpm service not found.',
-      observations: [`Missing service: ${serviceFullName}`],
+      observations: [
+        `Missing service: ${envServiceName(environmentId, 'php-fpm')}`,
+        `Missing service: ${envServiceName(environmentId, 'php-fpm-admin')}`,
+      ],
     };
   }
 
@@ -3053,20 +3280,43 @@ async function runMagentoMaintenance(environmentId: number, mode: 'enable' | 'di
     ? 'bin/magento maintenance:enable --no-interaction'
     : 'bin/magento maintenance:disable --no-interaction';
 
-  const job = await runServiceJob(environmentId, targetService, `maintenance-${mode}`, `cd /var/www/html/magento && ${cmd}`, { timeout_ms: 90_000 });
-  const ok = job.ok;
-  return {
-    runbook_id: runbookId,
-    status: ok ? 'ok' : 'failed',
-    summary: ok ? `Magento maintenance mode ${mode}d.` : `Magento maintenance mode ${mode} failed.`,
-    observations: [
+  const observations: string[] = [];
+  const results: Array<{ service: string; ok: boolean; state: string; node?: string; logs?: string; error?: string }> = [];
+
+  for (const service of services) {
+    const serviceFullName = envServiceName(environmentId, service);
+    const job = await runServiceJob(environmentId, service, `maintenance-${mode}`, `cd /var/www/html/magento && ${cmd}`, { timeout_ms: 90_000 });
+    results.push({
+      service: serviceFullName,
+      ok: job.ok,
+      state: job.state,
+      node: job.node,
+      logs: job.logs,
+      error: job.error,
+    });
+    observations.push(
       `Service: ${serviceFullName}`,
       job.node ? `Node: ${job.node}` : '',
       job.logs.trim() ? `Logs: ${tailLines(job.logs.trim(), 30)}` : '',
-      ok ? '' : `Error: ${job.error || job.state}`,
-    ].filter(Boolean),
+      job.ok ? '' : `Error: ${job.error || job.state}`,
+    );
+  }
+
+  const frontend = results.find((r) => r.service === envServiceName(environmentId, 'php-fpm')) || results[0];
+  const admin = results.find((r) => r.service === envServiceName(environmentId, 'php-fpm-admin'));
+  const ok = Boolean(frontend?.ok);
+  const warning = ok && admin && !admin.ok;
+
+  return {
+    runbook_id: runbookId,
+    status: ok ? (warning ? 'warning' : 'ok') : 'failed',
+    summary: ok ? `Magento maintenance mode ${mode}d.` : `Magento maintenance mode ${mode} failed.`,
+    observations: observations.filter(Boolean),
     remediation: { attempted: true, actions: [`Magento maintenance:${mode}`] },
-    data: { service: serviceFullName, ok, state: job.state },
+    data: {
+      ok,
+      services: results.map((r) => ({ service: r.service, ok: r.ok, state: r.state, node: r.node })),
+    },
   };
 }
 
@@ -3074,10 +3324,19 @@ async function runMagentoCommand(
   environmentId: number,
   command: string,
   jobPrefix: string,
-  timeoutMs = 90_000
+  timeoutMs = 90_000,
+  target: 'auto' | 'php-fpm' | 'php-fpm-admin' = 'auto'
 ): Promise<{ ok: boolean; logs: string; error?: string; state: string; service: string; node?: string }> {
+  const hasFrontend = Boolean(await inspectServiceSpec(envServiceName(environmentId, 'php-fpm')));
   const hasAdmin = Boolean(await inspectServiceSpec(envServiceName(environmentId, 'php-fpm-admin')));
-  const targetService = hasAdmin ? 'php-fpm-admin' : 'php-fpm';
+  let targetService: 'php-fpm' | 'php-fpm-admin';
+  if (target === 'php-fpm') {
+    targetService = hasFrontend ? 'php-fpm' : (hasAdmin ? 'php-fpm-admin' : 'php-fpm');
+  } else if (target === 'php-fpm-admin') {
+    targetService = hasAdmin ? 'php-fpm-admin' : (hasFrontend ? 'php-fpm' : 'php-fpm-admin');
+  } else {
+    targetService = hasAdmin ? 'php-fpm-admin' : 'php-fpm';
+  }
   const serviceFullName = envServiceName(environmentId, targetService);
   if (!(await inspectServiceSpec(serviceFullName))) {
     return {
@@ -3111,9 +3370,24 @@ async function runEnvironmentTeardown(environmentId: number, input: Record<strin
   const runbookId = 'environment_teardown';
   const observations: string[] = [];
   const actions: string[] = [];
+  const progress = RunbookProgress.create(runbookId, environmentId, [
+    { id: 'precheck', label: 'Pre-flight checks' },
+    { id: 'maintenance_on', label: 'Enable maintenance mode' },
+    { id: 'cache_flush', label: 'Flush Magento cache' },
+    { id: 'maintenance_confirm', label: 'Confirm maintenance mode' },
+    { id: 'dump', label: 'Dump database' },
+    { id: 'compress', label: 'Compress backup' },
+    { id: 'encrypt', label: 'Encrypt backup' },
+    { id: 'upload', label: 'Upload to R2' },
+    { id: 'stack_rm', label: 'Remove environment stack' },
+    { id: 'wait_services', label: 'Wait for services to stop' },
+    { id: 'remove_volumes', label: 'Remove volumes' },
+  ]);
 
+  progress.start('precheck');
   const activeDeploy = await runDeployActiveSummary(environmentId);
   if (activeDeploy.status === 'warning') {
+    progress.fail('precheck', 'Deploy is active; teardown aborted.');
     return {
       runbook_id: runbookId,
       status: 'failed',
@@ -3121,11 +3395,14 @@ async function runEnvironmentTeardown(environmentId: number, input: Record<strin
       observations: activeDeploy.observations,
     };
   }
+  progress.ok('precheck');
 
+  progress.start('maintenance_on');
   const maintenance = await runMagentoMaintenance(environmentId, 'enable');
   observations.push(`Maintenance: ${maintenance.summary}`);
   observations.push(...maintenance.observations.map((line) => `Maintenance: ${line}`));
   if (maintenance.status !== 'ok') {
+    progress.fail('maintenance_on', 'Failed to enable maintenance mode; teardown aborted.');
     return {
       runbook_id: runbookId,
       status: 'failed',
@@ -3133,13 +3410,16 @@ async function runEnvironmentTeardown(environmentId: number, input: Record<strin
       observations,
     };
   }
+  progress.ok('maintenance_on');
 
+  progress.start('cache_flush');
   const cacheFlush = await runMagentoCommand(environmentId, 'php bin/magento cache:flush --no-interaction', 'cache-flush', 120_000);
   observations.push(`Cache flush: ${cacheFlush.ok ? 'ok' : 'failed'}`);
   if (cacheFlush.logs.trim()) {
     observations.push(`Cache flush logs: ${tailLines(cacheFlush.logs.trim(), 20)}`);
   }
   if (!cacheFlush.ok) {
+    progress.fail('cache_flush', 'Cache flush failed; teardown aborted.');
     const maintenanceOff = await runMagentoMaintenance(environmentId, 'disable');
     return {
       runbook_id: runbookId,
@@ -3153,14 +3433,18 @@ async function runEnvironmentTeardown(environmentId: number, input: Record<strin
       ].filter(Boolean),
     };
   }
+  progress.ok('cache_flush');
 
-  const maintenanceStatus = await runMagentoCommand(environmentId, 'php bin/magento maintenance:status --no-interaction', 'maintenance-status', 60_000);
+  progress.start('maintenance_confirm');
+  // Confirm storefront maintenance mode (php-fpm), not just php-fpm-admin.
+  const maintenanceStatus = await runMagentoCommand(environmentId, 'php bin/magento maintenance:status --no-interaction', 'maintenance-status', 60_000, 'php-fpm');
   const maintenanceOutput = maintenanceStatus.logs.toLowerCase();
   const maintenanceEnabled = maintenanceStatus.ok
     && maintenanceOutput.includes('enabled')
     && !maintenanceOutput.includes('disabled');
   observations.push(`Maintenance status: ${maintenanceEnabled ? 'enabled' : 'not enabled'}`);
   if (!maintenanceStatus.ok || !maintenanceEnabled) {
+    progress.fail('maintenance_confirm', 'Maintenance mode not confirmed; teardown aborted.');
     const maintenanceOff = await runMagentoMaintenance(environmentId, 'disable');
     return {
       runbook_id: runbookId,
@@ -3175,9 +3459,11 @@ async function runEnvironmentTeardown(environmentId: number, input: Record<strin
       ].filter(Boolean),
     };
   }
+  progress.ok('maintenance_confirm');
 
   const r2 = resolveR2Context(environmentId);
   if (!r2) {
+    progress.fail('precheck', 'Missing mz-control connection details for R2 presign.');
     return {
       runbook_id: runbookId,
       status: 'failed',
@@ -3197,6 +3483,7 @@ async function runEnvironmentTeardown(environmentId: number, input: Record<strin
 
   const publicKeyPath = resolveStackMasterPublicKeyPath();
   if (!publicKeyPath) {
+    progress.fail('precheck', 'Missing stack master public key for encryption.');
     return {
       runbook_id: runbookId,
       status: 'failed',
@@ -3211,6 +3498,7 @@ async function runEnvironmentTeardown(environmentId: number, input: Record<strin
   const dbServiceName = envServiceName(environmentId, 'database');
   const dbSpec = await inspectServiceSpec(dbServiceName);
   if (!dbSpec) {
+    progress.fail('dump', `Database service missing: ${dbServiceName}`);
     return {
       runbook_id: runbookId,
       status: 'failed',
@@ -3222,6 +3510,7 @@ async function runEnvironmentTeardown(environmentId: number, input: Record<strin
   const dbName = String(dbSpec.env.MYSQL_DATABASE || 'magento').trim() || 'magento';
   const containerId = await findServiceContainerId(dbServiceName);
   if (!containerId) {
+    progress.fail('dump', 'Database container not running; backup aborted.');
     return {
       runbook_id: runbookId,
       status: 'failed',
@@ -3238,8 +3527,11 @@ async function runEnvironmentTeardown(environmentId: number, input: Record<strin
   const agePath = `${zstPath}.age`;
 
   try {
+    progress.start('dump');
     const dumpInner = [
-      'set -euo pipefail',
+      // `sh` on some distros is `dash`, which doesn't support `set -o pipefail`.
+      // We don't use pipes here, so `-eu` is sufficient.
+      'set -eu',
       'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
       `mariadb-dump -uroot -p"$ROOT_PASS" --single-transaction --quick --routines --events --triggers --hex-blob --databases ${quoteShell(
         dbName
@@ -3250,24 +3542,32 @@ async function runEnvironmentTeardown(environmentId: number, input: Record<strin
       const output = (dumpResult.stderr || '').trim();
       throw new Error(output ? `Database dump failed: ${output}` : 'Database dump failed.');
     }
+    progress.ok('dump');
 
+    progress.start('compress');
     const zstdResult = await runCommand('zstd', ['-19', '-f', '-o', zstPath, dumpPath], 10 * 60_000);
     if (zstdResult.code !== 0) {
       const output = (zstdResult.stderr || zstdResult.stdout || '').trim();
       throw new Error(output ? `zstd failed: ${output}` : 'zstd failed.');
     }
+    progress.ok('compress');
 
+    progress.start('encrypt');
     const ageResult = await runCommand('age', ['-R', publicKeyPath, '-o', agePath, zstPath], 60_000);
     if (ageResult.code !== 0) {
       const output = (ageResult.stderr || ageResult.stdout || '').trim();
       throw new Error(output ? `age encryption failed: ${output}` : 'age encryption failed.');
     }
+    progress.ok('encrypt');
 
+    progress.start('upload');
     await uploadArtifact(r2, backupObject, agePath);
     actions.push(backupBucket ? `Uploaded backup to ${backupBucket}/${backupObject}` : `Uploaded backup to ${backupObject}`);
+    progress.ok('upload');
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const maintenanceOff = await runMagentoMaintenance(environmentId, 'disable');
+    progress.fail(progressStateForDbBackupFailure(message), 'Database backup failed; teardown aborted.');
     return {
       runbook_id: runbookId,
       status: 'failed',
@@ -3291,6 +3591,7 @@ async function runEnvironmentTeardown(environmentId: number, input: Record<strin
   }
 
   const stackName = `mz-env-${environmentId}`;
+  progress.start('stack_rm');
   const stackRemove = await runCommand('docker', ['stack', 'rm', stackName], 60_000);
   if (stackRemove.code === 0) {
     actions.push(`Removed stack ${stackName}`);
@@ -3298,6 +3599,7 @@ async function runEnvironmentTeardown(environmentId: number, input: Record<strin
     const output = (stackRemove.stderr || stackRemove.stdout || '').trim();
     const missing = output.toLowerCase().includes('nothing found') || output.toLowerCase().includes('not found');
     if (!missing) {
+      progress.fail('stack_rm', 'Failed to remove environment stack.');
       return {
         runbook_id: runbookId,
         status: 'failed',
@@ -3307,9 +3609,12 @@ async function runEnvironmentTeardown(environmentId: number, input: Record<strin
     }
     observations.push(`Stack ${stackName} already removed.`);
   }
+  progress.ok('stack_rm');
 
+  progress.start('wait_services');
   const wait = await waitForEnvironmentServicesGone(environmentId, 180_000);
   if (!wait.ok) {
+    progress.fail('wait_services', 'Environment services did not stop in time.');
     return {
       runbook_id: runbookId,
       status: 'failed',
@@ -3318,13 +3623,21 @@ async function runEnvironmentTeardown(environmentId: number, input: Record<strin
     };
   }
   actions.push('All environment services removed.');
+  progress.ok('wait_services');
 
+  progress.start('remove_volumes');
   const volumes = await removeEnvironmentVolumes(environmentId);
   if (volumes.removed.length) {
     actions.push(`Removed volumes: ${volumes.removed.join(', ')}`);
   }
   if (volumes.failed.length) {
     observations.push(`Failed to remove volumes: ${volumes.failed.join(', ')}`);
+  }
+  if (volumes.failed.length) {
+    progress.fail('remove_volumes', `Failed to remove some volumes: ${volumes.failed.join(', ')}`);
+  } else {
+    progress.ok('remove_volumes');
+    progress.doneOk();
   }
 
   const status: RunbookResult['status'] = volumes.failed.length ? 'warning' : 'ok';

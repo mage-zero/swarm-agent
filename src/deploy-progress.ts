@@ -128,47 +128,49 @@ export async function handleRunbookProgress(c: { req: { raw: Request; query: (na
     return { status: 400, body: { error: 'invalid_runbook' } } as const;
   }
 
-  // For now, only deploy writes progress. Other runbooks can adopt the same progress.json schema later.
-  if (runbookId !== 'deploy') {
-    return { status: 400, body: { error: 'unsupported_runbook', runbook: runbookId } } as const;
-  }
-
   const environmentId = Number.parseInt(String(c.req.query('environment_id') || '0'), 10) || 0;
   const limitRaw = Number.parseInt(String(c.req.query('limit') || '1'), 10);
   const limit = Number.isFinite(limitRaw) ? Math.min(10, Math.max(1, limitRaw)) : 1;
   const activeOnly = String(c.req.query('active_only') || '').trim() === '1';
 
-  let entries: string[] = [];
-  try {
-    entries = fs.readdirSync(DEPLOY_WORK_DIR);
-  } catch {
-    entries = [];
-  }
+  const scanRoots = [
+    DEPLOY_WORK_DIR,
+    path.join(DEPLOY_WORK_DIR, 'runbooks'),
+  ];
 
   const runs: Array<Record<string, unknown>> = [];
-  for (const deploymentId of entries) {
-    if (!DEPLOY_ID.test(deploymentId)) continue;
-    const progressPath = path.join(DEPLOY_WORK_DIR, deploymentId, 'progress.json');
-    if (!fs.existsSync(progressPath)) continue;
+  for (const root of scanRoots) {
+    let entries: string[] = [];
+    try {
+      entries = fs.readdirSync(root);
+    } catch {
+      entries = [];
+    }
 
-    const read = safeReadJson(progressPath);
-    if (!read.ok) continue;
-    const data = read.data;
+    for (const deploymentId of entries) {
+      if (!DEPLOY_ID.test(deploymentId)) continue;
+      const progressPath = path.join(root, deploymentId, 'progress.json');
+      if (!fs.existsSync(progressPath)) continue;
 
-    const fileRunbook = String((data as any)?.runbook_id || '').trim();
-    if (!fileRunbook) continue;
-    if (fileRunbook !== runbookId) continue;
+      const read = safeReadJson(progressPath);
+      if (!read.ok) continue;
+      const data = read.data;
 
-    const fileEnvId = Number((data as any)?.environment_id ?? 0) || 0;
-    if (environmentId && fileEnvId !== environmentId) continue;
+      const fileRunbook = String((data as any)?.runbook_id || '').trim();
+      if (!fileRunbook) continue;
+      if (fileRunbook !== runbookId) continue;
 
-    const status = String((data as any)?.status || '').trim();
-    if (activeOnly && status !== 'running') continue;
+      const fileEnvId = Number((data as any)?.environment_id ?? 0) || 0;
+      if (environmentId && fileEnvId !== environmentId) continue;
 
-    // Include the deployment id we matched on, even if the file is missing it for some reason.
-    (data as any).deployment_id = String((data as any).deployment_id || deploymentId);
+      const status = String((data as any)?.status || '').trim();
+      if (activeOnly && status !== 'running') continue;
 
-    runs.push(data);
+      // Include the id we matched on, even if the file is missing it for some reason.
+      (data as any).deployment_id = String((data as any).deployment_id || deploymentId);
+
+      runs.push(data);
+    }
   }
 
   runs.sort((a, b) => {

@@ -2933,7 +2933,9 @@ async function backupDatabasePreUpgrade(params: {
   try {
     const safeDbName = assertSafeIdentifier(params.dbName, 'database name');
     const dumpCmd = [
-      'set -euo pipefail',
+      // `sh` on some distros is `dash`, which doesn't support `set -o pipefail`.
+      // We don't use pipes here, so `-eu` is sufficient.
+      'set -eu',
       'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
       `mariadb-dump -uroot -p\"$ROOT_PASS\" --single-transaction --quick --routines --events --triggers --hex-blob --databases ${safeDbName} > ${containerTmp}`,
     ].join(' && ');
