@@ -1656,6 +1656,82 @@ async function downloadArtifact(r2: R2PresignContext, objectKeyOrUrl: string, ta
   await runCommand('curl', ['-fsSL', url, '-o', targetPath]);
 }
 
+async function validateLocalArtifactArchive(artifactPath: string): Promise<boolean> {
+  if (!fs.existsSync(artifactPath)) {
+    return false;
+  }
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(artifactPath);
+  } catch {
+    return false;
+  }
+  if (!stat.isFile() || stat.size <= 0) {
+    return false;
+  }
+
+  try {
+    await runCommandCapture('zstd', ['-tq', artifactPath]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function listLocalArtifactCandidates(artifactFileName: string, currentWorkDir: string): string[] {
+  if (!artifactFileName || !fs.existsSync(DEPLOY_WORK_DIR)) {
+    return [];
+  }
+
+  const currentResolved = path.resolve(currentWorkDir);
+  const candidates: Array<{ fullPath: string; mtimeMs: number }> = [];
+  const entries = fs.readdirSync(DEPLOY_WORK_DIR, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const dirPath = path.join(DEPLOY_WORK_DIR, entry.name);
+    if (path.resolve(dirPath) === currentResolved) {
+      continue;
+    }
+    const candidate = path.join(dirPath, artifactFileName);
+    if (!fs.existsSync(candidate)) {
+      continue;
+    }
+    try {
+      const stat = fs.statSync(candidate);
+      if (!stat.isFile() || stat.size <= 0) {
+        continue;
+      }
+      candidates.push({ fullPath: candidate, mtimeMs: stat.mtimeMs });
+    } catch {
+      continue;
+    }
+  }
+
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return candidates.map((item) => item.fullPath);
+}
+
+async function tryReuseLocalArtifact(
+  artifactFileName: string,
+  currentWorkDir: string,
+  targetPath: string,
+  log: (message: string) => void
+): Promise<{ sourcePath: string } | null> {
+  const candidates = listLocalArtifactCandidates(artifactFileName, currentWorkDir);
+  for (const sourcePath of candidates) {
+    const valid = await validateLocalArtifactArchive(sourcePath);
+    if (!valid) {
+      log(`local artifact candidate invalid, skipping: ${sourcePath}`);
+      continue;
+    }
+    fs.copyFileSync(sourcePath, targetPath);
+    return { sourcePath };
+  }
+  return null;
+}
+
 async function uploadArtifact(r2: R2PresignContext, objectKey: string, sourcePath: string) {
   const normalizedKey = objectKey.replace(/^\/+/, '');
   const url = await presignR2ObjectUrl(r2, 'PUT', normalizedKey, 3600);
@@ -3065,12 +3141,24 @@ async function processDeployment(recordPath: string) {
     ],
   );
 
-  const artifactPath = path.join(workDir, path.basename(artifactKey));
-  log('downloading build artifact');
+  const artifactFileName = path.basename(artifactKey);
+  const artifactPath = path.join(workDir, artifactFileName);
   progress.start('download_artifact');
-  await downloadArtifact(r2, artifactKey, artifactPath);
-  log('downloaded build artifact');
-  progress.ok('download_artifact');
+  if (await validateLocalArtifactArchive(artifactPath)) {
+    log(`reusing local artifact in work dir: ${artifactPath}`);
+    progress.ok('download_artifact', 'Reused local artifact from current work dir');
+  } else {
+    const reused = await tryReuseLocalArtifact(artifactFileName, workDir, artifactPath, log);
+    if (reused) {
+      log(`reused local artifact from previous deployment: ${reused.sourcePath}`);
+      progress.ok('download_artifact', `Reused local artifact from ${reused.sourcePath}`);
+    } else {
+      log('downloading build artifact from R2');
+      await downloadArtifact(r2, artifactKey, artifactPath);
+      log('downloaded build artifact from R2');
+      progress.ok('download_artifact');
+    }
+  }
 
   const logDir = path.join(workDir, 'logs');
   ensureDir(logDir);
