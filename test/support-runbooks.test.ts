@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { __testing } from '../src/support-runbooks.js';
+import { __testing, listRunbooks } from '../src/support-runbooks.js';
 
 describe('support-runbooks helpers', () => {
   it('parses slave status output', () => {
@@ -66,5 +66,33 @@ describe('support-runbooks helpers', () => {
       { hostgroup: 10, hostname: 'mz-env-5_database', status: 'ONLINE' },
       { hostgroup: 20, hostname: 'mz-env-5_database-replica', status: 'OFFLINE_SOFT' },
     ]);
+  });
+
+  it('registers deploy_retry_latest runbook as remediation', async () => {
+    const runbooks = await listRunbooks();
+    const retry = runbooks.find((entry) => entry.id === 'deploy_retry_latest');
+    expect(retry).toBeTruthy();
+    expect(retry?.safe).toBe(false);
+    expect(retry?.supports_remediation).toBe(true);
+  });
+
+  it('selects latest deployment state by timestamp', () => {
+    const latest = __testing.pickLatestDeploymentState([
+      { state: 'failed', deploymentId: 'a', atMs: 1000, atIso: '2024-01-01T00:00:01Z', record: {}, sourcePath: '/tmp/a.json' },
+      { state: 'processing', deploymentId: 'b', atMs: 2000, atIso: '2024-01-01T00:00:02Z', record: {}, sourcePath: '/tmp/b.json' },
+      { state: 'queued', deploymentId: 'c', atMs: 1500, atIso: '2024-01-01T00:00:01.500Z', record: {}, sourcePath: '/tmp/c.json' },
+    ]);
+    expect(latest?.state).toBe('processing');
+    expect(latest?.deploymentId).toBe('b');
+  });
+
+  it('breaks timestamp ties by state priority', () => {
+    const latest = __testing.pickLatestDeploymentState([
+      { state: 'failed', deploymentId: 'a', atMs: 2000, atIso: '2024-01-01T00:00:02Z', record: {}, sourcePath: '/tmp/a.json' },
+      { state: 'queued', deploymentId: 'b', atMs: 2000, atIso: '2024-01-01T00:00:02Z', record: {}, sourcePath: '/tmp/b.json' },
+      { state: 'processing', deploymentId: 'c', atMs: 2000, atIso: '2024-01-01T00:00:02Z', record: {}, sourcePath: '/tmp/c.json' },
+    ]);
+    expect(latest?.state).toBe('processing');
+    expect(latest?.deploymentId).toBe('c');
   });
 });

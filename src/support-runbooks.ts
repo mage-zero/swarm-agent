@@ -394,6 +394,13 @@ const RUNBOOKS: RunbookDefinition[] = [
     supports_remediation: true,
   },
   {
+    id: 'deploy_retry_latest',
+    name: 'Retry latest failed deploy',
+    description: 'Queue a redeploy using the payload from the latest failed deployment record for this environment.',
+    safe: false,
+    supports_remediation: true,
+  },
+  {
     id: 'magento_maintenance_enable',
     name: 'Enable Magento maintenance mode',
     description: 'Enable Magento maintenance mode (break-glass).',
@@ -1908,6 +1915,8 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
       return runDeployResume();
     case 'deploy_rollback_previous':
       return runDeployRollbackPrevious(environmentId, input);
+    case 'deploy_retry_latest':
+      return runDeployRetryLatest(environmentId);
     case 'magento_maintenance_enable':
       return runMagentoMaintenance(environmentId, 'enable');
     case 'magento_maintenance_disable':
@@ -3116,6 +3125,39 @@ function tailLines(text: string, count: number): string {
 
 type DeployHistoryEntry = { artifacts: string[]; imageTags: string[]; updated_at?: string };
 type DeployHistory = Record<string, DeployHistoryEntry>;
+type DeployState = 'queued' | 'processing' | 'failed';
+type DeployStateRecord = {
+  state: DeployState;
+  deploymentId: string;
+  atMs: number;
+  atIso: string;
+  record: Record<string, unknown>;
+  sourcePath: string;
+};
+
+function deployStatePriority(state: DeployState): number {
+  if (state === 'processing') return 3;
+  if (state === 'queued') return 2;
+  return 1;
+}
+
+function pickLatestDeploymentState(records: DeployStateRecord[]): DeployStateRecord | null {
+  if (!records.length) {
+    return null;
+  }
+
+  const sorted = [...records].sort((a, b) => {
+    if (b.atMs !== a.atMs) {
+      return b.atMs - a.atMs;
+    }
+    const byState = deployStatePriority(b.state) - deployStatePriority(a.state);
+    if (byState !== 0) {
+      return byState;
+    }
+    return b.deploymentId.localeCompare(a.deploymentId);
+  });
+  return sorted[0] || null;
+}
 
 function safeReadDeployHistory(): DeployHistory {
   try {
@@ -3131,6 +3173,83 @@ function safeReadDeployHistory(): DeployHistory {
   } catch {
     return {};
   }
+}
+
+function parseRecordTimestamp(
+  record: Record<string, unknown>,
+  fallbackMs: number,
+  fields: string[]
+): { atMs: number; atIso: string } {
+  for (const field of fields) {
+    const raw = String(record[field] ?? '').trim();
+    if (!raw) {
+      continue;
+    }
+    const parsed = Date.parse(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return { atMs: parsed, atIso: raw };
+    }
+  }
+
+  if (Number.isFinite(fallbackMs) && fallbackMs > 0) {
+    return { atMs: fallbackMs, atIso: new Date(fallbackMs).toISOString() };
+  }
+
+  return { atMs: 0, atIso: '' };
+}
+
+function collectDeploymentStateRecords(params: {
+  dirPath: string;
+  state: DeployState;
+  environmentId: number;
+  filenamePattern: RegExp;
+  timestampFields: string[];
+}): DeployStateRecord[] {
+  const { dirPath, state, environmentId, filenamePattern, timestampFields } = params;
+  if (!fs.existsSync(dirPath)) {
+    return [];
+  }
+
+  const out: DeployStateRecord[] = [];
+  const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isFile() || !filenamePattern.test(entry.name)) {
+      continue;
+    }
+
+    const fullPath = path.join(dirPath, entry.name);
+    const record = safeReadJsonFile(fullPath);
+    if (!record) {
+      continue;
+    }
+    const payload = (record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload))
+      ? (record.payload as Record<string, unknown>)
+      : null;
+    const envId = Number(payload?.environment_id ?? 0);
+    if (!envId || envId !== environmentId) {
+      continue;
+    }
+
+    let mtimeMs = 0;
+    try {
+      mtimeMs = fs.statSync(fullPath).mtimeMs;
+    } catch {
+      mtimeMs = 0;
+    }
+    const ts = parseRecordTimestamp(record, mtimeMs, timestampFields);
+    const deploymentId = String(record.id ?? path.basename(entry.name, '.json')).trim() || path.basename(entry.name, '.json');
+    out.push({
+      state,
+      deploymentId,
+      atMs: ts.atMs,
+      atIso: ts.atIso,
+      record,
+      sourcePath: fullPath,
+    });
+  }
+
+  out.sort((a, b) => b.atMs - a.atMs);
+  return out;
 }
 
 function ensureDir(target: string) {
@@ -3250,6 +3369,118 @@ async function runDeployRollbackPrevious(environmentId: number, input: Record<st
     ],
     remediation: { attempted: true, actions: ['Queued rollback deploy using previous artefact'] },
     data: { deployment_id: deploymentId, artifact: targetArtifact, key, history_updated_at: entry?.updated_at || null },
+  };
+}
+
+async function runDeployRetryLatest(environmentId: number): Promise<RunbookResult> {
+  const processing = collectDeploymentStateRecords({
+    dirPath: DEPLOY_PROCESSING_DIR,
+    state: 'processing',
+    environmentId,
+    filenamePattern: DEPLOY_RECORD_FILENAME,
+    timestampFields: ['updated_at', 'queued_at'],
+  });
+  const queued = collectDeploymentStateRecords({
+    dirPath: DEPLOY_QUEUE_DIR,
+    state: 'queued',
+    environmentId,
+    filenamePattern: DEPLOY_RECORD_FILENAME,
+    timestampFields: ['queued_at', 'updated_at'],
+  });
+  const failed = collectDeploymentStateRecords({
+    dirPath: DEPLOY_FAILED_DIR,
+    state: 'failed',
+    environmentId,
+    filenamePattern: /\.json$/i,
+    timestampFields: ['failed_at', 'updated_at', 'queued_at'],
+  });
+
+  const latest = pickLatestDeploymentState([...processing, ...queued, ...failed]);
+  if (!latest) {
+    return {
+      runbook_id: 'deploy_retry_latest',
+      status: 'failed',
+      summary: 'Cannot retry: latest deployment status is not failed.',
+      observations: [`No failed deployment records found for environment ${environmentId}.`],
+      data: { latest_status: 'none' },
+    };
+  }
+
+  if (latest.state !== 'failed') {
+    return {
+      runbook_id: 'deploy_retry_latest',
+      status: 'failed',
+      summary: `Cannot retry: latest deployment status is ${latest.state}.`,
+      observations: [
+        `Deployment: ${latest.deploymentId}`,
+        `${latest.state === 'queued' ? 'Queued' : 'Updated'} at: ${latest.atIso || '(unknown)'}`,
+      ],
+      data: {
+        latest_status: latest.state,
+        deployment_id: latest.deploymentId,
+      },
+    };
+  }
+
+  const payload = (latest.record.payload && typeof latest.record.payload === 'object' && !Array.isArray(latest.record.payload))
+    ? (latest.record.payload as Record<string, unknown>)
+    : null;
+  const artifact = String(payload?.artifact ?? '').trim();
+  const stackId = Number(payload?.stack_id ?? 0);
+  const repository = String(payload?.repository ?? '').trim();
+  const ref = String(payload?.ref ?? '').trim();
+
+  if (!artifact || !stackId) {
+    return {
+      runbook_id: 'deploy_retry_latest',
+      status: 'failed',
+      summary: 'Cannot retry: failed deployment payload is incomplete.',
+      observations: [
+        `Source deployment: ${latest.deploymentId}`,
+        `Missing fields:${!artifact ? ' artifact' : ''}${!stackId ? ' stack_id' : ''}`.trim(),
+      ],
+      data: {
+        latest_status: 'failed',
+        deployment_id: latest.deploymentId,
+      },
+    };
+  }
+
+  const queuedDeploymentId = crypto.randomUUID();
+  const retryPayload: Record<string, unknown> = {
+    artifact,
+    stack_id: stackId,
+    environment_id: environmentId,
+    retry_of: latest.deploymentId,
+  };
+  if (repository) {
+    retryPayload.repository = repository;
+  }
+  if (ref) {
+    retryPayload.ref = ref;
+  }
+  enqueueDeploymentRecord(retryPayload, queuedDeploymentId);
+
+  return {
+    runbook_id: 'deploy_retry_latest',
+    status: 'warning',
+    summary: `Deploy retry queued (${queuedDeploymentId}) from failed deployment ${latest.deploymentId}.`,
+    observations: [
+      'Latest status: failed',
+      `Failed at: ${latest.atIso || '(unknown)'}`,
+      `Artifact: ${artifact}`,
+    ],
+    remediation: { attempted: true, actions: ['Queued deploy retry from latest failed deployment'] },
+    data: {
+      latest_status: 'failed',
+      source_deployment_id: latest.deploymentId,
+      source_failed_at: latest.atIso || null,
+      queued_deployment_id: queuedDeploymentId,
+      artifact,
+      stack_id: stackId,
+      repository: repository || null,
+      ref: ref || null,
+    },
   };
 }
 
@@ -3757,4 +3988,5 @@ export const __testing = {
   parseDbReplicationProbe,
   buildDbProbeScript,
   parseProxySqlHostgroups,
+  pickLatestDeploymentState,
 };
