@@ -3213,24 +3213,34 @@ async function processDeployment(recordPath: string) {
     log(`capacity unavailable; defaulting replica host to database (${message})`);
   }
 
+  const registryHost = process.env.REGISTRY_HOST || '127.0.0.1';
+  const registryPushHost = process.env.REGISTRY_PUSH_HOST || registryHost;
+  const registryPullHost = process.env.REGISTRY_PULL_HOST || registryHost;
+  const registryCacheHost = process.env.REGISTRY_CACHE_HOST || registryPullHost;
+  const registryPort = process.env.REGISTRY_PORT || '5000';
+  const registryCachePort = process.env.REGISTRY_CACHE_PORT || registryPort;
+  const buildxNetwork = process.env.BUILDX_NETWORK || 'host';
+
   const envVars: NodeJS.ProcessEnv = {
     ...process.env,
     ...defaultVersions,
     ...overrideVersions,
     ...plannerResourceEnv,
     ...configEnv,
-	    // Default to pushing directly from Buildx to reduce local-disk pressure.
-	    // Can be overridden for local/dev usage.
-	    BUILDX_OUTPUT: process.env.BUILDX_OUTPUT || 'push',
-	    REGISTRY_HOST: 'registry',
-	    // Buildx uses the docker-container driver, so pushes happen from inside the BuildKit container.
-	    // Use the swarm service DNS name so the builder can reach the registry on the overlay network.
-	    REGISTRY_PUSH_HOST: 'registry',
-	    REGISTRY_PORT: '5000',
-	    SECRET_VERSION,
-	    MZ_ENV_ID: String(environmentId),
-	    MAGE_VERSION: mageVersion,
-	    MYSQL_DATABASE: process.env.MYSQL_DATABASE || 'magento',
+    // Default to pushing directly from Buildx to reduce local-disk pressure.
+    // Can be overridden for local/dev usage.
+    BUILDX_OUTPUT: process.env.BUILDX_OUTPUT || 'push',
+    BUILDX_NETWORK: buildxNetwork,
+    REGISTRY_HOST: registryHost,
+    REGISTRY_PUSH_HOST: registryPushHost,
+    REGISTRY_PULL_HOST: registryPullHost,
+    REGISTRY_CACHE_HOST: registryCacheHost,
+    REGISTRY_PORT: registryPort,
+    REGISTRY_CACHE_PORT: registryCachePort,
+    SECRET_VERSION,
+    MZ_ENV_ID: String(environmentId),
+    MAGE_VERSION: mageVersion,
+    MYSQL_DATABASE: process.env.MYSQL_DATABASE || 'magento',
     MYSQL_USER: process.env.MYSQL_USER || 'magento',
     MZ_DB_HOST: stackService('proxysql'),
     MZ_DB_PORT: '6033',
