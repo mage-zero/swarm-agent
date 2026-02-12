@@ -101,13 +101,24 @@ function isAllowed(command: string, args: string[]): Decision {
     }
     case 'bash': {
       // We intentionally do not allow interactive shell execution.
-      // Permit running a known script file (e.g. registry-gc.sh) but block `bash -lc ...`.
+      // Permit a small, explicit set of script files and block `bash -lc ...`.
       if (args[0] === '-lc') return deny('bash -lc is not allowlisted');
-      if (args.length !== 1) return deny('bash must be invoked with exactly one script path');
+      if (args.length < 1) return deny('bash must be invoked with a script path');
       const scriptPath = args[0] || '';
       if (!path.isAbsolute(scriptPath)) return deny('bash script path must be absolute');
-      if (!scriptPath.endsWith('/scripts/registry-gc.sh')) return deny('bash script is not allowlisted');
-      return allow();
+      if (scriptPath.endsWith('/scripts/registry-gc.sh')) {
+        if (args.length !== 1) return deny('registry-gc.sh does not accept extra args');
+        return allow();
+      }
+      if (scriptPath.endsWith('/scripts/build-services.sh')) {
+        if (args.length !== 1) return deny('build-services.sh does not accept extra args');
+        return allow();
+      }
+      if (scriptPath.endsWith('/scripts/build-magento.sh')) {
+        if (args.length < 2) return deny('build-magento.sh requires artifact path arg');
+        return allow();
+      }
+      return deny('bash script is not allowlisted');
     }
     default:
       return deny(`command not allowlisted: ${cmd}`);

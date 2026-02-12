@@ -27,5 +27,17 @@ describe('command policy', () => {
     process.env.MZ_COMMAND_POLICY_MODE = 'enforce';
     expect(() => enforceCommandPolicy('bash', ['-lc', 'echo hi'], { source: 'test' })).toThrow(/bash -lc/i);
   });
-});
 
+  it('allows deploy bash scripts with expected args', () => {
+    process.env.MZ_COMMAND_POLICY_MODE = 'enforce';
+    expect(() => enforceCommandPolicy('bash', ['/opt/mage-zero/cloud-swarm/scripts/build-services.sh'], { source: 'test' })).not.toThrow();
+    expect(() => enforceCommandPolicy('bash', ['/opt/mage-zero/cloud-swarm/scripts/build-magento.sh', '/tmp/build.tar.zst'], { source: 'test' })).not.toThrow();
+  });
+
+  it('blocks disallowed bash scripts or bad arg counts', () => {
+    process.env.MZ_COMMAND_POLICY_MODE = 'enforce';
+    expect(() => enforceCommandPolicy('bash', ['/opt/mage-zero/cloud-swarm/scripts/unknown.sh'], { source: 'test' })).toThrow(/not allowlisted/i);
+    expect(() => enforceCommandPolicy('bash', ['/opt/mage-zero/cloud-swarm/scripts/build-services.sh', 'extra'], { source: 'test' })).toThrow(/does not accept extra args/i);
+    expect(() => enforceCommandPolicy('bash', ['/opt/mage-zero/cloud-swarm/scripts/build-magento.sh'], { source: 'test' })).toThrow(/requires artifact path arg/i);
+  });
+});
