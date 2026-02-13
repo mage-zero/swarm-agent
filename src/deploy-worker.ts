@@ -112,6 +112,7 @@ const RELEASE_COHORT_GATE_ENABLED = (process.env.MZ_RELEASE_COHORT_GATE_ENABLED 
 const RELEASE_COHORT_GATE_TIMEOUT_MS = Math.max(10_000, Number(process.env.MZ_RELEASE_COHORT_GATE_TIMEOUT_MS || 5 * 60 * 1000));
 const RELEASE_COHORT_LABEL_KEY = process.env.MZ_RELEASE_COHORT_LABEL_KEY || 'mz.release.cohort';
 const RELEASE_COHORT_LABEL_VALUE = process.env.MZ_RELEASE_COHORT_LABEL_VALUE || 'magento';
+const RELEASE_ID_LABEL_KEY = process.env.MZ_RELEASE_ID_LABEL_KEY || 'mz.release.id';
 const REGISTRY_CLEANUP_ENABLED = (process.env.MZ_REGISTRY_CLEANUP_ENABLED || '1') !== '0';
 // Registry cleanup should hit the host-published registry port by default.
 // Do not couple cleanup to REGISTRY_PUSH_HOST because Buildx pushes can occur
@@ -140,6 +141,54 @@ const DEPLOY_INTERVAL_MS = Number(process.env.MZ_DEPLOY_WORKER_INTERVAL_MS || 50
 const FETCH_TIMEOUT_MS = Number(process.env.MZ_FETCH_TIMEOUT_MS || 30000);
 const MIB = 1024 * 1024;
 const GIB = 1024 * 1024 * 1024;
+
+function isLoopbackHost(host: string) {
+  const value = String(host || '').trim().toLowerCase();
+  return value === '127.0.0.1' || value === 'localhost' || value === '::1';
+}
+
+async function detectWireGuardIpV4(): Promise<string | null> {
+  // Prefer wg0: we use WireGuard for swarm control + private registry access.
+  const result = await runCommandCaptureWithStatus('ip', ['-4', 'addr', 'show', 'dev', 'wg0']);
+  if (result.code !== 0) {
+    return null;
+  }
+  const match = (result.stdout || '').match(/\binet\s+(\d+\.\d+\.\d+\.\d+)\//);
+  return match?.[1] || null;
+}
+
+async function swarmHasMultipleNodes(): Promise<boolean> {
+  const result = await runCommandCaptureWithStatus('docker', ['node', 'ls', '--format', '{{.ID}}']);
+  if (result.code !== 0) {
+    return false;
+  }
+  const lines = (result.stdout || '').trim().split('\n').filter(Boolean);
+  return lines.length > 1;
+}
+
+async function resolveRegistryPullHost(candidate: string, log: (message: string) => void): Promise<string> {
+  const trimmed = String(candidate || '').trim();
+  if (!trimmed) {
+    return '127.0.0.1';
+  }
+
+  // In a multi-node Swarm, 127.0.0.1/localhost will break pulls on worker nodes.
+  if (!isLoopbackHost(trimmed)) {
+    return trimmed;
+  }
+
+  if (!(await swarmHasMultipleNodes())) {
+    return trimmed;
+  }
+
+  const wgIp = await detectWireGuardIpV4();
+  if (wgIp) {
+    log(`registry pull host is loopback in multi-node swarm; using WireGuard IP ${wgIp}`);
+    return wgIp;
+  }
+
+  return trimmed;
+}
 
 type DeployProgressStepStatus = 'pending' | 'running' | 'ok' | 'failed' | 'skipped';
 type DeployProgressStep = {
@@ -2669,6 +2718,16 @@ async function waitForReleaseCohort(expectedTag: string, services: string[], log
   return { ok: false, summary: lastSummary || 'release cohort not ready', snapshot: lastSnapshot };
 }
 
+function buildRollbackImageRef(currentImage: string, rollbackTag: string, registryPullHost: string, registryPort: string): string | null {
+  const parsed = parseImageReference(currentImage);
+  const repoPath = stripRegistryHost(parsed.repository || '');
+  if (!repoPath) {
+    return null;
+  }
+  const hostPort = `${registryPullHost}:${registryPort}`;
+  return `${hostPort}/${repoPath}:${rollbackTag}`;
+}
+
 async function rollbackReleaseCohort(services: string[], log: (message: string) => void): Promise<Record<string, unknown>> {
   const snapshot: Record<string, unknown> = {};
   for (const serviceName of services) {
@@ -2682,6 +2741,59 @@ async function rollbackReleaseCohort(services: string[], log: (message: string) 
       ok: result.code === 0,
       exit_code: result.code,
       output: (result.stderr || result.stdout || '').trim() || null,
+    };
+  }
+  return snapshot;
+}
+
+async function rollbackReleaseCohortToTag(
+  services: string[],
+  rollbackTag: string,
+  registryPullHost: string,
+  registryPort: string,
+  log: (message: string) => void
+): Promise<Record<string, unknown>> {
+  const snapshot: Record<string, unknown> = {};
+  for (const serviceName of services) {
+    const currentImage = await inspectServiceImage(serviceName);
+    const rollbackImage = currentImage ? buildRollbackImageRef(currentImage, rollbackTag, registryPullHost, registryPort) : null;
+    if (!rollbackImage) {
+      snapshot[serviceName] = {
+        ok: false,
+        exit_code: 1,
+        output: 'Unable to determine rollback image reference.',
+      };
+      continue;
+    }
+
+    let result = await runCommandCaptureWithStatus('docker', [
+      'service',
+      'update',
+      '--image',
+      rollbackImage,
+      '--label-add',
+      `${RELEASE_ID_LABEL_KEY}=${rollbackTag}`,
+      serviceName,
+    ]);
+    const output = `${result.stderr || ''}\n${result.stdout || ''}`.toLowerCase();
+    if (result.code !== 0 && (output.includes('update paused') || output.includes('paused'))) {
+      await resumePausedServiceUpdate(serviceName, log);
+      result = await runCommandCaptureWithStatus('docker', [
+        'service',
+        'update',
+        '--image',
+        rollbackImage,
+        '--label-add',
+        `${RELEASE_ID_LABEL_KEY}=${rollbackTag}`,
+        serviceName,
+      ]);
+    }
+
+    snapshot[serviceName] = {
+      ok: result.code === 0,
+      exit_code: result.code,
+      output: (result.stderr || result.stdout || '').trim() || null,
+      image: rollbackImage,
     };
   }
   return snapshot;
@@ -3213,10 +3325,17 @@ async function processDeployment(recordPath: string) {
     log(`capacity unavailable; defaulting replica host to database (${message})`);
   }
 
-  const registryHost = process.env.REGISTRY_HOST || '127.0.0.1';
-  const registryPushHost = process.env.REGISTRY_PUSH_HOST || registryHost;
-  const registryPullHost = process.env.REGISTRY_PULL_HOST || registryHost;
-  const registryCacheHost = process.env.REGISTRY_CACHE_HOST || registryPullHost;
+  // Swarm service tasks must pull images from an address reachable by every node.
+  // Prefer an explicit pull host (WireGuard IP in multi-node setups). Fall back to REGISTRY_HOST.
+  const registryPullHost = await resolveRegistryPullHost(
+    process.env.REGISTRY_PULL_HOST || process.env.REGISTRY_HOST || '127.0.0.1',
+    log
+  );
+  // Historically stack templates use REGISTRY_HOST for service images; treat it as the pull host.
+  const registryHost = registryPullHost;
+  // Build/push can remain local to the manager to avoid BuildKit HTTPS-to-insecure registry issues.
+  const registryPushHost = process.env.REGISTRY_PUSH_HOST || '127.0.0.1';
+  const registryCacheHost = process.env.REGISTRY_CACHE_HOST || registryPushHost;
   const registryPort = process.env.REGISTRY_PORT || '5000';
   const registryCachePort = process.env.REGISTRY_CACHE_PORT || registryPort;
   const buildxNetwork = process.env.BUILDX_NETWORK || 'host';
@@ -3392,8 +3511,16 @@ async function processDeployment(recordPath: string) {
 
       if (!gate.ok) {
         log('release cohort gate failed; rolling back cohort');
-        const rollbackIssued = await rollbackReleaseCohort(cohortServices, log);
         const rollbackTargetTag = cohortSnapshotPre.tag;
+        const rollbackIssued = rollbackTargetTag
+          ? await rollbackReleaseCohortToTag(
+            cohortServices,
+            rollbackTargetTag,
+            String(envVars.REGISTRY_PULL_HOST || envVars.REGISTRY_HOST || '127.0.0.1'),
+            String(envVars.REGISTRY_PORT || '5000'),
+            log
+          )
+          : await rollbackReleaseCohort(cohortServices, log);
 
         let rollbackGate: { ok: boolean; summary: string; snapshot: Record<string, unknown> } | null = null;
         if (rollbackTargetTag) {

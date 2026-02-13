@@ -50,7 +50,9 @@ const ADDON_INTERVAL_MS = Number(process.env.MZ_ADDON_WORKER_INTERVAL_MS || 5000
 const FETCH_TIMEOUT_MS = Number(process.env.MZ_ADDON_FETCH_TIMEOUT_MS || process.env.MZ_FETCH_TIMEOUT_MS || 10 * 60 * 1000);
 const DOCKER_PUSH_TIMEOUT_MS = Number(process.env.MZ_DOCKER_PUSH_TIMEOUT_MS || 30 * 60 * 1000);
 const DOCKER_LOAD_TIMEOUT_MS = Number(process.env.MZ_DOCKER_LOAD_TIMEOUT_MS || 10 * 60 * 1000);
-const REGISTRY_HOST = process.env.REGISTRY_HOST || 'registry';
+// Swarm services must pull images from a host reachable by every node.
+// REGISTRY_HOST historically meant "service/pull host" in stack templates.
+const REGISTRY_PULL_HOST = process.env.REGISTRY_PULL_HOST || process.env.REGISTRY_HOST || '127.0.0.1';
 const REGISTRY_PORT = process.env.REGISTRY_PORT || '5000';
 const REGISTRY_PUSH_HOST = process.env.REGISTRY_PUSH_HOST || '127.0.0.1';
 const DEPLOY_RECORD_FILENAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i;
@@ -327,7 +329,7 @@ async function deployAddon(record: DeploymentRecord, deploymentId: string) {
   const serviceName = `${stackName}_addon-${slug}`;
   const imageRepo = `mz-addon-${environmentId}-${slug}`;
   const pushRef = `${REGISTRY_PUSH_HOST}:${REGISTRY_PORT}/${imageRepo}:${imageTag}`;
-  const serviceRef = `${REGISTRY_HOST}:${REGISTRY_PORT}/${imageRepo}:${imageTag}`;
+  const serviceRef = `${REGISTRY_PULL_HOST}:${REGISTRY_PORT}/${imageRepo}:${imageTag}`;
 
   const workDir = path.join(ADDON_WORK_DIR, deploymentId);
   ensureDir(workDir);
