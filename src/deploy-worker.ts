@@ -109,7 +109,16 @@ const DEPLOY_SMOKE_AUTO_HEAL_ENABLED = (process.env.MZ_DEPLOY_SMOKE_AUTO_HEAL_EN
 const DEPLOY_SMOKE_AUTO_HEAL_ROUNDS = Math.max(0, Number(process.env.MZ_DEPLOY_SMOKE_AUTO_HEAL_ROUNDS || 1));
 const DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED = (process.env.MZ_DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED || '0') === '1';
 const RELEASE_COHORT_GATE_ENABLED = (process.env.MZ_RELEASE_COHORT_GATE_ENABLED || '1') !== '0';
-const RELEASE_COHORT_GATE_TIMEOUT_MS = Math.max(10_000, Number(process.env.MZ_RELEASE_COHORT_GATE_TIMEOUT_MS || 5 * 60 * 1000));
+// Default 15 minutes: Swarm updates can legitimately take time (image pulls, task reschedules),
+// but we must not wait indefinitely.
+const releaseCohortGateTimeoutDefaultMs = 15 * 60 * 1000;
+const releaseCohortGateTimeoutParsed = Number(process.env.MZ_RELEASE_COHORT_GATE_TIMEOUT_MS);
+const RELEASE_COHORT_GATE_TIMEOUT_MS = Math.max(
+  10_000,
+  Number.isFinite(releaseCohortGateTimeoutParsed) && releaseCohortGateTimeoutParsed > 0
+    ? releaseCohortGateTimeoutParsed
+    : releaseCohortGateTimeoutDefaultMs
+);
 const RELEASE_COHORT_LABEL_KEY = process.env.MZ_RELEASE_COHORT_LABEL_KEY || 'mz.release.cohort';
 const RELEASE_COHORT_LABEL_VALUE = process.env.MZ_RELEASE_COHORT_LABEL_VALUE || 'magento';
 const RELEASE_ID_LABEL_KEY = process.env.MZ_RELEASE_ID_LABEL_KEY || 'mz.release.id';
