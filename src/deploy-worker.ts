@@ -3440,13 +3440,22 @@ async function processDeployment(recordPath: string) {
     'NGINX_VERSION',
     ...RESOURCE_ENV_KEYS,
   ]);
-  const renderedStack = await runCommandCapture('docker', [
+  const servicesStackPath = path.join(CLOUD_SWARM_DIR, 'stacks/magento-services.yml');
+  const appStackPath = path.join(CLOUD_SWARM_DIR, 'stacks/magento-app.yml');
+  const renderedServicesStack = await runCommandCapture('docker', [
     'stack',
     'config',
     '-c',
-    path.join(CLOUD_SWARM_DIR, 'stacks/magento.yml'),
+    servicesStackPath,
   ], { env: envVars });
-  assertNoLatestImages(renderedStack.stdout);
+  assertNoLatestImages(renderedServicesStack.stdout);
+  const renderedAppStack = await runCommandCapture('docker', [
+    'stack',
+    'config',
+    '-c',
+    appStackPath,
+  ], { env: envVars });
+  assertNoLatestImages(renderedAppStack.stdout);
 
   const secrets = envRecord?.environment_secrets ?? null;
   const envBaseUrl = envHostname ? `https://${envHostname.replace(/^https?:\/\//, '').replace(/\/+$/, '')}` : '';
@@ -3518,15 +3527,50 @@ async function processDeployment(recordPath: string) {
   writeJsonFileBestEffort(recordPath, recordMeta);
 
   progress.start('deploy_stack');
+  const baseServices = [
+    'varnish',
+    'database',
+    'database-replica',
+    'proxysql',
+    'opensearch',
+    'redis-cache',
+    'redis-session',
+    'rabbitmq',
+    'mailhog',
+  ];
+  const missingBaseServices: string[] = [];
+  for (const serviceName of baseServices) {
+    const fullName = `${stackName}_${serviceName}`;
+    const image = await inspectServiceImage(fullName);
+    if (!image) {
+      missingBaseServices.push(serviceName);
+    }
+  }
+
+  if (missingBaseServices.length) {
+    log(`base services missing (${missingBaseServices.join(', ')}); deploying services stack`);
+    await runCommandLogged('docker', [
+      'stack',
+      'deploy',
+      '--with-registry-auth',
+      '-c',
+      servicesStackPath,
+      stackName,
+    ], { env: envVars, logDir, label: 'stack-deploy-services' });
+    log('services stack deployed');
+  } else {
+    log('services stack present; skipping services redeploy');
+  }
+
   await runCommandLogged('docker', [
     'stack',
     'deploy',
     '--with-registry-auth',
     '-c',
-    path.join(CLOUD_SWARM_DIR, 'stacks/magento.yml'),
+    appStackPath,
     stackName,
-  ], { env: envVars, logDir, label: 'stack-deploy' });
-  log('stack deployed');
+  ], { env: envVars, logDir, label: 'stack-deploy-app' });
+  log('app stack deployed');
 
   if (RELEASE_COHORT_GATE_ENABLED) {
     progress.detail('deploy_stack', 'Waiting for Swarm services to converge');
