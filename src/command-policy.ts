@@ -37,6 +37,44 @@ function allow(): Decision {
   return { allowed: true };
 }
 
+function allowDockerPsArgs(args: string[]): Decision {
+  // Keep this tight: the deploy worker uses `docker ps` only to locate a
+  // specific container ID by name.
+  let i = 0;
+  let sawFilter = false;
+  let sawFormat = false;
+
+  while (i < args.length) {
+    const arg = String(args[i] || '');
+
+    if (arg === '--filter') {
+      if (sawFilter) return deny('docker ps only supports a single --filter');
+      const value = String(args[i + 1] || '');
+      if (!value) return deny('docker ps --filter missing value');
+      // Only allow name filters.
+      if (!value.startsWith('name=')) return deny('docker ps --filter must be name=...');
+      sawFilter = true;
+      i += 2;
+      continue;
+    }
+
+    if (arg === '--format') {
+      if (sawFormat) return deny('docker ps only supports a single --format');
+      const value = String(args[i + 1] || '');
+      if (!value) return deny('docker ps --format missing value');
+      sawFormat = true;
+      i += 2;
+      continue;
+    }
+
+    return deny(`docker ps arg not allowlisted: ${arg || '(missing)'}`);
+  }
+
+  if (!sawFilter) return deny('docker ps requires --filter name=...');
+  if (!sawFormat) return deny('docker ps requires --format ...');
+  return allow();
+}
+
 function isAllowed(command: string, args: string[]): Decision {
   const cmd = baseCommand(command);
   if (!cmd) return deny('empty command');
@@ -65,8 +103,10 @@ function isAllowed(command: string, args: string[]): Decision {
         'load',
         'tag',
         'push',
+        'ps',
       ]);
       if (!allowedSubs.has(sub)) return deny(`docker subcommand not allowlisted: ${sub || '(missing)'}`);
+      if (sub === 'ps') return allowDockerPsArgs(args.slice(1));
       return allow();
     }
     case 'curl': {

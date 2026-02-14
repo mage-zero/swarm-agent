@@ -18,6 +18,29 @@ describe('command policy', () => {
     expect(() => enforceCommandPolicy('docker', ['exec', 'cid', 'sh', '-c', 'echo ok'], { source: 'test' })).not.toThrow();
   });
 
+  it('allows the specific docker ps invocation used by deploy readiness checks', () => {
+    process.env.MZ_COMMAND_POLICY_MODE = 'enforce';
+    expect(() =>
+      enforceCommandPolicy(
+        'docker',
+        ['ps', '--filter', 'name=mz-env-15_php-fpm', '--format', '{{.ID}}'],
+        { source: 'test' },
+      ),
+    ).not.toThrow();
+  });
+
+  it('blocks docker ps when args are broader than expected', () => {
+    process.env.MZ_COMMAND_POLICY_MODE = 'enforce';
+    expect(() => enforceCommandPolicy('docker', ['ps'], { source: 'test' })).toThrow(/requires/i);
+    expect(() => enforceCommandPolicy('docker', ['ps', '--format', '{{.ID}}'], { source: 'test' })).toThrow(/requires/i);
+    expect(() =>
+      enforceCommandPolicy('docker', ['ps', '--filter', 'label=foo', '--format', '{{.ID}}'], { source: 'test' }),
+    ).toThrow(/name=/i);
+    expect(() =>
+      enforceCommandPolicy('docker', ['ps', '--filter', 'name=foo', '--format', '{{.ID}}', '--no-trunc'], { source: 'test' }),
+    ).toThrow(/not allowlisted/i);
+  });
+
   it('blocks unknown commands', () => {
     process.env.MZ_COMMAND_POLICY_MODE = 'enforce';
     expect(() => enforceCommandPolicy('python', ['-c', 'print(1)'], { source: 'test' })).toThrow(/not allowlisted/i);
