@@ -109,6 +109,10 @@ const DEPLOY_SMOKE_AUTO_HEAL_ENABLED = (process.env.MZ_DEPLOY_SMOKE_AUTO_HEAL_EN
 const DEPLOY_SMOKE_AUTO_HEAL_ROUNDS = Math.max(0, Number(process.env.MZ_DEPLOY_SMOKE_AUTO_HEAL_ROUNDS || 1));
 const DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED = (process.env.MZ_DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED || '0') === '1';
 const RELEASE_COHORT_GATE_ENABLED = (process.env.MZ_RELEASE_COHORT_GATE_ENABLED || '1') !== '0';
+// Rolling back a cohort to an unknown state can make things worse (e.g. rolling back to a tag that was never
+// a successful deploy). Default to "fail-fast + stop crash-looping services" instead.
+const RELEASE_COHORT_ROLLBACK_ENABLED = (process.env.MZ_RELEASE_COHORT_ROLLBACK_ENABLED || '0') === '1';
+const RELEASE_COHORT_SCALE_DOWN_ON_FAILURE = (process.env.MZ_RELEASE_COHORT_SCALE_DOWN_ON_FAILURE || '1') !== '0';
 // Default 15 minutes: Swarm updates can legitimately take time (image pulls, task reschedules),
 // but we must not wait indefinitely.
 const releaseCohortGateTimeoutDefaultMs = 15 * 60 * 1000;
@@ -2808,6 +2812,30 @@ async function rollbackReleaseCohortToTag(
   return snapshot;
 }
 
+async function scaleDownServices(services: string[], log: (message: string) => void): Promise<Record<string, unknown>> {
+  const snapshot: Record<string, unknown> = {};
+  for (const serviceName of services) {
+    const result = await runCommandCaptureWithStatus('docker', [
+      'service',
+      'update',
+      '--replicas',
+      '0',
+      serviceName,
+    ]);
+    snapshot[serviceName] = {
+      ok: result.code === 0,
+      exit_code: result.code,
+      output: (result.stderr || result.stdout || '').trim() || null,
+    };
+    if (result.code === 0) {
+      log(`scaled down service: ${serviceName} replicas=0`);
+    } else {
+      log(`failed to scale down service: ${serviceName} (exit ${result.code}) ${(result.stderr || result.stdout || '').trim()}`);
+    }
+  }
+  return snapshot;
+}
+
 async function tryForceUpdateService(serviceName: string, log: (message: string) => void): Promise<boolean> {
   let result = await runCommandCaptureWithStatus('docker', ['service', 'update', '--force', serviceName]);
   if (result.code !== 0) {
@@ -3519,40 +3547,61 @@ async function processDeployment(recordPath: string) {
       writeJsonFileBestEffort(recordPath, recordMeta);
 
       if (!gate.ok) {
-        log('release cohort gate failed; rolling back cohort');
-        const rollbackTargetTag = cohortSnapshotPre.tag;
-        const rollbackIssued = rollbackTargetTag
-          ? await rollbackReleaseCohortToTag(
-            cohortServices,
-            rollbackTargetTag,
-            String(envVars.REGISTRY_PULL_HOST || envVars.REGISTRY_HOST || '127.0.0.1'),
-            String(envVars.REGISTRY_PORT || '5000'),
-            log
-          )
-          : await rollbackReleaseCohort(cohortServices, log);
+        log('release cohort gate failed');
 
-        let rollbackGate: { ok: boolean; summary: string; snapshot: Record<string, unknown> } | null = null;
-        if (rollbackTargetTag) {
-          log(`release cohort rollback: waiting for services to converge to previous tag ${rollbackTargetTag}`);
-          rollbackGate = await waitForReleaseCohort(rollbackTargetTag, cohortServices, log, RELEASE_COHORT_GATE_TIMEOUT_MS);
-        } else {
-          const post = await captureReleaseCohortSnapshot(cohortServices);
-          if (post.tag) {
-            log(`release cohort rollback: previous tag unknown, observed tag ${post.tag}; waiting for convergence`);
-            rollbackGate = await waitForReleaseCohort(post.tag, cohortServices, log, RELEASE_COHORT_GATE_TIMEOUT_MS);
-          }
+        // Default behavior: stop crash-looping cohort services and fail the deploy.
+        // Rollback is optional because the "previous tag" is not necessarily a known-good deploy.
+        let shutdownSnapshot: Record<string, unknown> | null = null;
+        if (RELEASE_COHORT_SCALE_DOWN_ON_FAILURE) {
+          log('release cohort: scaling down cohort services to replicas=0');
+          shutdownSnapshot = await scaleDownServices(cohortServices, log);
         }
-
-        recordMeta.release_cohort_rollback = {
-          issued_at: new Date().toISOString(),
-          issued: rollbackIssued,
-          expected_tag: rollbackTargetTag,
-          gate: rollbackGate,
-        };
+        recordMeta.release_cohort_shutdown = shutdownSnapshot
+          ? { issued_at: new Date().toISOString(), services: cohortServices, snapshot: shutdownSnapshot }
+          : null;
         writeJsonFileBestEffort(recordPath, recordMeta);
 
-        const rollbackNote = rollbackTargetTag ? `Rolled back to ${rollbackTargetTag}.` : 'Rollback attempted.';
-        throw new Error(`Release cohort did not converge to ${mageVersion}: ${gate.summary}. ${rollbackNote}`);
+        if (RELEASE_COHORT_ROLLBACK_ENABLED) {
+          log('release cohort: rollback enabled; attempting rollback of cohort services');
+          const rollbackTargetTag = cohortSnapshotPre.tag;
+          const rollbackIssued = rollbackTargetTag
+            ? await rollbackReleaseCohortToTag(
+              cohortServices,
+              rollbackTargetTag,
+              String(envVars.REGISTRY_PULL_HOST || envVars.REGISTRY_HOST || '127.0.0.1'),
+              String(envVars.REGISTRY_PORT || '5000'),
+              log
+            )
+            : await rollbackReleaseCohort(cohortServices, log);
+
+          let rollbackGate: { ok: boolean; summary: string; snapshot: Record<string, unknown> } | null = null;
+          if (rollbackTargetTag) {
+            log(`release cohort rollback: waiting for services to converge to previous tag ${rollbackTargetTag}`);
+            rollbackGate = await waitForReleaseCohort(rollbackTargetTag, cohortServices, log, RELEASE_COHORT_GATE_TIMEOUT_MS);
+          } else {
+            const post = await captureReleaseCohortSnapshot(cohortServices);
+            if (post.tag) {
+              log(`release cohort rollback: previous tag unknown, observed tag ${post.tag}; waiting for convergence`);
+              rollbackGate = await waitForReleaseCohort(post.tag, cohortServices, log, RELEASE_COHORT_GATE_TIMEOUT_MS);
+            }
+          }
+
+          recordMeta.release_cohort_rollback = {
+            issued_at: new Date().toISOString(),
+            issued: rollbackIssued,
+            expected_tag: rollbackTargetTag,
+            gate: rollbackGate,
+          };
+          writeJsonFileBestEffort(recordPath, recordMeta);
+
+          const rollbackNote = rollbackTargetTag ? `Rolled back to ${rollbackTargetTag}.` : 'Rollback attempted.';
+          throw new Error(`Release cohort did not converge to ${mageVersion}: ${gate.summary}. ${rollbackNote}`);
+        }
+
+        const shutdownNote = RELEASE_COHORT_SCALE_DOWN_ON_FAILURE
+          ? 'Cohort services were scaled down (replicas=0) to avoid crash loops.'
+          : 'Cohort services were left as-is.';
+        throw new Error(`Release cohort did not converge to ${mageVersion}: ${gate.summary}. ${shutdownNote}`);
       }
     }
   }
