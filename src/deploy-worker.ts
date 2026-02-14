@@ -7,6 +7,8 @@ import { isDeployPaused } from './deploy-pause.js';
 import { buildCapacityPayload, buildPlannerPayload, isSwarmManager, readConfig } from './status.js';
 import { enforceCommandPolicy } from './command-policy.js';
 import { parseListObjectsV2Xml } from './r2-list.js';
+import { getDbBackupZstdLevel } from './backup-utils.js';
+import { buildJobName, envServiceName, inspectServiceSpec, listServiceTasks, runSwarmJob } from './swarm.js';
 
 type DeployPayload = {
   artifact?: string;
@@ -3048,34 +3050,135 @@ async function runSetupUpgradeWithRetry(
   throw lastError || new Error('setup:upgrade failed after retries');
 }
 
+function parseEnvironmentIdFromStackName(stackName: string): number | null {
+  const match = /^mz-env-(\d+)$/.exec(String(stackName || '').trim());
+  if (!match) return null;
+  const id = Number(match[1]);
+  if (!Number.isFinite(id) || id <= 0) return null;
+  return id;
+}
+
+async function toggleMagentoMaintenanceFlagOnService(params: {
+  environmentId: number;
+  serviceName: string;
+  mode: 'enable' | 'disable';
+  log: (message: string) => void;
+}): Promise<{ ok: boolean; details: string[] }> {
+  const serviceFullName = envServiceName(params.environmentId, params.serviceName);
+  const spec = await inspectServiceSpec(serviceFullName);
+  if (!spec) {
+    return { ok: false, details: [`missing service: ${serviceFullName}`] };
+  }
+
+  const tasks = await listServiceTasks(serviceFullName);
+  const desiredRunning = tasks.filter((t) => String(t.desired_state || '').toLowerCase() === 'running' && t.node);
+  const nodes = Array.from(new Set((desiredRunning.length ? desiredRunning : tasks).map((t) => t.node).filter(Boolean)));
+  if (!nodes.length) {
+    return { ok: false, details: [`no tasks/nodes found for service: ${serviceFullName}`] };
+  }
+
+  const networks = Array.from(new Set(spec.networks.map((net) => net.name).filter(Boolean)));
+  if (!networks.length) networks.push('mz-backend');
+  const secrets = spec.secrets.map((secret) => ({ source: secret.secret_name, target: secret.file_name }));
+  const mounts = spec.mounts.map((mount) => ({
+    type: mount.type,
+    source: mount.source,
+    target: mount.target,
+    read_only: mount.read_only,
+  }));
+
+  const flagPath = '/var/www/html/magento/var/.maintenance.flag';
+  const script = params.mode === 'enable'
+    ? `set -eu; mkdir -p /var/www/html/magento/var; touch ${flagPath}`
+    : `set -eu; rm -f ${flagPath} || true`;
+
+  let ok = true;
+  const details: string[] = [];
+  for (const node of nodes) {
+    const jobName = buildJobName(`deploy-maint-${params.mode}-${params.serviceName}`, params.environmentId);
+    const job = await runSwarmJob({
+      name: jobName,
+      image: spec.image,
+      networks,
+      secrets,
+      mounts,
+      env: spec.env,
+      constraints: [`node.hostname==${node}`],
+      command: ['sh', '-lc', script],
+      timeout_ms: 90_000,
+    });
+    params.log(`maintenance:${params.mode} ${serviceFullName} on ${node}: ${job.ok ? 'ok' : job.state}`);
+    if (!job.ok) {
+      ok = false;
+      const jobOutput = (job.logs || job.error || '').trim();
+      details.push(`${serviceFullName} on ${node}: ${job.state}${jobOutput ? ` (${jobOutput})` : ''}`);
+    }
+  }
+
+  return { ok, details };
+}
+
 async function setMagentoMaintenanceMode(
   containerId: string,
   stackName: string,
   mode: 'enable' | 'disable',
   log: (message: string) => void,
 ) {
-  let currentId = containerId;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    currentId = await ensureMagentoEnvWrapperWithRetry(currentId, stackName, log);
-    const result = await runMagentoCommandWithStatus(
-      currentId,
-      stackName,
-      `php bin/magento maintenance:${mode} --no-interaction`,
-    );
-    if (result.code === 0) {
-      log(`maintenance:${mode} ok`);
-      return currentId;
+  const environmentId = parseEnvironmentIdFromStackName(stackName);
+  if (!environmentId) {
+    // Fallback for unexpected stack names: best-effort in php-fpm-admin only.
+    let currentId = containerId;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      currentId = await ensureMagentoEnvWrapperWithRetry(currentId, stackName, log);
+      const result = await runMagentoCommandWithStatus(
+        currentId,
+        stackName,
+        `php bin/magento maintenance:${mode} --no-interaction`,
+      );
+      if (result.code === 0) {
+        log(`maintenance:${mode} ok`);
+        return currentId;
+      }
+      const output = (result.stderr || result.stdout || '').trim();
+      if (!output || output.includes('No such container') || output.includes('is not running')) {
+        log(`maintenance:${mode} retry ${attempt}: ${output || `exit ${result.code}`}`);
+        currentId = await waitForContainer(stackName, 'php-fpm-admin', 60 * 1000);
+        await delay(2000);
+        continue;
+      }
+      throw new Error(`maintenance:${mode} failed (exit ${result.code}): ${output}`);
     }
-    const output = (result.stderr || result.stdout || '').trim();
-    if (!output || output.includes('No such container') || output.includes('is not running')) {
-      log(`maintenance:${mode} retry ${attempt}: ${output || `exit ${result.code}`}`);
-      currentId = await waitForContainer(stackName, 'php-fpm-admin', 60 * 1000);
-      await delay(2000);
-      continue;
-    }
-    throw new Error(`maintenance:${mode} failed (exit ${result.code}): ${output}`);
+    return currentId;
   }
-  return currentId;
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const frontend = await toggleMagentoMaintenanceFlagOnService({
+        environmentId,
+        serviceName: 'php-fpm',
+        mode,
+        log,
+      });
+      const admin = await toggleMagentoMaintenanceFlagOnService({
+        environmentId,
+        serviceName: 'php-fpm-admin',
+        mode,
+        log,
+      });
+      if (frontend.ok && admin.ok) {
+        log(`maintenance:${mode} ok`);
+        return containerId;
+      }
+      const combined = [...frontend.details, ...admin.details].filter(Boolean).join('; ');
+      throw new Error(combined || 'maintenance flag toggle failed');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`maintenance:${mode} retry ${attempt}: ${message}`);
+      await delay(2000);
+    }
+  }
+
+  throw new Error(`maintenance:${mode} failed after retries`);
 }
 
 async function runSetupDbStatus(
@@ -3088,24 +3191,52 @@ async function runSetupDbStatus(
     currentId = await ensureMagentoEnvWrapperWithRetry(currentId, stackName, log);
     const result = await runMagentoCommandWithStatus(currentId, stackName, 'php bin/magento setup:db:status');
     const output = (result.stderr || result.stdout || '').trim();
+    const outputLower = output.toLowerCase();
     const exitCode = result.code;
-    if (exitCode === 0) {
+
+    // Magento core strings (example: setup/src/Magento/Setup/Console/Command/DbStatusCommand.php):
+    // - ok: "All modules are up to date."
+    // - upgrade required: "Run 'setup:upgrade' to update your DB schema and data."
+    // - not installed: "No information is available: the Magento application is not installed."
+    //
+    // Other Magento versions / forks sometimes emit different strings and/or use
+    // exit code 1 for mismatches, so we keep a few backward-compatible fallbacks.
+    const OK_UP_TO_DATE = 'all modules are up to date.';
+    const NEEDS_UPGRADE_HINT = "run 'setup:upgrade' to update your db schema and data.";
+    const NOT_INSTALLED = 'no information is available: the magento application is not installed.';
+
+    // First: trust a clean exit or the explicit up-to-date message.
+    if (exitCode === 0 || outputLower.includes(OK_UP_TO_DATE)) {
       return { needed: false, exitCode, output, containerId: currentId };
     }
-    if (exitCode === 1 || exitCode === 2) {
+
+    // Next: trust Magento's explicit upgrade hint (core) and common alternates.
+    const LEGACY_CODE_DB_MISMATCH = 'some modules use code versions newer or older than the database';
+    const LEGACY_UPGRADE_REQUIRED = 'setup:upgrade is required';
+    if (
+      outputLower.includes(NEEDS_UPGRADE_HINT)
+      || outputLower.includes(LEGACY_CODE_DB_MISMATCH)
+      || outputLower.includes(LEGACY_UPGRADE_REQUIRED)
+      || exitCode === 2
+    ) {
       return { needed: true, exitCode, output, containerId: currentId };
     }
-    if (output && output.toLowerCase().includes('setup:upgrade is required')) {
-      return { needed: true, exitCode, output, containerId: currentId };
-    }
+
     if (!output || output.includes('No such container') || output.includes('is not running')) {
       log(`setup:db:status retry ${attempt}: ${output || `exit ${exitCode}`}`);
       currentId = await waitForContainer(stackName, 'php-fpm-admin', 60 * 1000);
       await delay(2000);
       continue;
     }
-    log(`setup:db:status unexpected exit=${exitCode}: ${output}`);
-    return { needed: true, exitCode, output, containerId: currentId };
+
+    // Not installed is a real state (typically pre-install); treat as a hard error.
+    if (outputLower.includes(NOT_INSTALLED)) {
+      log(`setup:db:status not installed exit=${exitCode}: ${output}`);
+      throw new Error(`setup:db:status indicates Magento is not installed: ${output}`);
+    }
+
+    log(`setup:db:status failed exit=${exitCode}: ${output}`);
+    throw new Error(`setup:db:status failed (exit ${exitCode}): ${output}`);
   }
   return { needed: true, exitCode: 1, output: 'setup:db:status retries exhausted', containerId: currentId };
 }
@@ -3168,7 +3299,8 @@ async function backupDatabasePreUpgrade(params: {
     await runCommand('docker', ['cp', `${params.dbContainerId}:${containerTmp}`, dumpPath]);
     await runCommand('docker', ['exec', params.dbContainerId, 'sh', '-lc', `rm -f ${containerTmp} || true`]).catch(() => {});
 
-    await runCommand('zstd', ['-19', '-f', '-o', zstPath, dumpPath]);
+    const zstdLevel = getDbBackupZstdLevel();
+    await runCommand('zstd', [`-${zstdLevel}`, '-f', '-o', zstPath, dumpPath]);
     await runCommand('age', ['-R', publicKeyPath, '-o', agePath, zstPath]);
     await uploadArtifact(params.r2, params.objectKey, agePath);
     params.log(`db backup uploaded: ${params.objectKey}`);

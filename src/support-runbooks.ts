@@ -5,6 +5,7 @@ import { buildNodeHeaders, buildSignature } from './node-hmac.js';
 import { readConfig } from './status.js';
 import { getDeployPauseFilePath, isDeployPaused, readDeployPausedAt, setDeployPaused } from './deploy-pause.js';
 import { runCommand, runCommandToFile } from './exec.js';
+import { getDbBackupZstdLevel } from './backup-utils.js';
 import {
   buildJobName,
   envServiceName,
@@ -2112,7 +2113,8 @@ async function runDbBackup(environmentId: number, input: Record<string, unknown>
     progress.ok('dump', dumpSource ? `Source: ${dumpSource}` : '');
 
     progress.start('compress');
-    const zstdResult = await runCommand('zstd', ['-19', '-f', '-o', zstPath, dumpPath], 15 * 60_000);
+    const zstdLevel = getDbBackupZstdLevel();
+    const zstdResult = await runCommand('zstd', [`-${zstdLevel}`, '-f', '-o', zstPath, dumpPath], 15 * 60_000);
     if (zstdResult.code !== 0) {
       const output = (zstdResult.stderr || zstdResult.stdout || '').trim();
       throw new Error(output ? `zstd failed: ${output}` : 'zstd failed.');
@@ -3776,7 +3778,8 @@ async function runEnvironmentTeardown(environmentId: number, input: Record<strin
     progress.ok('dump');
 
     progress.start('compress');
-    const zstdResult = await runCommand('zstd', ['-19', '-f', '-o', zstPath, dumpPath], 10 * 60_000);
+    const zstdLevel = getDbBackupZstdLevel();
+    const zstdResult = await runCommand('zstd', [`-${zstdLevel}`, '-f', '-o', zstPath, dumpPath], 10 * 60_000);
     if (zstdResult.code !== 0) {
       const output = (zstdResult.stderr || zstdResult.stdout || '').trim();
       throw new Error(output ? `zstd failed: ${output}` : 'zstd failed.');
