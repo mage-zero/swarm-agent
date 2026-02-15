@@ -1708,6 +1708,45 @@ async function ensureCloudSwarmRepo() {
   await runCommand('git', ['-C', CLOUD_SWARM_DIR, 'checkout', '-B', 'main', 'origin/main', '--force'], { env: gitEnv });
 }
 
+/**
+ * Ensure the mz-monitoring overlay network and monitoring stack exist.
+ * Idempotent: skips if the stack already has running services.
+ */
+async function ensureMonitoringStack(log: (msg: string) => void, envVars: NodeJS.ProcessEnv) {
+  // 1. Ensure the mz-monitoring overlay network exists
+  const { code: netCode } = await runCommandCaptureWithStatus(
+    'docker', ['network', 'inspect', 'mz-monitoring'],
+  );
+  if (netCode !== 0) {
+    log('creating mz-monitoring overlay network');
+    await runCommandCapture('docker', [
+      'network', 'create',
+      '--driver', 'overlay',
+      '--attachable',
+      '--opt', 'encrypted=true',
+      'mz-monitoring',
+    ]);
+  }
+
+  // 2. Deploy monitoring stack if not already present
+  const monitoringStackName = 'mz-monitoring';
+  const { stdout: stackList } = await runCommandCapture('docker', ['stack', 'ls', '--format', '{{.Name}}']);
+  if (stackList.split('\n').some(n => n.trim() === monitoringStackName)) {
+    log('monitoring stack already deployed');
+    return;
+  }
+
+  log('deploying monitoring stack');
+  const monitoringStackPath = path.join(CLOUD_SWARM_DIR, 'stacks/monitoring.yml');
+  await runCommandCapture('docker', [
+    'stack', 'deploy',
+    '--with-registry-auth',
+    '-c', monitoringStackPath,
+    monitoringStackName,
+  ], { env: envVars });
+  log('monitoring stack deployed');
+}
+
 async function downloadArtifact(r2: R2PresignContext, objectKeyOrUrl: string, targetPath: string) {
   const source = String(objectKeyOrUrl || '').trim();
   if (!source) {
@@ -3611,6 +3650,12 @@ async function processDeployment(recordPath: string) {
     SMTP_AUTH_PASSWORD: mailCatcherEnabled ? '' : (process.env.SMTP_AUTH_PASSWORD || ''),
     SMTP_FROM_ADDRESS: process.env.SMTP_FROM_ADDRESS || (envHostnameOnly ? `no-reply@${envHostnameOnly}` : ''),
     SMTP_FROM_HOSTNAME: process.env.SMTP_FROM_HOSTNAME || envHostnameOnly,
+    // APM / Monitoring
+    MZ_APM_ENABLED: '1',
+    MZ_APM_SERVER_URL: `http://mz-monitoring_apm-server:8200`,
+    MZ_APM_SAMPLE_RATE: process.env.MZ_APM_SAMPLE_RATE || '1.0',
+    MZ_APM_SERVICE_NAME: `mz-env-${environmentId}`,
+    MZ_APM_ENVIRONMENT: envTypeRaw || 'production',
   };
   assertRequiredEnv(envVars, [
     'MAGE_VERSION',
@@ -3712,6 +3757,9 @@ async function processDeployment(recordPath: string) {
     captured_at: new Date().toISOString(),
   };
   writeJsonFileBestEffort(recordPath, recordMeta);
+
+  // Ensure monitoring infrastructure is available before deploying env stacks.
+  await ensureMonitoringStack(log, envVars);
 
   progress.start('deploy_stack');
   const baseServices = [

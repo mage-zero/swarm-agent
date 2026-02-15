@@ -54,6 +54,7 @@ describe('command policy', () => {
   it('allows deploy bash scripts with expected args', () => {
     process.env.MZ_COMMAND_POLICY_MODE = 'enforce';
     expect(() => enforceCommandPolicy('bash', ['/opt/mage-zero/cloud-swarm/scripts/build-services.sh'], { source: 'test' })).not.toThrow();
+    expect(() => enforceCommandPolicy('bash', ['/opt/mage-zero/cloud-swarm/scripts/build-monitoring.sh'], { source: 'test' })).not.toThrow();
     expect(() => enforceCommandPolicy('bash', ['/opt/mage-zero/cloud-swarm/scripts/build-magento.sh', '/tmp/build.tar.zst'], { source: 'test' })).not.toThrow();
   });
 
@@ -61,6 +62,15 @@ describe('command policy', () => {
     process.env.MZ_COMMAND_POLICY_MODE = 'enforce';
     expect(() => enforceCommandPolicy('bash', ['/opt/mage-zero/cloud-swarm/scripts/unknown.sh'], { source: 'test' })).toThrow(/not allowlisted/i);
     expect(() => enforceCommandPolicy('bash', ['/opt/mage-zero/cloud-swarm/scripts/build-services.sh', 'extra'], { source: 'test' })).toThrow(/does not accept extra args/i);
+    expect(() => enforceCommandPolicy('bash', ['/opt/mage-zero/cloud-swarm/scripts/build-monitoring.sh', 'extra'], { source: 'test' })).toThrow(/does not accept extra args/i);
     expect(() => enforceCommandPolicy('bash', ['/opt/mage-zero/cloud-swarm/scripts/build-magento.sh'], { source: 'test' })).toThrow(/requires artifact path arg/i);
+  });
+
+  it('allows docker network and stack commands used by monitoring stack', () => {
+    process.env.MZ_COMMAND_POLICY_MODE = 'enforce';
+    expect(() => enforceCommandPolicy('docker', ['network', 'inspect', 'mz-monitoring'], { source: 'test' })).not.toThrow();
+    expect(() => enforceCommandPolicy('docker', ['network', 'create', '--driver', 'overlay', '--attachable', '--opt', 'encrypted=true', 'mz-monitoring'], { source: 'test' })).not.toThrow();
+    expect(() => enforceCommandPolicy('docker', ['stack', 'ls'], { source: 'test' })).not.toThrow();
+    expect(() => enforceCommandPolicy('docker', ['stack', 'deploy', '-c', 'monitoring.yml', 'mz-monitoring'], { source: 'test' })).not.toThrow();
   });
 });

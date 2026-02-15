@@ -154,6 +154,10 @@ function isAllowed(command: string, args: string[]): Decision {
         if (args.length !== 1) return deny('build-services.sh does not accept extra args');
         return allow();
       }
+      if (scriptPath.endsWith('/scripts/build-monitoring.sh')) {
+        if (args.length !== 1) return deny('build-monitoring.sh does not accept extra args');
+        return allow();
+      }
       if (scriptPath.endsWith('/scripts/build-magento.sh')) {
         if (args.length < 2) return deny('build-magento.sh requires artifact path arg');
         return allow();

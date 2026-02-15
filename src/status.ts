@@ -1973,6 +1973,97 @@ function aggregateInspectionHistory(
   };
 }
 
+/**
+ * Query the monitoring stack's OpenSearch for recent Metricbeat and APM aggregated metrics.
+ * Returns per-service metrics keyed by service short name (e.g. "database", "redis-cache").
+ */
+async function collectMonitoringMetrics(): Promise<Record<string, Record<string, InspectionMetricValue>>> {
+  const result: Record<string, Record<string, InspectionMetricValue>> = {};
+  try {
+    // Find the monitoring opensearch container
+    const listResp = await dockerRequestWithOptions(
+      `/${await getDockerApiVersion()}/containers/json?filters=${encodeURIComponent(JSON.stringify({ name: ['mz-monitoring_opensearch.'] }))}`,
+    );
+    const containers = Array.isArray(listResp) ? listResp : [];
+    const osContainer = containers.find(
+      (c: any) => String(c?.State) === 'running' && !String(c?.Names?.[0] ?? '').includes('init'),
+    );
+    if (!osContainer?.Id) {
+      return result;
+    }
+    const containerId = osContainer.Id;
+
+    // Query APM for average transaction duration per service (last 30 min)
+    const apmQuery = JSON.stringify({
+      size: 0,
+      query: { range: { '@timestamp': { gte: 'now-30m' } } },
+      aggs: {
+        by_service: {
+          terms: { field: 'context.service.name', size: 50 },
+          aggs: {
+            avg_duration: { avg: { field: 'transaction.duration.us' } },
+            p95_duration: { percentiles: { field: 'transaction.duration.us', percents: [95] } },
+            error_rate: {
+              filter: { term: { 'transaction.result': 'HTTP 5xx' } },
+            },
+            total: { value_count: { field: 'transaction.duration.us' } },
+          },
+        },
+      },
+    });
+    const apmCmd = ['sh', '-c', `curl -sf 'http://localhost:9200/apm-*/_search' -H 'Content-Type: application/json' -d '${apmQuery.replace(/'/g, "'\\''")}'`];
+    try {
+      const apmResult = await execContainerCommand(containerId, apmCmd, 10000);
+      if (apmResult.exitCode === 0 && apmResult.stdout) {
+        const parsed = JSON.parse(apmResult.stdout);
+        const buckets = parsed?.aggregations?.by_service?.buckets ?? [];
+        for (const bucket of buckets) {
+          const serviceName = String(bucket.key ?? '');
+          if (!serviceName) continue;
+          // APM service names are like "mz-env-5", map to the env
+          if (!result[serviceName]) result[serviceName] = {};
+          result[serviceName]['apm_avg_duration_us'] = bucket.avg_duration?.value ?? null;
+          result[serviceName]['apm_p95_duration_us'] = bucket.p95_duration?.values?.['95.0'] ?? null;
+          result[serviceName]['apm_request_count'] = bucket.total?.value ?? null;
+          result[serviceName]['apm_error_count'] = bucket.error_rate?.doc_count ?? null;
+        }
+      }
+    } catch { /* APM data may not exist yet */ }
+
+    // Query Metricbeat for system-level host metrics (last 5 min)
+    const systemQuery = JSON.stringify({
+      size: 1,
+      sort: [{ '@timestamp': 'desc' }],
+      query: {
+        bool: {
+          must: [
+            { range: { '@timestamp': { gte: 'now-5m' } } },
+            { term: { 'metricset.name': 'cpu' } },
+          ],
+        },
+      },
+    });
+    const sysCmd = ['sh', '-c', `curl -sf 'http://localhost:9200/mz-metrics-*/_search' -H 'Content-Type: application/json' -d '${systemQuery.replace(/'/g, "'\\''")}'`];
+    try {
+      const sysResult = await execContainerCommand(containerId, sysCmd, 10000);
+      if (sysResult.exitCode === 0 && sysResult.stdout) {
+        const parsed = JSON.parse(sysResult.stdout);
+        const hit = parsed?.hits?.hits?.[0]?._source;
+        if (hit) {
+          if (!result['_host']) result['_host'] = {};
+          result['_host']['host_cpu_system_pct'] = hit?.system?.cpu?.system?.pct ?? null;
+          result['_host']['host_cpu_user_pct'] = hit?.system?.cpu?.user?.pct ?? null;
+          result['_host']['host_cpu_total_pct'] = hit?.system?.cpu?.total?.pct ?? null;
+          result['_host']['host_memory_used_pct'] = hit?.system?.memory?.actual?.used?.pct ?? null;
+        }
+      }
+    } catch { /* Metricbeat data may not exist yet */ }
+  } catch {
+    // Monitoring stack may not be deployed yet; this is non-fatal
+  }
+  return result;
+}
+
 async function buildInspectionForTuning(): Promise<PlannerInspectionPayload> {
   const now = new Date().toISOString();
   const nowMs = Date.now();
@@ -1999,6 +2090,35 @@ async function buildInspectionForTuning(): Promise<PlannerInspectionPayload> {
     : latestInspection;
   aggregated.window_minutes = Math.round(TUNING_INTERVAL_MS / 60000);
   aggregated.sample_count = windowEntries.length;
+
+  // Enrich with monitoring stack data (Metricbeat + APM)
+  try {
+    const monitoringMetrics = await collectMonitoringMetrics();
+    if (Object.keys(monitoringMetrics).length > 0) {
+      for (const service of aggregated.services) {
+        // Match APM data by environment service name (e.g. "mz-env-5")
+        const apmKey = service.name.replace(/_[^_]+$/, '');
+        const apmData = monitoringMetrics[apmKey];
+        if (apmData) {
+          service.app = { ...(service.app || {}), ...apmData };
+        }
+      }
+      // Attach host-level metrics to a synthetic service entry
+      const hostMetrics = monitoringMetrics['_host'];
+      if (hostMetrics && Object.keys(hostMetrics).length > 0) {
+        aggregated.services.push({
+          name: '_host_metrics',
+          service: '_host',
+          container_ids: [],
+          replicas: 0,
+          app: hostMetrics,
+        });
+      }
+    }
+  } catch {
+    // Non-fatal: monitoring data enrichment is best-effort
+  }
+
   return aggregated;
 }
 
