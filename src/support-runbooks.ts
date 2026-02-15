@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import readline from 'readline';
 import { buildNodeHeaders, buildSignature } from './node-hmac.js';
 import { readConfig } from './status.js';
 import { getDeployPauseFilePath, isDeployPaused, readDeployPausedAt, setDeployPaused } from './deploy-pause.js';
@@ -33,6 +34,8 @@ const DEPLOY_HISTORY_FILE = process.env.MZ_DEPLOY_HISTORY_FILE || path.join(DEPL
 const DEPLOY_RECORD_FILENAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i;
 const DEPLOY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const STACK_MASTER_PUBLIC_KEY_PATH = process.env.MZ_STACK_MASTER_PUBLIC_KEY_PATH || '/etc/magezero/stack_master_ssh.pub';
+const STACK_MASTER_KEY_PATH = process.env.MZ_STACK_MASTER_KEY_PATH || '/etc/magezero/stack_master_ssh';
+const DEFAULT_DB_RESTORE_OBJECT = process.env.MZ_DB_BACKUP_OBJECT || 'provisioning-database.sql.zst.age';
 
 type RunbookDefinition = {
   id: string;
@@ -230,6 +233,9 @@ type R2PresignContext = {
 type EnvironmentRecord = {
   environment_id?: number;
   db_backup_bucket?: string;
+  db_backup_object?: string;
+  environment_hostname?: string;
+  hostname?: string;
 };
 
 const RUNBOOKS: RunbookDefinition[] = [
@@ -279,6 +285,13 @@ const RUNBOOKS: RunbookDefinition[] = [
     id: 'db_replica_reseed',
     name: 'Reseed database replica from primary',
     description: 'Destructive rebuild: wipe replica data and reseed from primary using a logical GTID snapshot, then start replication.',
+    safe: false,
+    supports_remediation: true,
+  },
+  {
+    id: 'db_restore_provisioning',
+    name: 'Restore database (provisioning)',
+    description: 'Restore the Magento database from the configured provisioning backup object in R2. Use before the first code deploy.',
     safe: false,
     supports_remediation: true,
   },
@@ -1924,6 +1937,8 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
       return runMagentoMaintenance(environmentId, 'disable');
     case 'db_backup':
       return runDbBackup(environmentId, input);
+    case 'db_restore_provisioning':
+      return runDbRestoreProvisioning(environmentId, input);
     case 'environment_teardown':
       return runEnvironmentTeardown(environmentId, input);
     case 'proxysql_restart':
@@ -1935,6 +1950,303 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
     default:
       return { error: 'unknown_runbook', status: 404 };
   }
+}
+
+function normalizeDbRestoreObjectKey(environmentId: number, raw: string): string | null {
+  const key = String(raw || '').trim().replace(/^\/+/, '');
+  if (!key) return null;
+  if (key.includes('..')) return null;
+  if (!/^[a-zA-Z0-9._/-]+$/.test(key)) return null;
+  if (key === DEFAULT_DB_RESTORE_OBJECT) return key;
+  const prefix = `db-backups/env-${environmentId}/`;
+  if (!key.startsWith(prefix)) return null;
+  return key;
+}
+
+async function waitForLocalContainer(stackName: string, serviceName: string, timeoutMs: number): Promise<string> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const result = await runCommand('docker', [
+      'ps',
+      '--filter',
+      `name=${stackName}_${serviceName}`,
+      '--format',
+      '{{.ID}}',
+    ], 12_000);
+    const id = (result.code === 0 ? result.stdout : '').trim().split('\n')[0] || '';
+    if (id) return id;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error(`Timed out waiting for ${serviceName} container on this node`);
+}
+
+async function waitForDatabase(containerId: string, timeoutMs: number) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const result = await runCommand('docker', [
+      'exec',
+      containerId,
+      'sh',
+      '-c',
+      'mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -e "SELECT 1" >/dev/null 2>&1',
+    ], 12_000);
+    if (result.code === 0) return;
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  throw new Error('Database did not become ready in time');
+}
+
+async function databaseHasTables(containerId: string, dbName: string): Promise<boolean> {
+  const safeName = String(dbName || '').trim() || 'magento';
+  const result = await runCommand('docker', [
+    'exec',
+    containerId,
+    'sh',
+    '-c',
+    `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -N -s -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${safeName.replace(/'/g, "''")}'" 2>/dev/null || echo 0`,
+  ], 30_000);
+  if (result.code !== 0) return false;
+  const count = Number.parseInt(result.stdout.trim().split('\n')[0] || '0', 10);
+  return Number.isFinite(count) && count > 0;
+}
+
+async function downloadR2Object(r2: R2PresignContext, objectKey: string, targetPath: string) {
+  const url = await presignR2ObjectUrl(r2, 'GET', objectKey, 3600);
+  const result = await runCommand('curl', ['-fsSL', url, '-o', targetPath], 10 * 60_000);
+  if (result.code !== 0) {
+    throw new Error(result.stderr.trim() || result.stdout.trim() || 'Failed to download backup from R2');
+  }
+}
+
+async function stripDefiners(inputPath: string, outputPath: string) {
+  await new Promise<void>((resolve, reject) => {
+    const input = fs.createReadStream(inputPath, 'utf8');
+    const output = fs.createWriteStream(outputPath, { encoding: 'utf8' });
+    const rl = readline.createInterface({ input, crlfDelay: Infinity });
+
+    rl.on('line', (line) => {
+      const cleaned = line
+        .replace(/DEFINER=`[^`]+`@`[^`]+`/g, '')
+        .replace(/DEFINER=[^ ]+ /g, '');
+      output.write(`${cleaned}\n`);
+    });
+    rl.on('close', () => {
+      output.end();
+      resolve();
+    });
+    rl.on('error', reject);
+  });
+}
+
+async function runDbRestoreProvisioning(environmentId: number, input: Record<string, unknown>): Promise<RunbookResult> {
+  const runbookId = 'db_restore_provisioning';
+  const observations: string[] = [];
+  const actions: string[] = [];
+  const progress = RunbookProgress.create(runbookId, environmentId, [
+    { id: 'validate', label: 'Validate inputs' },
+    { id: 'wait_db', label: 'Wait for database' },
+    { id: 'check', label: 'Check database state' },
+    { id: 'download', label: 'Download backup from R2' },
+    { id: 'decrypt', label: 'Decrypt backup' },
+    { id: 'decompress', label: 'Decompress backup' },
+    { id: 'sanitize', label: 'Sanitize SQL (strip definers)' },
+    { id: 'import', label: 'Import SQL into database' },
+    { id: 'secure_offloader', label: 'Apply secure offloader config' },
+    { id: 'verify', label: 'Verify restored database' },
+  ]);
+
+  progress.start('validate');
+  if (!fs.existsSync(STACK_MASTER_KEY_PATH)) {
+    progress.fail('validate', 'Missing stack master private key for decrypt.');
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Missing stack master private key for decrypt.',
+      observations: [`Expected: ${STACK_MASTER_KEY_PATH}`],
+    };
+  }
+  const r2 = resolveR2Context(environmentId);
+  if (!r2) {
+    progress.fail('validate', 'Missing mz-control connection details for R2 presign.');
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Missing mz-control connection details for R2 presign.',
+      observations: [
+        `Expected: ${path.join(NODE_DIR, 'node-id')}`,
+        `Expected: ${path.join(NODE_DIR, 'node-secret')}`,
+        `Expected: ${path.join(NODE_DIR, 'config.json')} with stack_id + mz_control_base_url (or env var MZ_CONTROL_BASE_URL)`,
+      ],
+    };
+  }
+  const envRecord = await fetchEnvironmentRecord(r2).catch(() => null);
+  const inputObject = typeof input.backup_object === 'string' ? input.backup_object.trim() : '';
+  const rawKey = inputObject || String(envRecord?.db_backup_object || '').trim() || DEFAULT_DB_RESTORE_OBJECT;
+  const objectKey = normalizeDbRestoreObjectKey(environmentId, rawKey);
+  if (!objectKey) {
+    progress.fail('validate', 'Invalid backup object key.');
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Invalid backup object key.',
+      observations: [
+        `Received: ${String(rawKey || '(empty)')}`,
+        `Allowed: ${DEFAULT_DB_RESTORE_OBJECT}`,
+        `Allowed prefix: db-backups/env-${environmentId}/...`,
+      ],
+    };
+  }
+  progress.ok('validate');
+
+  progress.start('wait_db');
+  const stackName = `mz-env-${environmentId}`;
+  let dbContainerId: string;
+  try {
+    dbContainerId = await waitForLocalContainer(stackName, 'database', 5 * 60_000);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    progress.fail('wait_db', message);
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Database container not found on this node.',
+      observations: [
+        message,
+        'Note: This runbook currently requires the database task to be running on the same node as swarm-agent.',
+      ],
+    };
+  }
+  try {
+    await waitForDatabase(dbContainerId, 5 * 60_000);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    progress.fail('wait_db', message);
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Database did not become ready in time.',
+      observations: [message],
+    };
+  }
+  progress.ok('wait_db');
+
+  const dbName = 'magento';
+  progress.start('check');
+  const alreadyPopulated = await databaseHasTables(dbContainerId, dbName);
+  if (alreadyPopulated) {
+    progress.ok('check', 'Database already populated; restore not required.');
+    return {
+      runbook_id: runbookId,
+      status: 'ok',
+      summary: 'Database already populated; restore not required.',
+      observations: [
+        `Database: ${dbName}`,
+        `Backup object (unused): ${objectKey}`,
+      ],
+    };
+  }
+  progress.ok('check', 'Database empty; proceeding with restore.');
+
+  ensureDir(path.join(DEPLOY_WORK_DIR, 'runbooks'));
+  const workDir = fs.mkdtempSync(path.join(DEPLOY_WORK_DIR, 'runbooks', `db-restore-env-${environmentId}-`));
+  const encryptedPath = path.join(workDir, path.basename(objectKey));
+  const decryptedPath = path.join(workDir, 'db.sql.zst');
+  const sqlPath = path.join(workDir, 'db.sql');
+  const sanitizedPath = path.join(workDir, 'db.sanitized.sql');
+
+  progress.start('download');
+  await downloadR2Object(r2, objectKey, encryptedPath);
+  actions.push(`downloaded:${objectKey}`);
+  progress.ok('download');
+
+  progress.start('decrypt');
+  {
+    const result = await runCommand('age', ['-d', '-i', STACK_MASTER_KEY_PATH, '-o', decryptedPath, encryptedPath], 10 * 60_000);
+    if (result.code !== 0) {
+      const message = result.stderr.trim() || result.stdout.trim() || 'age decrypt failed';
+      progress.fail('decrypt', message);
+      return { runbook_id: runbookId, status: 'failed', summary: 'Decrypt failed.', observations: [message] };
+    }
+  }
+  progress.ok('decrypt');
+
+  progress.start('decompress');
+  {
+    const result = await runCommand('zstd', ['-d', '-f', '-o', sqlPath, decryptedPath], 30 * 60_000);
+    if (result.code !== 0) {
+      const message = result.stderr.trim() || result.stdout.trim() || 'zstd decompress failed';
+      progress.fail('decompress', message);
+      return { runbook_id: runbookId, status: 'failed', summary: 'Decompress failed.', observations: [message] };
+    }
+  }
+  progress.ok('decompress');
+
+  progress.start('sanitize');
+  await stripDefiners(sqlPath, sanitizedPath);
+  progress.ok('sanitize');
+
+  progress.start('import');
+  {
+    const cp = await runCommand('docker', ['cp', sanitizedPath, `${dbContainerId}:/tmp/mz-restore.sql`], 5 * 60_000);
+    if (cp.code !== 0) {
+      const message = cp.stderr.trim() || cp.stdout.trim() || 'docker cp failed';
+      progress.fail('import', message);
+      return { runbook_id: runbookId, status: 'failed', summary: 'Import failed.', observations: [message] };
+    }
+    const importCmd = [
+      `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -e "CREATE DATABASE IF NOT EXISTS ${dbName};"`,
+      `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" --database="${dbName}" < /tmp/mz-restore.sql`,
+    ].join(' && ');
+    const imp = await runCommand('docker', ['exec', dbContainerId, 'sh', '-c', importCmd], 60 * 60_000);
+    if (imp.code !== 0) {
+      const message = imp.stderr.trim() || imp.stdout.trim() || 'database import failed';
+      progress.fail('import', message);
+      return { runbook_id: runbookId, status: 'failed', summary: 'Import failed.', observations: [message] };
+    }
+  }
+  progress.ok('import');
+
+  progress.start('secure_offloader');
+  {
+    const statements = [
+      `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'web/secure/offloader_header', 'X-Forwarded-Proto') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+      `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'web/secure/offloader_header_value', 'https') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
+    ].join('; ');
+    const cmd = `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -D ${dbName} -e "${statements};"`;
+    const res = await runCommand('docker', ['exec', dbContainerId, 'sh', '-c', cmd], 5 * 60_000);
+    if (res.code !== 0) {
+      const message = res.stderr.trim() || res.stdout.trim() || 'secure offloader config failed';
+      progress.fail('secure_offloader', message);
+      return { runbook_id: runbookId, status: 'failed', summary: 'Secure offloader config failed.', observations: [message] };
+    }
+  }
+  progress.ok('secure_offloader');
+
+  progress.start('verify');
+  const restored = await databaseHasTables(dbContainerId, dbName);
+  if (!restored) {
+    progress.fail('verify', 'Database still appears empty after import.');
+    return {
+      runbook_id: runbookId,
+      status: 'failed',
+      summary: 'Database restore did not complete successfully.',
+      observations: [
+        `Database: ${dbName}`,
+        `Backup object: ${objectKey}`,
+      ],
+    };
+  }
+  observations.push(`Database restored into ${dbName}.`);
+  observations.push(`Backup object: ${objectKey}`);
+  progress.ok('verify');
+
+  return {
+    runbook_id: runbookId,
+    status: 'ok',
+    summary: 'Database restored.',
+    observations,
+    remediation: { attempted: true, actions },
+  };
 }
 
 async function runDbBackup(environmentId: number, input: Record<string, unknown>): Promise<RunbookResult> {

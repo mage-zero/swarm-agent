@@ -2062,6 +2062,35 @@ async function setSearchEngine(
   return runDatabaseCommandWithRetry(stackName, containerId, command);
 }
 
+function parseDetectedEngine(stdout: string): string | null {
+  const engine = stdout.trim();
+  return (engine === 'elasticsearch7' || engine === 'opensearch') ? engine : null;
+}
+
+function resolveSearchEngine(override: string, detected: string | null): string {
+  return override || detected || 'opensearch';
+}
+
+function buildSearchEngineEnvOverride(override: string): Record<string, string> {
+  return override ? { MZ_SEARCH_ENGINE: override } : {};
+}
+
+async function detectSearchEngine(
+  containerId: string,
+  dbName: string
+): Promise<string | null> {
+  const safeDbName = assertSafeIdentifier(dbName, 'database name').replace(/`/g, '``');
+  try {
+    const result = await runCommandCapture('docker', [
+      'exec', containerId, 'sh', '-c',
+      `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -N -s -D ${safeDbName} -e "SELECT value FROM core_config_data WHERE scope='default' AND scope_id=0 AND path='catalog/search/engine' LIMIT 1"`,
+    ]);
+    return parseDetectedEngine(result.stdout);
+  } catch {
+    return null;
+  }
+}
+
 function escapeSqlValue(value: string): string {
   return value.replace(/'/g, "''");
 }
@@ -2169,7 +2198,25 @@ async function setSecureOffloaderConfig(containerId: string, dbName: string) {
   ]);
 }
 
-async function setOpensearchSystemConfig(
+function buildSearchSystemConfigSql(host: string, port: string, timeout: string): string {
+  const safeHost = escapeSqlValue(String(host || ''));
+  const safePort = escapeSqlValue(String(port || ''));
+  const safeTimeout = escapeSqlValue(String(timeout || ''));
+  const upsert = (p: string, v: string) =>
+    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, '${p}', '${v}') ON DUPLICATE KEY UPDATE value=VALUES(value)`;
+  return [
+    upsert('catalog/search/opensearch_server_hostname', safeHost),
+    upsert('catalog/search/opensearch_server_port', safePort),
+    upsert('catalog/search/opensearch_server_timeout', safeTimeout),
+    upsert('catalog/search/elasticsearch7_server_hostname', safeHost),
+    upsert('catalog/search/elasticsearch7_server_port', safePort),
+    upsert('catalog/search/elasticsearch7_server_timeout', safeTimeout),
+    upsert('catalog/search/elasticsearch7_enable_auth', '0'),
+    upsert('catalog/search/opensearch_enable_auth', '0'),
+  ].join('; ');
+}
+
+async function setSearchSystemConfig(
   stackName: string,
   containerId: string,
   dbName: string,
@@ -2178,14 +2225,7 @@ async function setOpensearchSystemConfig(
   timeout: string
 ): Promise<string> {
   const safeDbName = assertSafeIdentifier(dbName, 'database name').replace(/`/g, '``');
-  const safeHost = escapeSqlValue(String(host || ''));
-  const safePort = escapeSqlValue(String(port || ''));
-  const safeTimeout = escapeSqlValue(String(timeout || ''));
-  const statements = [
-    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/opensearch_server_hostname', '${safeHost}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
-    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/opensearch_server_port', '${safePort}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
-    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, 'catalog/search/opensearch_server_timeout', '${safeTimeout}') ON DUPLICATE KEY UPDATE value=VALUES(value)`,
-  ].join('; ');
+  const statements = buildSearchSystemConfigSql(host, port, timeout);
   const command = `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -D ${safeDbName} -e "${statements};"`;
   return runDatabaseCommandWithRetry(stackName, containerId, command);
 }
@@ -3394,14 +3434,13 @@ async function processDeployment(recordPath: string) {
   log('fetched environment record');
   const selections = envRecord?.application_selections;
   const versions = resolveVersionEnv(selections);
-  const searchEngine = process.env.MZ_SEARCH_ENGINE || 'opensearch';
+  const searchEngineOverride = process.env.MZ_SEARCH_ENGINE || '';
+  let searchEngine = searchEngineOverride || 'opensearch'; // refined after DB is reachable
   const opensearchHost = process.env.MZ_OPENSEARCH_HOST || `${stackName}_opensearch`;
   const opensearchPort = process.env.MZ_OPENSEARCH_PORT || '9200';
   const opensearchTimeout = process.env.MZ_OPENSEARCH_TIMEOUT || '15';
 
   const r2: R2PresignContext = { baseUrl, nodeId, nodeSecret, environmentId };
-
-  const objectKey = String(envRecord?.db_backup_object || DEFAULT_DB_BACKUP_OBJECT).replace(/^\/+/, '');
   const workDir = path.join(DEPLOY_WORK_DIR, deploymentId);
   ensureDir(workDir);
   const progress = new DeployProgress(
@@ -3546,7 +3585,7 @@ async function processDeployment(recordPath: string) {
     MZ_PHP_FPM_ADMIN_HOST: stackService('php-fpm-admin'),
     MZ_VARNISH_BACKEND_HOST: stackService('nginx'),
     MZ_VARNISH_BACKEND_PORT: '80',
-    MZ_SEARCH_ENGINE: searchEngine,
+    ...buildSearchEngineEnvOverride(searchEngineOverride),
     MZ_OPENSEARCH_HOST: opensearchHost,
     MZ_OPENSEARCH_PORT: opensearchPort,
     MZ_OPENSEARCH_TIMEOUT: opensearchTimeout,
@@ -3789,18 +3828,14 @@ async function processDeployment(recordPath: string) {
 
   const dbName = envVars.MYSQL_DATABASE || 'magento';
   const hasTables = await databaseHasTables(dbContainerId, dbName);
-  if (hasTables) {
-    log('database already populated; skipping restore');
-    progress.detail('db_prepare', 'Database already populated; skipping restore');
-  } else {
-    progress.detail('db_prepare', 'Restoring database from provisioning backup');
-    const encryptedBackupPath = path.join(workDir, path.basename(objectKey));
-    await downloadArtifact(r2, objectKey, encryptedBackupPath);
-    await restoreDatabase(dbContainerId, encryptedBackupPath, workDir, dbName);
-    await setSecureOffloaderConfig(dbContainerId, dbName);
-    log('database restored');
-    log('secure offloader config applied');
+  if (!hasTables) {
+    const message = `Database is empty (no tables). Run support runbook "db_restore_provisioning" (Restore database) first, then retry the deploy.`;
+    log(`db not ready: ${message}`);
+    progress.fail('db_prepare', message);
+    throw new Error(message);
   }
+  log('database already populated; restore not required');
+  progress.detail('db_prepare', 'Database already populated; skipping restore');
   await syncDatabaseUser(
     dbContainerId,
     dbName,
@@ -3813,6 +3848,9 @@ async function processDeployment(recordPath: string) {
     await setBaseUrls(dbContainerId, envVars.MYSQL_DATABASE || 'magento', envBaseUrl);
     log(`base URLs set to ${envBaseUrl}`);
   }
+  const detectedEngine = await detectSearchEngine(dbContainerId, dbName);
+  searchEngine = resolveSearchEngine(searchEngineOverride, detectedEngine);
+  log(`search engine: detected=${detectedEngine || 'none'}, using=${searchEngine}`);
   progress.ok('db_prepare');
 
   progress.start('app_prepare');
@@ -3881,7 +3919,7 @@ async function processDeployment(recordPath: string) {
     });
   }
   let upgradeWarning = false;
-  dbContainerId = await setOpensearchSystemConfig(
+  dbContainerId = await setSearchSystemConfig(
     stackName,
     dbContainerId,
     envVars.MYSQL_DATABASE || 'magento',
@@ -4288,3 +4326,10 @@ export function startDeploymentWorker() {
     void tick();
   }, Number.isFinite(DEPLOY_INTERVAL_MS) && DEPLOY_INTERVAL_MS > 1000 ? DEPLOY_INTERVAL_MS : 5000);
 }
+
+export const __testing = {
+  parseDetectedEngine,
+  resolveSearchEngine,
+  buildSearchEngineEnvOverride,
+  buildSearchSystemConfigSql,
+};
