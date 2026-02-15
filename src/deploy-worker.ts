@@ -56,6 +56,7 @@ type EnvironmentRecord = {
   db_backup_bucket?: string;
   db_backup_object?: string;
   application_selections?: ApplicationSelections;
+  application_version?: string;
   environment_secrets?: EnvironmentSecrets | null;
 };
 
@@ -2067,8 +2068,20 @@ function parseDetectedEngine(stdout: string): string | null {
   return (engine === 'elasticsearch7' || engine === 'opensearch') ? engine : null;
 }
 
-function resolveSearchEngine(override: string, detected: string | null): string {
-  return override || detected || 'opensearch';
+function defaultSearchEngine(applicationVersion: string): 'opensearch' | 'elasticsearch7' {
+  // Magento <2.4.6 does not have an opensearch adapter; use elasticsearch7
+  // (which is API-compatible with our OpenSearch containers).
+  const match = applicationVersion.match(/^(\d+)\.(\d+)\.(\d+)/);
+  if (!match) return 'opensearch';
+  const [, major, minor, patch] = match.map(Number);
+  if (major < 2 || (major === 2 && minor < 4) || (major === 2 && minor === 4 && patch < 6)) {
+    return 'elasticsearch7';
+  }
+  return 'opensearch';
+}
+
+function resolveSearchEngine(override: string, detected: string | null, applicationVersion = ''): string {
+  return override || detected || defaultSearchEngine(applicationVersion);
 }
 
 function buildSearchEngineEnvOverride(override: string): Record<string, string> {
@@ -3433,9 +3446,10 @@ async function processDeployment(recordPath: string) {
   }
   log('fetched environment record');
   const selections = envRecord?.application_selections;
+  const applicationVersion = envRecord?.application_version || '';
   const versions = resolveVersionEnv(selections);
   const searchEngineOverride = process.env.MZ_SEARCH_ENGINE || '';
-  let searchEngine = searchEngineOverride || 'opensearch'; // refined after DB is reachable
+  let searchEngine = searchEngineOverride || defaultSearchEngine(applicationVersion); // refined after DB is reachable
   const opensearchHost = process.env.MZ_OPENSEARCH_HOST || `${stackName}_opensearch`;
   const opensearchPort = process.env.MZ_OPENSEARCH_PORT || '9200';
   const opensearchTimeout = process.env.MZ_OPENSEARCH_TIMEOUT || '15';
@@ -3745,8 +3759,8 @@ async function processDeployment(recordPath: string) {
     const dbN = envVars.MYSQL_DATABASE || 'magento';
     if (await databaseHasTables(dbCid, dbN)) {
       const detectedEngine = await detectSearchEngine(dbCid, dbN);
-      searchEngine = resolveSearchEngine(searchEngineOverride, detectedEngine);
-      log(`search engine: detected=${detectedEngine || 'none'}, resolved=${searchEngine}`);
+      searchEngine = resolveSearchEngine(searchEngineOverride, detectedEngine, applicationVersion);
+      log(`search engine: detected=${detectedEngine || 'none'}, resolved=${searchEngine}, appVersion=${applicationVersion || 'unknown'}`);
     } else {
       log('database not yet populated; using default search engine');
     }
@@ -4354,6 +4368,7 @@ export function startDeploymentWorker() {
 
 export const __testing = {
   parseDetectedEngine,
+  defaultSearchEngine,
   resolveSearchEngine,
   buildSearchEngineEnvOverride,
   buildSearchSystemConfigSql,

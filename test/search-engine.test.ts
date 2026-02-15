@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { __testing } from '../src/deploy-worker.js';
 
-const { parseDetectedEngine, resolveSearchEngine, buildSearchEngineEnvOverride, buildSearchSystemConfigSql } = __testing;
+const { parseDetectedEngine, defaultSearchEngine, resolveSearchEngine, buildSearchEngineEnvOverride, buildSearchSystemConfigSql } = __testing;
 
 // ---------------------------------------------------------------------------
 // parseDetectedEngine – parses mariadb stdout into a known engine or null
@@ -49,7 +49,33 @@ describe('parseDetectedEngine', () => {
 });
 
 // ---------------------------------------------------------------------------
-// resolveSearchEngine – override > detected > default
+// defaultSearchEngine – version-aware default
+// ---------------------------------------------------------------------------
+describe('defaultSearchEngine', () => {
+  it('returns elasticsearch7 for Magento <2.4.6', () => {
+    expect(defaultSearchEngine('2.4.5')).toBe('elasticsearch7');
+    expect(defaultSearchEngine('2.4.5-p1')).toBe('elasticsearch7');
+    expect(defaultSearchEngine('2.4.4')).toBe('elasticsearch7');
+    expect(defaultSearchEngine('2.4.0')).toBe('elasticsearch7');
+    expect(defaultSearchEngine('2.3.7')).toBe('elasticsearch7');
+  });
+
+  it('returns opensearch for Magento >=2.4.6', () => {
+    expect(defaultSearchEngine('2.4.6')).toBe('opensearch');
+    expect(defaultSearchEngine('2.4.6-p1')).toBe('opensearch');
+    expect(defaultSearchEngine('2.4.7')).toBe('opensearch');
+    expect(defaultSearchEngine('2.4.7-p3')).toBe('opensearch');
+    expect(defaultSearchEngine('2.4.8')).toBe('opensearch');
+  });
+
+  it('returns opensearch when version is empty or unparseable', () => {
+    expect(defaultSearchEngine('')).toBe('opensearch');
+    expect(defaultSearchEngine('unknown')).toBe('opensearch');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveSearchEngine – override > detected > version-aware default
 // ---------------------------------------------------------------------------
 describe('resolveSearchEngine', () => {
   it('uses explicit override over detected engine', () => {
@@ -62,12 +88,27 @@ describe('resolveSearchEngine', () => {
     expect(resolveSearchEngine('', 'opensearch')).toBe('opensearch');
   });
 
-  it('defaults to opensearch when both override and detected are empty/null', () => {
+  it('defaults to opensearch when version is unknown', () => {
     expect(resolveSearchEngine('', null)).toBe('opensearch');
+    expect(resolveSearchEngine('', null, '')).toBe('opensearch');
+  });
+
+  it('defaults to elasticsearch7 for Magento <2.4.6', () => {
+    expect(resolveSearchEngine('', null, '2.4.5')).toBe('elasticsearch7');
+    expect(resolveSearchEngine('', null, '2.4.5-p1')).toBe('elasticsearch7');
+  });
+
+  it('defaults to opensearch for Magento >=2.4.6', () => {
+    expect(resolveSearchEngine('', null, '2.4.7')).toBe('opensearch');
   });
 
   it('uses override even when detected is null', () => {
     expect(resolveSearchEngine('elasticsearch7', null)).toBe('elasticsearch7');
+  });
+
+  it('detected engine takes priority over version-aware default', () => {
+    // DB says opensearch but version is <2.4.6 - trust what's in the DB
+    expect(resolveSearchEngine('', 'opensearch', '2.4.5')).toBe('opensearch');
   });
 });
 
