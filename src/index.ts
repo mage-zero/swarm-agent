@@ -6,6 +6,7 @@ import { startDeploymentWorker } from './deploy-worker.js';
 import { startEnvironmentSync } from './env-sync.js';
 import { startInspectionScheduler, startStatusReporter, startTuningScheduler } from './status.js';
 import { startMeshSyncScheduler } from './mesh.js';
+import { startUpgradeScheduler } from './upgrade.js';
 
 const port = Number(process.env.PORT ?? 8080);
 
@@ -17,6 +18,7 @@ startEnvironmentSync();
 void ensureCloudSwarmDeployKey();
 startDeploymentWorker();
 startAddonWorker();
+startUpgradeScheduler();
 
 serve({
   fetch: createApp().fetch,

@@ -31,9 +31,13 @@ jobs:
           cd dist
           sha256sum swarm-agent.cjs > swarm-agent.cjs.sha256
 
+      - name: Copy changelog to dist
+        run: cp changelog.json dist/changelog.json
+
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/swarm-agent.cjs
             dist/swarm-agent.cjs.sha256
+            dist/changelog.json

@@ -1,0 +1,36 @@
+{
+  "versions": [
+    {
+      "version": "0.2.1",
+      "date": "2026-02-10",
+      "summary": "Initial versioned release with monitoring stack support",
+      "requires": {},
+      "changes": []
+    },
+    {
+      "version": "0.3.0",
+      "date": "2026-02-15",
+      "summary": "Controlled upgrade system with changelog-driven migrations",
+      "requires": {
+        "cloud-swarm": ">=1.0.0",
+        "mz-control": ">=1.0.0"
+      },
+      "changes": [
+        {
+          "id": "create-monitoring-network",
+          "description": "Create mz-monitoring overlay network",
+          "phase": "pre_migrate",
+          "downtimeMinutes": 0,
+          "scope": "stack"
+        },
+        {
+          "id": "connect-php-to-monitoring",
+          "description": "Connect php-fpm, php-fpm-admin, cron to monitoring network (service restart)",
+          "phase": "migrate",
+          "downtimeMinutes": 2,
+          "scope": "environment"
+        }
+      ]
+    }
+  ]
+}
