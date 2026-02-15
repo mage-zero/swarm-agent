@@ -170,17 +170,17 @@ describe('env.php.wrapper search engine config', () => {
     const existingEnginePhp = existingEngine
       ? `$base['system']['default']['catalog']['search']['engine'] = '${existingEngine}';`
       : '';
-    // Replicate exactly the block from env.php.wrapper lines 181-203
+    // Replicate exactly the search-engine block from env.php.wrapper
     const php = `<?php
 $base = ['system' => ['default' => ['catalog' => ['search' => []]]]];
 ${existingEnginePhp}
 $opensearchHost = getenv('MZ_OPENSEARCH_HOST') ?: 'opensearch';
 $opensearchPort = getenv('MZ_OPENSEARCH_PORT') ?: '9200';
 $opensearchTimeout = getenv('MZ_OPENSEARCH_TIMEOUT') ?: '15';
-$searchEngine = getenv('MZ_SEARCH_ENGINE') ?: 'opensearch';
-// Only override engine if MZ_SEARCH_ENGINE is explicitly set
-if (getenv('MZ_SEARCH_ENGINE') !== false) {
-    $base['system']['default']['catalog']['search']['engine'] = $searchEngine;
+// Only override engine if MZ_SEARCH_ENGINE is explicitly set and non-empty
+$mzSearchEngine = getenv('MZ_SEARCH_ENGINE');
+if (is_string($mzSearchEngine) && $mzSearchEngine !== '') {
+    $base['system']['default']['catalog']['search']['engine'] = $mzSearchEngine;
 }
 // Set connection paths for BOTH engines (whichever the customer uses)
 $base['system']['default']['catalog']['search']['opensearch_server_hostname'] = $opensearchHost;
@@ -201,6 +201,13 @@ echo json_encode($base['system']['default']['catalog']['search']);
 
   it('does NOT override engine when MZ_SEARCH_ENGINE is absent (preserves customer value)', () => {
     const config = evalSearchConfig({}, 'elasticsearch7');
+    expect(config.engine).toBe('elasticsearch7');
+  });
+
+  it('does NOT override engine when MZ_SEARCH_ENGINE is empty string (stack YAML default)', () => {
+    // The stack YAML uses ${MZ_SEARCH_ENGINE:-} which produces an empty string
+    // when the deploy-worker does not set an explicit override.
+    const config = evalSearchConfig({ MZ_SEARCH_ENGINE: '' }, 'elasticsearch7');
     expect(config.engine).toBe('elasticsearch7');
   });
 

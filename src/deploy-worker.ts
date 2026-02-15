@@ -3450,14 +3450,14 @@ async function processDeployment(recordPath: string) {
     environmentId,
     [
       { id: 'download_artifact', label: 'Download build artifact' },
-      { id: 'build_images', label: 'Build images' },
-      { id: 'deploy_stack', label: 'Deploy stack' },
+      { id: 'build_images', label: 'Build container images' },
+      { id: 'deploy_stack', label: 'Deploy environment' },
       { id: 'db_prepare', label: 'Prepare database' },
-      { id: 'app_prepare', label: 'Prepare application runtime' },
-      { id: 'magento_steps', label: 'Run Magento deploy steps' },
-      { id: 'smoke_checks', label: 'Post-deploy smoke checks' },
-      { id: 'verify', label: 'Verify services' },
-      { id: 'finalize', label: 'Finalize deploy' },
+      { id: 'app_prepare', label: 'Configure application' },
+      { id: 'magento_steps', label: 'Run Magento setup' },
+      { id: 'smoke_checks', label: 'Health checks' },
+      { id: 'verify', label: 'Verify deployment' },
+      { id: 'finalize', label: 'Finalize' },
     ],
   );
 
@@ -3654,6 +3654,7 @@ async function processDeployment(recordPath: string) {
   log('docker secrets ready');
 
   progress.start('build_images');
+  progress.detail('build_images', 'Building service images (database, search, cache)');
   await runCommandLoggedWithRetry(
     'bash',
     [path.join(CLOUD_SWARM_DIR, 'scripts/build-services.sh')],
@@ -3668,6 +3669,7 @@ async function processDeployment(recordPath: string) {
     }
   );
   log('built base services');
+  progress.detail('build_images', 'Building Magento application image');
   await runCommandLoggedWithRetry(
     'bash',
     [path.join(CLOUD_SWARM_DIR, 'scripts/build-magento.sh'), artifactPath],
@@ -3720,6 +3722,7 @@ async function processDeployment(recordPath: string) {
 
   if (missingBaseServices.length) {
     log(`base services missing (${missingBaseServices.join(', ')}); deploying services stack`);
+    progress.detail('deploy_stack', 'Deploying infrastructure services');
     await runCommandLogged('docker', [
       'stack',
       'deploy',
@@ -3733,6 +3736,24 @@ async function processDeployment(recordPath: string) {
     log('services stack present; skipping services redeploy');
   }
 
+  // Detect search engine from the existing database before deploying the app
+  // stack so that containers start with the correct MZ_SEARCH_ENGINE value.
+  progress.detail('deploy_stack', 'Waiting for database');
+  {
+    const dbCid = await waitForContainer(stackName, 'database', 5 * 60 * 1000);
+    await waitForDatabase(dbCid, 5 * 60 * 1000);
+    const dbN = envVars.MYSQL_DATABASE || 'magento';
+    if (await databaseHasTables(dbCid, dbN)) {
+      const detectedEngine = await detectSearchEngine(dbCid, dbN);
+      searchEngine = resolveSearchEngine(searchEngineOverride, detectedEngine);
+      log(`search engine: detected=${detectedEngine || 'none'}, resolved=${searchEngine}`);
+    } else {
+      log('database not yet populated; using default search engine');
+    }
+  }
+  envVars.MZ_SEARCH_ENGINE = searchEngine;
+
+  progress.detail('deploy_stack', `Deploying application (search engine: ${searchEngine})`);
   await runCommandLogged('docker', [
     'stack',
     'deploy',
@@ -3744,7 +3765,7 @@ async function processDeployment(recordPath: string) {
   log('app stack deployed');
 
   if (RELEASE_COHORT_GATE_ENABLED) {
-    progress.detail('deploy_stack', 'Waiting for Swarm services to converge');
+    progress.detail('deploy_stack', 'Waiting for services to be ready');
     const cohortServices = await resolveReleaseCohortServices(stackName);
     if (!cohortServices.length) {
       log('release cohort gate skipped: no cohort services found');
@@ -3848,14 +3869,12 @@ async function processDeployment(recordPath: string) {
     await setBaseUrls(dbContainerId, envVars.MYSQL_DATABASE || 'magento', envBaseUrl);
     log(`base URLs set to ${envBaseUrl}`);
   }
-  const detectedEngine = await detectSearchEngine(dbContainerId, dbName);
-  searchEngine = resolveSearchEngine(searchEngineOverride, detectedEngine);
-  log(`search engine: detected=${detectedEngine || 'none'}, using=${searchEngine}`);
   progress.ok('db_prepare');
 
   progress.start('app_prepare');
   if (replicaServiceName === 'database-replica') {
     try {
+      progress.detail('app_prepare', 'Configuring database replication');
       const replicaContainerId = await waitForContainer(stackName, 'database-replica', 5 * 60 * 1000);
       await waitForDatabase(replicaContainerId, 5 * 60 * 1000);
       await configureReplica(replicaContainerId, stackService('database'), replicaUser);
@@ -3866,6 +3885,7 @@ async function processDeployment(recordPath: string) {
     }
   }
 
+  progress.detail('app_prepare', 'Waiting for PHP containers');
   let adminContainerId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
   const webContainerId = await findLocalContainer(stackName, 'php-fpm');
   const writePathCommand = 'mkdir -p /var/www/html/magento/var/log /var/www/html/magento/var/report /var/www/html/magento/var/session /var/www/html/magento/var/cache /var/www/html/magento/var/page_cache /var/www/html/magento/var/tmp /var/www/html/magento/var/export /var/www/html/magento/var/import /var/www/html/magento/pub/media && chmod -R 0777 /var/www/html/magento/var/log /var/www/html/magento/var/report /var/www/html/magento/var/session /var/www/html/magento/var/cache /var/www/html/magento/var/page_cache /var/www/html/magento/var/tmp /var/www/html/magento/var/export /var/www/html/magento/var/import /var/www/html/magento/pub/media';
@@ -3919,6 +3939,7 @@ async function processDeployment(recordPath: string) {
     });
   }
   let upgradeWarning = false;
+  progress.detail('app_prepare', 'Configuring search engine');
   dbContainerId = await setSearchSystemConfig(
     stackName,
     dbContainerId,
@@ -3928,8 +3949,11 @@ async function processDeployment(recordPath: string) {
     opensearchTimeout
   );
   dbContainerId = await setSearchEngine(stackName, dbContainerId, envVars.MYSQL_DATABASE || 'magento', 'mysql');
+  progress.detail('app_prepare', 'Waiting for ProxySQL');
   await waitForProxySql(adminContainerId, stackName, 5 * 60 * 1000);
+  progress.detail('app_prepare', 'Waiting for Redis');
   await waitForRedisCache(adminContainerId, stackName, 5 * 60 * 1000);
+  progress.detail('app_prepare', 'Applying runtime configuration');
   adminContainerId = await ensureMagentoEnvWrapperWithRetry(adminContainerId, stackName, log);
   progress.ok('app_prepare');
 
@@ -4019,6 +4043,7 @@ async function processDeployment(recordPath: string) {
 
   if (envHostname) {
     progress.start('smoke_checks');
+    progress.detail('smoke_checks', `Checking ${envHostname}`);
     const smoke = await runPostDeploySmokeChecks(stackName, envHostname, log);
     if (!smoke.ok) {
       const recordState = record as unknown as Record<string, unknown>;
