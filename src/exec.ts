@@ -9,11 +9,24 @@ export type CommandResult = {
 };
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.MZ_RUNBOOK_TIMEOUT_MS || 15000);
+type CommandOptions = {
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+};
 
-export function runCommand(command: string, args: string[], timeoutMs = DEFAULT_TIMEOUT_MS): Promise<CommandResult> {
+export function runCommand(
+  command: string,
+  args: string[],
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  options: CommandOptions = {},
+): Promise<CommandResult> {
   return new Promise((resolve) => {
     enforceCommandPolicy(command, args, { source: 'exec.runCommand' });
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: options.cwd,
+      env: options.env,
+    });
     let stdout = '';
     let stderr = '';
     const timer = setTimeout(() => {
@@ -36,12 +49,17 @@ export function runCommandToFile(
   command: string,
   args: string[],
   stdoutPath: string,
-  timeoutMs = DEFAULT_TIMEOUT_MS
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  options: CommandOptions = {},
 ): Promise<{ code: number; stderr: string }> {
   return new Promise((resolve, reject) => {
     enforceCommandPolicy(command, args, { source: 'exec.runCommandToFile' });
     const stdoutStream = fs.createWriteStream(stdoutPath, { flags: 'w' });
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: options.cwd,
+      env: options.env,
+    });
     let stderr = '';
 
     const timer = setTimeout(() => {

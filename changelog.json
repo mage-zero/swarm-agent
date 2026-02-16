@@ -56,6 +56,13 @@
           "scope": "stack"
         },
         {
+          "id": "connect-cloudflared-to-monitoring",
+          "description": "Attach cloudflared/tunnel service to mz-monitoring network for dashboards routing",
+          "phase": "pre_migrate",
+          "downtimeMinutes": 0,
+          "scope": "stack"
+        },
+        {
           "id": "setup-dashboards-dns",
           "description": "Create DNS, tunnel ingress, and WAF rules for OpenSearch Dashboards UI",
           "phase": "post_migrate",
@@ -63,6 +70,16 @@
           "scope": "stack"
         }
       ]
+    },
+    {
+      "version": "0.4.1",
+      "date": "2026-02-16",
+      "summary": "Monitoring reliability hardening and runbook cleanup automation",
+      "requires": {
+        "cloud-swarm": ">=1.0.0",
+        "mz-control": ">=1.0.1"
+      },
+      "changes": []
     }
   ]
 }

@@ -1708,9 +1708,193 @@ async function ensureCloudSwarmRepo() {
   await runCommand('git', ['-C', CLOUD_SWARM_DIR, 'checkout', '-B', 'main', 'origin/main', '--force'], { env: gitEnv });
 }
 
+const MONITORING_RUNTIME_SERVICES = [
+  'mz-monitoring_opensearch',
+  'mz-monitoring_opensearch-dashboards',
+  'mz-monitoring_apm-server',
+  'mz-monitoring_metricbeat',
+  'mz-monitoring_filebeat',
+] as const;
+const CLOUDFLARED_SERVICE_MARKERS = ['cloudflared', '_tunnel'];
+
+const monitoringHealthTimeoutParsed = Number(process.env.MZ_MONITORING_HEALTH_TIMEOUT_MS);
+const MONITORING_HEALTH_TIMEOUT_MS = Number.isFinite(monitoringHealthTimeoutParsed) && monitoringHealthTimeoutParsed > 0
+  ? monitoringHealthTimeoutParsed
+  : 8 * 60 * 1000;
+const monitoringHealthPollParsed = Number(process.env.MZ_MONITORING_HEALTH_POLL_MS);
+const MONITORING_HEALTH_POLL_MS = Number.isFinite(monitoringHealthPollParsed) && monitoringHealthPollParsed > 0
+  ? Math.max(5_000, monitoringHealthPollParsed)
+  : 10_000;
+
+type MonitoringRuntimeStatus = {
+  serviceName: string;
+  desiredRunning: number;
+  running: number;
+  issues: string[];
+};
+
+type DockerServiceNetworkRef = {
+  Target?: string;
+};
+
+async function inspectMonitoringRuntimeService(serviceName: string): Promise<MonitoringRuntimeStatus> {
+  const result = await runCommandCaptureWithStatus(
+    'docker',
+    ['service', 'ps', serviceName, '--no-trunc', '--format', '{{.DesiredState}}|{{.CurrentState}}|{{.Error}}'],
+  );
+  if (result.code !== 0) {
+    const details = (result.stderr || result.stdout || 'service inspect failed').trim();
+    return {
+      serviceName,
+      desiredRunning: 0,
+      running: 0,
+      issues: [details],
+    };
+  }
+
+  let desiredRunning = 0;
+  let running = 0;
+  const issues: string[] = [];
+  for (const rawLine of result.stdout.split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const [desiredStateRaw = '', currentStateRaw = '', errorRaw = ''] = line.split('|');
+    const desiredState = desiredStateRaw.trim().toLowerCase();
+    if (desiredState !== 'running') continue;
+    desiredRunning += 1;
+    const currentState = currentStateRaw.trim();
+    if (currentState.startsWith('Running')) {
+      running += 1;
+      continue;
+    }
+    const error = errorRaw.trim();
+    const suffix = error ? ` (${error})` : '';
+    if (issues.length < 3) {
+      issues.push(`${currentState}${suffix}`.trim());
+    }
+  }
+
+  if (desiredRunning === 0) {
+    issues.push('no tasks desired Running');
+  }
+
+  return {
+    serviceName,
+    desiredRunning,
+    running,
+    issues,
+  };
+}
+
+async function inspectMonitoringRuntimeServices(serviceNames: string[]): Promise<MonitoringRuntimeStatus[]> {
+  const results: MonitoringRuntimeStatus[] = [];
+  for (const serviceName of serviceNames) {
+    results.push(await inspectMonitoringRuntimeService(serviceName));
+  }
+  return results;
+}
+
+function monitoringRuntimeHealthy(statuses: MonitoringRuntimeStatus[]): boolean {
+  return statuses.every((status) => status.desiredRunning > 0 && status.running === status.desiredRunning);
+}
+
+function summarizeMonitoringRuntimeIssues(statuses: MonitoringRuntimeStatus[]): string {
+  return statuses
+    .filter((status) => status.desiredRunning === 0 || status.running < status.desiredRunning || status.issues.length > 0)
+    .map((status) => {
+      const base = `${status.serviceName} ${status.running}/${status.desiredRunning}`;
+      if (!status.issues.length) return base;
+      return `${base} (${status.issues.join('; ')})`;
+    })
+    .join(' | ');
+}
+
+async function waitForMonitoringRuntimeHealthy(log: (msg: string) => void): Promise<void> {
+  const deadline = Date.now() + MONITORING_HEALTH_TIMEOUT_MS;
+  let lastSummary = '';
+  while (Date.now() < deadline) {
+    const statuses = await inspectMonitoringRuntimeServices([...MONITORING_RUNTIME_SERVICES]);
+    if (monitoringRuntimeHealthy(statuses)) {
+      return;
+    }
+    const summary = summarizeMonitoringRuntimeIssues(statuses);
+    if (summary && summary !== lastSummary) {
+      log(`monitoring stack not yet healthy: ${summary}`);
+      lastSummary = summary;
+    }
+    await delay(MONITORING_HEALTH_POLL_MS);
+  }
+
+  const statuses = await inspectMonitoringRuntimeServices([...MONITORING_RUNTIME_SERVICES]);
+  throw new Error(
+    `Monitoring stack did not become healthy within ${Math.round(MONITORING_HEALTH_TIMEOUT_MS / 1000)}s: ${summarizeMonitoringRuntimeIssues(statuses)}`
+  );
+}
+
+async function ensureCloudflaredMonitoringNetwork(log: (msg: string) => void): Promise<void> {
+  const monitoringNetwork = await runCommandCaptureWithStatus(
+    'docker',
+    ['network', 'inspect', 'mz-monitoring', '--format', '{{.ID}}'],
+  );
+  if (monitoringNetwork.code !== 0) {
+    throw new Error(`Unable to inspect mz-monitoring network: ${monitoringNetwork.stderr || monitoringNetwork.stdout}`);
+  }
+  const monitoringNetworkId = monitoringNetwork.stdout.trim();
+  if (!monitoringNetworkId) {
+    throw new Error('Unable to resolve mz-monitoring network id');
+  }
+
+  const services = await runCommandCaptureWithStatus('docker', ['service', 'ls', '--format', '{{.Name}}']);
+  if (services.code !== 0) {
+    throw new Error(`Unable to list services: ${services.stderr || services.stdout}`);
+  }
+
+  const candidates = services.stdout
+    .split('\n')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .filter((name) => CLOUDFLARED_SERVICE_MARKERS.some((marker) => name.includes(marker)));
+
+  for (const serviceName of candidates) {
+    const inspect = await runCommandCaptureWithStatus(
+      'docker',
+      ['service', 'inspect', serviceName, '--format', '{{json .Spec.TaskTemplate.Networks}}'],
+    );
+    if (inspect.code !== 0) {
+      log(`monitoring: unable to inspect ${serviceName} networks (${inspect.stderr || inspect.stdout})`);
+      continue;
+    }
+
+    let attached = false;
+    try {
+      const parsed = JSON.parse(inspect.stdout || '[]') as DockerServiceNetworkRef[];
+      attached = parsed.some((entry) => String(entry?.Target || '').trim() === monitoringNetworkId);
+    } catch {
+      attached = false;
+    }
+
+    if (attached) {
+      continue;
+    }
+
+    log(`attaching ${serviceName} to mz-monitoring network`);
+    const update = await runCommandCaptureWithStatus(
+      'docker',
+      ['service', 'update', '--network-add', 'mz-monitoring', serviceName],
+    );
+    if (update.code !== 0) {
+      const output = `${update.stderr}\n${update.stdout}`.toLowerCase();
+      if (output.includes('already exists')) {
+        continue;
+      }
+      throw new Error(`Failed to attach ${serviceName} to mz-monitoring: ${update.stderr || update.stdout}`);
+    }
+  }
+}
+
 /**
  * Ensure the mz-monitoring overlay network and monitoring stack exist.
- * Idempotent: skips if the stack already has running services.
+ * Idempotent: skips only when required monitoring services are present and healthy.
  */
 async function ensureMonitoringStack(log: (msg: string) => void, envVars: NodeJS.ProcessEnv) {
   // 1. Ensure the mz-monitoring overlay network exists
@@ -1727,24 +1911,47 @@ async function ensureMonitoringStack(log: (msg: string) => void, envVars: NodeJS
       'mz-monitoring',
     ]);
   }
+  await ensureCloudflaredMonitoringNetwork(log);
 
-  // 2. Deploy monitoring stack if not already present
-  const monitoringStackName = 'mz-monitoring';
-  const { stdout: stackList } = await runCommandCapture('docker', ['stack', 'ls', '--format', '{{.Name}}']);
-  if (stackList.split('\n').some(n => n.trim() === monitoringStackName)) {
-    log('monitoring stack already deployed');
+  // 2. Deploy/reconcile monitoring stack when required services are missing or unhealthy.
+  const { stdout: serviceList } = await runCommandCapture('docker', ['service', 'ls', '--format', '{{.Name}}']);
+  const existingServices = new Set(
+    serviceList
+      .split('\n')
+      .map((name) => name.trim())
+      .filter(Boolean),
+  );
+  const missingServices = [...MONITORING_RUNTIME_SERVICES].filter((serviceName) => !existingServices.has(serviceName));
+  const currentStatuses = await inspectMonitoringRuntimeServices(
+    [...MONITORING_RUNTIME_SERVICES].filter((serviceName) => existingServices.has(serviceName)),
+  );
+  const healthy = missingServices.length === 0 && monitoringRuntimeHealthy(currentStatuses);
+  if (healthy) {
+    log('monitoring stack already deployed and healthy');
     return;
   }
 
+  if (missingServices.length) {
+    log(`monitoring stack missing services: ${missingServices.join(', ')}`);
+  }
+  const currentIssues = summarizeMonitoringRuntimeIssues(currentStatuses);
+  if (currentIssues) {
+    log(`monitoring stack needs reconcile: ${currentIssues}`);
+  }
+
   log('deploying monitoring stack');
+  const monitoringBaseStackPath = path.join(CLOUD_SWARM_DIR, 'stacks/monitoring-base.yml');
   const monitoringStackPath = path.join(CLOUD_SWARM_DIR, 'stacks/monitoring.yml');
   await runCommandCapture('docker', [
     'stack', 'deploy',
     '--with-registry-auth',
+    '-c', monitoringBaseStackPath,
     '-c', monitoringStackPath,
-    monitoringStackName,
+    'mz-monitoring',
   ], { env: envVars });
-  log('monitoring stack deployed');
+  await ensureCloudflaredMonitoringNetwork(log);
+  await waitForMonitoringRuntimeHealthy(log);
+  log('monitoring stack deployed and healthy');
 }
 
 async function downloadArtifact(r2: R2PresignContext, objectKeyOrUrl: string, targetPath: string) {

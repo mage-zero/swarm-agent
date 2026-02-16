@@ -77,6 +77,11 @@ export type SwarmServiceUpdateStatus = {
   message: string;
 };
 
+type RunbookServiceEntry = {
+  name: string;
+  replicas: string;
+};
+
 function parseDockerJsonLines(raw: string): Array<Record<string, unknown>> {
   const out: Array<Record<string, unknown>> = [];
   for (const line of raw.split('\n')) {
@@ -92,6 +97,46 @@ function parseDockerJsonLines(raw: string): Array<Record<string, unknown>> {
     }
   }
   return out;
+}
+
+function parseTaskStateWord(currentState: string): string {
+  return currentState.trim().split(/\s+/)[0] || '';
+}
+
+function isTerminalTaskState(currentState: string): boolean {
+  const state = parseTaskStateWord(currentState);
+  return state === 'Complete'
+    || state === 'Failed'
+    || state === 'Rejected'
+    || state === 'Shutdown'
+    || state === 'Remove'
+    || state === 'Orphaned';
+}
+
+function replicasSuggestsTerminal(replicas: string): boolean {
+  const lower = replicas.trim().toLowerCase();
+  if (!lower) return false;
+  return lower.includes('completed')
+    || lower.includes('failed')
+    || lower.includes('rejected')
+    || lower.includes('shutdown');
+}
+
+async function listRunbookJobServices(): Promise<RunbookServiceEntry[]> {
+  const result = await runCommand('docker', ['service', 'ls', '--format', '{{json .}}'], 12_000);
+  if (result.code !== 0) return [];
+  return parseDockerJsonLines(result.stdout)
+    .map((row) => ({
+      name: String(row.Name || '').trim(),
+      replicas: String(row.Replicas || '').trim(),
+    }))
+    .filter((row) => row.name.startsWith('mz-rb-'));
+}
+
+async function isRunbookServiceTerminal(serviceName: string): Promise<boolean> {
+  const tasks = await listServiceTasks(serviceName);
+  if (!tasks.length) return true;
+  return tasks.every((task) => isTerminalTaskState(task.current_state));
 }
 
 export async function listEnvironmentServices(environmentId: number): Promise<SwarmServiceListEntry[]> {
@@ -436,25 +481,59 @@ export async function runSwarmJob(options: SwarmJobOptions): Promise<SwarmJobRes
 }
 
 export async function cleanupOrphanedRunbookJobs(): Promise<{ removed: string[]; failed: string[] }> {
-  const result = await runCommand('docker', ['service', 'ls', '--format', '{{.Name}}'], 12_000);
-  if (result.code !== 0) return { removed: [], failed: [] };
-
-  const services = result.stdout
-    .split('\n')
-    .map((s) => s.trim())
-    .filter((s) => s.startsWith('mz-rb-'));
+  const services = await listRunbookJobServices();
 
   const removed: string[] = [];
   const failed: string[] = [];
 
   for (const service of services) {
-    const rm = await runCommand('docker', ['service', 'rm', service], 12_000);
+    // Skip active runbook jobs and only reap terminal leftovers.
+    const terminalByReplicas = replicasSuggestsTerminal(service.replicas);
+    if (!terminalByReplicas) continue;
+
+    const terminalByTasks = await isRunbookServiceTerminal(service.name);
+    if (!terminalByTasks) continue;
+
+    const rm = await runCommand('docker', ['service', 'rm', service.name], 12_000);
     if (rm.code === 0) {
-      removed.push(service);
+      removed.push(service.name);
     } else {
-      failed.push(service);
+      failed.push(service.name);
     }
   }
 
   return { removed, failed };
+}
+
+let runbookCleanupTimer: NodeJS.Timeout | null = null;
+let runbookCleanupRunning = false;
+
+async function runRunbookCleanup(reason: string): Promise<void> {
+  if (runbookCleanupRunning) return;
+  runbookCleanupRunning = true;
+  try {
+    const result = await cleanupOrphanedRunbookJobs();
+    if (result.removed.length || result.failed.length) {
+      const removed = result.removed.length;
+      const failed = result.failed.length;
+      console.log(`runbook.cleanup:${reason} removed=${removed} failed=${failed}`);
+    }
+  } finally {
+    runbookCleanupRunning = false;
+  }
+}
+
+export function startRunbookCleanupScheduler(): void {
+  if (runbookCleanupTimer) return;
+  const defaultIntervalMs = 5 * 60_000;
+  const configured = Number(process.env.MZ_RUNBOOK_CLEANUP_INTERVAL_MS || defaultIntervalMs);
+  const intervalMs = Number.isFinite(configured) && configured >= 30_000
+    ? configured
+    : defaultIntervalMs;
+
+  void runRunbookCleanup('startup');
+  runbookCleanupTimer = setInterval(() => {
+    void runRunbookCleanup('interval');
+  }, intervalMs);
+  runbookCleanupTimer.unref?.();
 }

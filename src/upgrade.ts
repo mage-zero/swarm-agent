@@ -3,7 +3,7 @@ import path from 'path';
 import { readConfig, isSwarmManager, type StatusConfig } from './status.js';
 import { buildNodeHeaders } from './node-hmac.js';
 import { isDeployPaused, setDeployPaused } from './deploy-pause.js';
-import { executeMigration } from './upgrade-migrations.js';
+import { ensureCloudSwarmRepo, executeMigration } from './upgrade-migrations.js';
 
 const AGENT_DIR = process.env.MZ_AGENT_DIR || '/opt/mage-zero/agent';
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
@@ -246,7 +246,17 @@ async function checkRequires(
   const missing: string[] = [];
 
   if (requires['cloud-swarm']) {
-    const cloudSwarmVersion = readCloudSwarmVersion();
+    let cloudSwarmVersion = readCloudSwarmVersion();
+    if (!satisfiesSemver(cloudSwarmVersion, requires['cloud-swarm'])) {
+      // Self-heal on freshly provisioned nodes where cloud-swarm checkout may
+      // not exist yet; upgrade migrations can bootstrap it.
+      try {
+        await ensureCloudSwarmRepo(CLOUD_SWARM_DIR);
+        cloudSwarmVersion = readCloudSwarmVersion();
+      } catch {
+        // Keep original behavior and report unmet requirement below.
+      }
+    }
     if (!satisfiesSemver(cloudSwarmVersion, requires['cloud-swarm'])) {
       missing.push(`cloud-swarm: need ${requires['cloud-swarm']}, have ${cloudSwarmVersion}`);
     }
@@ -514,6 +524,52 @@ async function fetchStackEnvironments(
   }
 }
 
+async function fetchStackEnvironmentCount(config: StatusConfig): Promise<number | null> {
+  const baseUrl = (config.mz_control_base_url || process.env.MZ_CONTROL_BASE_URL || '').trim();
+  const nodeId = readNodeFile('node-id');
+  const nodeSecret = readNodeFile('node-secret');
+  const stackId = Number(config.stack_id ?? 0);
+
+  if (!baseUrl || !nodeId || !nodeSecret || !stackId) {
+    return null;
+  }
+
+  try {
+    const result = await fetchJson(
+      baseUrl,
+      `/v1/agent/stack/${stackId}/environments`,
+      'GET',
+      null,
+      nodeId,
+      nodeSecret,
+    ) as { environments?: Array<Record<string, unknown>> };
+    return Array.isArray(result?.environments) ? result.environments.length : 0;
+  } catch {
+    return null;
+  }
+}
+
+function computeUpgradeDowntimeMinutes(
+  versions: ChangelogVersion[],
+  environmentCount: number | null,
+): number {
+  return versions.reduce((sum, version) => {
+    const scoped = version.changes
+      .filter((change) => change.phase === 'migrate')
+      .reduce((inner, change) => {
+        if (change.scope === 'stack') {
+          return inner + change.downtimeMinutes;
+        }
+        if (environmentCount === null) {
+          // Unknown env count: fail-safe by keeping stated downtime.
+          return inner + change.downtimeMinutes;
+        }
+        return environmentCount > 0 ? inner + change.downtimeMinutes : inner;
+      }, 0);
+    return sum + scoped;
+  }, 0);
+}
+
 /**
  * Main upgrade check loop. Runs every 60s on manager only.
  */
@@ -553,13 +609,14 @@ async function checkUpgrades(): Promise<void> {
     );
 
     if (pendingVersions.length > 0) {
-      const totalDowntime = pendingVersions.reduce(
-        (sum, v) =>
-          sum + v.changes.filter((c) => c.phase === 'migrate').reduce((s, c) => s + c.downtimeMinutes, 0),
-        0,
-      );
+      const environmentCount = await fetchStackEnvironmentCount(config);
+      const totalDowntime = computeUpgradeDowntimeMinutes(pendingVersions, environmentCount);
 
-      console.log(`upgrade.startup: version jump detected (${previousVersion} → ${currentVersion}), ${totalDowntime}min downtime`);
+      const envCountLabel = environmentCount === null ? 'unknown' : String(environmentCount);
+      console.log(
+        `upgrade.startup: version jump detected (${previousVersion} → ${currentVersion}), `
+        + `${totalDowntime}min downtime (environments=${envCountLabel})`,
+      );
 
       // Check requirements
       const allRequires: Record<string, string> = {};
