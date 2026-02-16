@@ -51,6 +51,8 @@ compare_semver() {
 
   for i in 0 1 2; do
     local na="${va[$i]:-0}" nb="${vb[$i]:-0}"
+    [[ "${na}" =~ ^[0-9]+$ ]] || na=0
+    [[ "${nb}" =~ ^[0-9]+$ ]] || nb=0
     if (( na > nb )); then return 1; fi
     if (( na < nb )); then return 2; fi
   done
@@ -139,9 +141,9 @@ if [[ -f "${VERSION_FILE}" ]]; then
 fi
 CURRENT_VERSION="$(parse_version "${CURRENT_VERSION}")"
 
-if [[ "${CURRENT_VERSION}" == "unknown" || -z "${CURRENT_VERSION}" ]]; then
-  log "cannot determine current version; skipping"
-  exit 0
+if [[ ! "${CURRENT_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  log "current version '${CURRENT_VERSION}' is not stable semver; using 0.0.0 baseline"
+  CURRENT_VERSION="0.0.0"
 fi
 
 log "current version: ${CURRENT_VERSION}"
@@ -160,19 +162,27 @@ VERSIONS=()
 while IFS= read -r tag; do
   [[ -z "${tag}" ]] && continue
   version="$(parse_version "${tag}")"
-  if [[ -n "${version}" ]] && version_gt "${version}" "${CURRENT_VERSION}"; then
+  if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    continue
+  fi
+  if version_gt "${version}" "${CURRENT_VERSION}"; then
     VERSIONS+=("${version}")
   fi
 done < <(echo "${RELEASES_JSON}" | python3 -c "
-import json, sys
+import json, re, sys
 releases = json.load(sys.stdin)
-tags = [r.get('tag_name','') for r in releases if not r.get('draft') and not r.get('prerelease')]
-def ver_key(t):
-    v = t.lstrip('v')
-    parts = v.split('.')
-    return tuple(int(p) for p in parts if p.isdigit())
-tags.sort(key=ver_key)
-for t in tags:
+stable = re.compile(r'^v?(\\d+)\\.(\\d+)\\.(\\d+)$')
+tags = []
+for r in releases:
+    if r.get('draft') or r.get('prerelease'):
+        continue
+    tag = r.get('tag_name', '')
+    m = stable.match(tag)
+    if not m:
+        continue
+    tags.append((tuple(int(x) for x in m.groups()), tag))
+tags.sort(key=lambda item: item[0])
+for _, t in tags:
     print(t)
 " 2>/dev/null)
 
