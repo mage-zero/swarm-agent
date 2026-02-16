@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { readConfig, type StatusConfig } from './status.js';
+import { readConfig, isSwarmManager, type StatusConfig } from './status.js';
 import { buildNodeHeaders } from './node-hmac.js';
 import { isDeployPaused, setDeployPaused } from './deploy-pause.js';
 import { executeMigration } from './upgrade-migrations.js';
@@ -88,6 +88,10 @@ function readUpgradeAvailable(): UpgradeAvailable | null {
   } catch {
     return null;
   }
+}
+
+function writeUpgradeAvailable(upgrade: UpgradeAvailable): void {
+  fs.writeFileSync(UPGRADE_AVAILABLE_PATH, JSON.stringify(upgrade, null, 2), 'utf8');
 }
 
 function readUpgradeState(): UpgradeState {
@@ -344,6 +348,10 @@ function sortEnvironmentsByType(
 export async function executeUpgradePlan(changelog: ChangelogVersion[]): Promise<void> {
   const config = readConfig();
   const stackId = Number(config.stack_id ?? 0);
+  const mzControlBaseUrl = (config.mz_control_base_url || process.env.MZ_CONTROL_BASE_URL || '').trim();
+  const nodeId = readNodeFile('node-id');
+  const nodeSecret = readNodeFile('node-secret');
+  const baseCtx = { stackId, cloudSwarmDir: CLOUD_SWARM_DIR, mzControlBaseUrl, nodeId, nodeSecret };
 
   console.log('upgrade.execute: starting upgrade plan');
 
@@ -356,7 +364,7 @@ export async function executeUpgradePlan(changelog: ChangelogVersion[]): Promise
       current_phase: 'pre_migrate',
       progress_message: `Pre-migration: ${change.description}`,
     });
-    await executeMigration(change.id, { stackId, cloudSwarmDir: CLOUD_SWARM_DIR });
+    await executeMigration(change.id, baseCtx);
   }
 
   // Fetch environments for this stack
@@ -375,9 +383,8 @@ export async function executeUpgradePlan(changelog: ChangelogVersion[]): Promise
         progress_message: `Pre-migration: ${change.description}`,
       });
       await executeMigration(change.id, {
+        ...baseCtx,
         environmentId: env.environment_id,
-        stackId,
-        cloudSwarmDir: CLOUD_SWARM_DIR,
       });
     }
   }
@@ -399,7 +406,7 @@ export async function executeUpgradePlan(changelog: ChangelogVersion[]): Promise
         current_phase: 'migrate',
         progress_message: `Migrating: ${change.description}`,
       });
-      await executeMigration(change.id, { stackId, cloudSwarmDir: CLOUD_SWARM_DIR });
+      await executeMigration(change.id, baseCtx);
     }
 
     // Environment-scoped migrations (sequential by type order)
@@ -413,9 +420,8 @@ export async function executeUpgradePlan(changelog: ChangelogVersion[]): Promise
           progress_message: `Migrating: ${change.description}`,
         });
         await executeMigration(change.id, {
+          ...baseCtx,
           environmentId: env.environment_id,
-          stackId,
-          cloudSwarmDir: CLOUD_SWARM_DIR,
         });
       }
     }
@@ -430,7 +436,7 @@ export async function executeUpgradePlan(changelog: ChangelogVersion[]): Promise
       current_phase: 'post_migrate',
       progress_message: `Post-migration: ${change.description}`,
     });
-    await executeMigration(change.id, { stackId, cloudSwarmDir: CLOUD_SWARM_DIR });
+    await executeMigration(change.id, baseCtx);
   }
 
   const postEnvChanges = collectChanges(changelog, 'post_migrate', 'environment');
@@ -444,9 +450,8 @@ export async function executeUpgradePlan(changelog: ChangelogVersion[]): Promise
         progress_message: `Post-migration: ${change.description}`,
       });
       await executeMigration(change.id, {
+        ...baseCtx,
         environmentId: env.environment_id,
-        stackId,
-        cloudSwarmDir: CLOUD_SWARM_DIR,
       });
     }
   }
@@ -536,13 +541,85 @@ async function checkUpgrades(): Promise<void> {
     return;
   }
 
-  // Check for upgrade-available.json (written by updater)
+  // Startup version detection: if our running version is newer than what was
+  // last reported, read the bundled changelog and trigger the upgrade flow.
+  // This handles: first deployment, manual binary swap, old-updater upgrades.
+  const currentVersion = readAgentVersion();
+  if (currentVersion !== 'unknown' && currentVersion !== state.reported_version) {
+    const changelog = readCurrentChangelog();
+    const previousVersion = state.reported_version || '0.0.0';
+    const pendingVersions = changelog.filter(
+      (v) => compareSemver(v.version, previousVersion) > 0 && compareSemver(v.version, currentVersion) <= 0,
+    );
+
+    if (pendingVersions.length > 0) {
+      const totalDowntime = pendingVersions.reduce(
+        (sum, v) =>
+          sum + v.changes.filter((c) => c.phase === 'migrate').reduce((s, c) => s + c.downtimeMinutes, 0),
+        0,
+      );
+
+      console.log(`upgrade.startup: version jump detected (${previousVersion} → ${currentVersion}), ${totalDowntime}min downtime`);
+
+      // Check requirements
+      const allRequires: Record<string, string> = {};
+      for (const v of pendingVersions) {
+        Object.assign(allRequires, v.requires);
+      }
+      const { satisfied, missing } = await checkRequires(allRequires, config);
+      if (!satisfied) {
+        console.warn('upgrade.startup: requirements not satisfied:', missing);
+        return;
+      }
+
+      // Report as available to mz-control
+      const upgradeData: UpgradeAvailable = {
+        current: previousVersion,
+        target: currentVersion,
+        total_downtime_minutes: totalDowntime,
+        changelog: pendingVersions,
+        detected_at: new Date().toISOString(),
+      };
+
+      try {
+        const result = await reportUpgradeAvailable(config, upgradeData);
+        state.reported_version = currentVersion;
+        state.last_check_at = new Date().toISOString();
+
+        if (result.auto_upgrade || totalDowntime === 0) {
+          // Zero downtime or auto-approved — execute immediately
+          state.pending_migrations = true;
+          writeUpgradeState(state);
+          console.log(`upgrade.startup: auto-executing migrations for ${currentVersion}`);
+          await executeUpgradePlan(pendingVersions);
+        } else {
+          // Keep a local upgrade-available file so normal schedule polling can
+          // continue even when this upgrade was detected on startup. Use the
+          // running version as "current" so stale-file checks do not skip it.
+          writeUpgradeAvailable({
+            ...upgradeData,
+            current: currentVersion,
+          });
+          writeUpgradeState(state);
+          console.log(`upgrade.startup: reported ${currentVersion} as available, waiting for approval`);
+        }
+      } catch (err) {
+        console.error('upgrade.startup.report.failed:', err instanceof Error ? err.message : err);
+      }
+      return;
+    }
+
+    // Version changed but no pending changelog entries — just update state
+    state.reported_version = currentVersion;
+    writeUpgradeState(state);
+  }
+
+  // Check for upgrade-available.json (written by updater for future versions)
   const upgrade = readUpgradeAvailable();
   if (!upgrade) {
     return;
   }
 
-  const currentVersion = readAgentVersion();
   if (upgrade.current !== currentVersion) {
     // Stale file, updater wrote it for a different version
     return;
@@ -593,6 +670,12 @@ async function checkUpgrades(): Promise<void> {
       );
 
       if (scheduled?.scheduled_at) {
+        const scheduledAtTs = Date.parse(scheduled.scheduled_at);
+        if (!Number.isNaN(scheduledAtTs) && scheduledAtTs > Date.now()) {
+          console.log(`upgrade.scheduled: waiting until ${scheduled.scheduled_at} for ${upgrade.target}`);
+          return;
+        }
+
         // Write approved file for the updater to pick up
         writeUpgradeApproved(upgrade.target, scheduled.scheduled_at);
         state.pending_migrations = true;
@@ -609,6 +692,13 @@ async function checkUpgrades(): Promise<void> {
  * Read changelog from bundled changelog.json or release directory.
  */
 function readCurrentChangelog(): ChangelogVersion[] {
+  // Prefer upgrade-available.json: it contains only the currently approved
+  // upgrade path and avoids replaying historical migrations.
+  const upgrade = readUpgradeAvailable();
+  if (upgrade?.changelog) {
+    return upgrade.changelog;
+  }
+
   // Try bundled changelog first (alongside the running binary)
   const bundledPath = path.join(AGENT_DIR, 'changelog.json');
   try {
@@ -619,29 +709,7 @@ function readCurrentChangelog(): ChangelogVersion[] {
     // ignore
   }
 
-  // Try from upgrade-available.json (updater wrote this)
-  const upgrade = readUpgradeAvailable();
-  if (upgrade?.changelog) {
-    return upgrade.changelog;
-  }
-
   return [];
-}
-
-/**
- * Check if we're a swarm manager (upgrade logic only runs on manager).
- */
-async function isSwarmManager(): Promise<boolean> {
-  if (process.env.MZ_DISABLE_DOCKER === '1') return false;
-  try {
-    const result = await fetch('http://localhost/info', {
-      headers: { Host: 'docker' },
-    });
-    const info = await result.json() as { Swarm?: { ControlAvailable?: boolean } };
-    return Boolean(info?.Swarm?.ControlAvailable);
-  } catch {
-    return false;
-  }
 }
 
 let upgradeTimer: ReturnType<typeof setInterval> | null = null;

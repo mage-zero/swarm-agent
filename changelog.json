@@ -31,6 +31,38 @@
           "scope": "environment"
         }
       ]
+    },
+    {
+      "version": "0.4.0",
+      "date": "2026-02-16",
+      "summary": "Deploy monitoring stack and OpenSearch Dashboards with DNS and IP-restricted access",
+      "requires": {
+        "cloud-swarm": ">=1.0.0",
+        "mz-control": ">=1.0.1"
+      },
+      "changes": [
+        {
+          "id": "build-monitoring-images",
+          "description": "Build OpenSearch, Dashboards, Filebeat, and Metricbeat images",
+          "phase": "pre_migrate",
+          "downtimeMinutes": 0,
+          "scope": "stack"
+        },
+        {
+          "id": "deploy-monitoring-stack",
+          "description": "Deploy mz-monitoring stack (OpenSearch, Dashboards, APM, Metricbeat, Filebeat)",
+          "phase": "pre_migrate",
+          "downtimeMinutes": 0,
+          "scope": "stack"
+        },
+        {
+          "id": "setup-dashboards-dns",
+          "description": "Create DNS, tunnel ingress, and WAF rules for OpenSearch Dashboards UI",
+          "phase": "post_migrate",
+          "downtimeMinutes": 0,
+          "scope": "stack"
+        }
+      ]
     }
   ]
 }
