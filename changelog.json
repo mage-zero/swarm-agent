@@ -80,6 +80,16 @@
         "mz-control": ">=1.0.1"
       },
       "changes": []
+    },
+    {
+      "version": "0.4.2",
+      "date": "2026-02-16",
+      "summary": "Fix service status evaluation for global constraints and completed one-shot jobs",
+      "requires": {
+        "cloud-swarm": ">=1.0.0",
+        "mz-control": ">=1.0.1"
+      },
+      "changes": []
     }
   ]
 }

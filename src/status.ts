@@ -151,6 +151,7 @@ type ServiceStateCounts = {
   pending: number;
   failed: number;
   rejected: number;
+  complete: number;
   shutdown: number;
 };
 
@@ -852,6 +853,141 @@ function parseEnvironmentServiceName(name: string) {
   };
 }
 
+function parseTaskRecency(task: any): number {
+  const versionIndex = Number(task?.Version?.Index || 0);
+  if (Number.isFinite(versionIndex) && versionIndex > 0) {
+    return versionIndex;
+  }
+  const timestamp = String(task?.Status?.Timestamp || task?.UpdatedAt || task?.CreatedAt || '').trim();
+  const parsed = timestamp ? Date.parse(timestamp) : 0;
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function taskGroupingKey(task: any): string {
+  const slotRaw = task?.Slot;
+  const slot = typeof slotRaw === 'number'
+    ? slotRaw
+    : Number.parseInt(String(slotRaw || ''), 10);
+  if (Number.isFinite(slot) && slot > 0) {
+    return `slot:${slot}`;
+  }
+  const nodeId = String(task?.NodeID || '').trim();
+  if (nodeId) {
+    return `node:${nodeId}`;
+  }
+  const taskId = String(task?.ID || '').trim();
+  if (taskId) {
+    return `task:${taskId}`;
+  }
+  return '';
+}
+
+function selectLatestServiceTasks(tasks: any[], serviceId: string): any[] {
+  const latestByKey = new Map<string, any>();
+  for (const task of tasks) {
+    if (task?.ServiceID !== serviceId) {
+      continue;
+    }
+    const key = taskGroupingKey(task);
+    if (!key) {
+      continue;
+    }
+    const current = latestByKey.get(key);
+    if (!current) {
+      latestByKey.set(key, task);
+      continue;
+    }
+    const candidateRecency = parseTaskRecency(task);
+    const currentRecency = parseTaskRecency(current);
+    if (candidateRecency > currentRecency) {
+      latestByKey.set(key, task);
+      continue;
+    }
+    if (candidateRecency === currentRecency) {
+      const candidateId = String(task?.ID || '');
+      const currentId = String(current?.ID || '');
+      if (candidateId > currentId) {
+        latestByKey.set(key, task);
+      }
+    }
+  }
+  return Array.from(latestByKey.values());
+}
+
+function parsePlacementConstraint(constraint: string): { key: string; operator: '==' | '!='; value: string } | null {
+  const match = String(constraint || '').trim().match(/^([a-zA-Z0-9_.-]+)\s*(==|!=)\s*(.+)$/);
+  if (!match) {
+    return null;
+  }
+  const [, key, operator, rawValue] = match;
+  const value = String(rawValue || '').trim().replace(/^['"]|['"]$/g, '');
+  if (!key || !value) {
+    return null;
+  }
+  return { key, operator: operator as '==' | '!=', value };
+}
+
+function getNodeConstraintValue(node: any, key: string): string | null {
+  if (key === 'node.id') {
+    return String(node?.ID || '').trim() || null;
+  }
+  if (key === 'node.role') {
+    return String(node?.Spec?.Role || '').trim() || null;
+  }
+  if (key === 'node.hostname') {
+    return String(node?.Description?.Hostname || '').trim() || null;
+  }
+  if (key === 'node.platform.os') {
+    return String(node?.Description?.Platform?.OS || '').trim() || null;
+  }
+  if (key === 'node.platform.arch') {
+    return String(node?.Description?.Platform?.Architecture || '').trim() || null;
+  }
+  if (key.startsWith('node.labels.')) {
+    const labelKey = key.slice('node.labels.'.length);
+    return String(node?.Spec?.Labels?.[labelKey] || '').trim() || null;
+  }
+  if (key.startsWith('engine.labels.')) {
+    const labelKey = key.slice('engine.labels.'.length);
+    return String(node?.Description?.Engine?.Labels?.[labelKey] || '').trim() || null;
+  }
+  return null;
+}
+
+function nodeMatchesPlacementConstraints(node: any, constraints: string[]): boolean {
+  for (const rawConstraint of constraints) {
+    const parsed = parsePlacementConstraint(rawConstraint);
+    if (!parsed) {
+      continue;
+    }
+    const nodeValue = getNodeConstraintValue(node, parsed.key);
+    if (nodeValue === null) {
+      return false;
+    }
+    if (parsed.operator === '==') {
+      if (nodeValue !== parsed.value) {
+        return false;
+      }
+      continue;
+    }
+    if (nodeValue === parsed.value) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function countEligibleReadyNodesForService(service: any, readyNodes: any[]): number {
+  const constraintsRaw = service?.Spec?.TaskTemplate?.Placement?.Constraints;
+  const constraints = Array.isArray(constraintsRaw)
+    ? constraintsRaw.map((entry) => String(entry || '').trim()).filter(Boolean)
+    : [];
+  if (!constraints.length) {
+    return readyNodes.length;
+  }
+  return readyNodes.filter((node) => nodeMatchesPlacementConstraints(node, constraints)).length;
+}
+
 export async function buildServiceStatusPayload(environmentId?: number): Promise<ServiceStatusPayload> {
   const localSwarm = await getLocalSwarmInfo();
   const swarmNodes = await getSwarmNodes(localSwarm.controlAvailable);
@@ -881,13 +1017,14 @@ export async function buildServiceStatusPayload(environmentId?: number): Promise
     const mode = service?.Spec?.Mode?.Replicated ? 'replicated' : 'global';
     const desiredReplicas = mode === 'replicated'
       ? Number(service?.Spec?.Mode?.Replicated?.Replicas || 0)
-      : readyNodes.length;
+      : countEligibleReadyNodesForService(service, readyNodes);
 
     const stateCounts: ServiceStateCounts = {
       running: 0,
       pending: 0,
       failed: 0,
       rejected: 0,
+      complete: 0,
       shutdown: 0,
     };
     const healthCounts: ServiceHealthCounts = {
@@ -903,9 +1040,8 @@ export async function buildServiceStatusPayload(environmentId?: number): Promise
     let lastErrorTime = 0;
 
     const nodeCounts = new Map<string, { hostname: string; count: number }>();
-    const serviceTasks = tasks.filter(
-      (task) => task?.ServiceID === service?.ID && task?.DesiredState === 'running',
-    );
+    const serviceId = String(service?.ID || '');
+    const serviceTasks = selectLatestServiceTasks(tasks, serviceId);
     for (const task of serviceTasks) {
       const state = String(task?.Status?.State || '').toLowerCase();
       if (state && state in stateCounts) {
@@ -942,7 +1078,13 @@ export async function buildServiceStatusPayload(environmentId?: number): Promise
       const restarts = Number(task?.Status?.ContainerStatus?.RestartCount || 0);
       restartCount += Number.isFinite(restarts) ? restarts : 0;
 
-      const errorMessage = String(task?.Status?.Err || task?.Status?.Message || '').trim();
+      const stateLower = String(task?.Status?.State || '').toLowerCase();
+      const errorMessage = String(
+        task?.Status?.Err
+        || ((stateLower === 'failed' || stateLower === 'rejected')
+          ? task?.Status?.Message
+          : ''),
+      ).trim();
       if (errorMessage) {
         const timestamp = String(task?.Status?.Timestamp || '');
         const timeValue = timestamp ? Date.parse(timestamp) : 0;
@@ -955,11 +1097,16 @@ export async function buildServiceStatusPayload(environmentId?: number): Promise
     }
 
     const hasIssues = healthCounts.unhealthy > 0 || stateCounts.failed > 0 || stateCounts.rejected > 0;
+    const completedOneShot = desiredReplicas > 0
+      && runningReplicas === 0
+      && stateCounts.complete >= desiredReplicas
+      && !hasIssues;
+    const effectiveRunningReplicas = completedOneShot ? desiredReplicas : runningReplicas;
     let status: ServiceStatus['status'] = 'unknown';
     if (desiredReplicas > 0) {
-      if (runningReplicas >= desiredReplicas && !hasIssues) {
+      if (effectiveRunningReplicas >= desiredReplicas && !hasIssues) {
         status = 'healthy';
-      } else if (runningReplicas > 0) {
+      } else if (effectiveRunningReplicas > 0) {
         status = 'degraded';
       } else {
         status = 'down';
@@ -973,7 +1120,7 @@ export async function buildServiceStatusPayload(environmentId?: number): Promise
       environment_id: parsed.environmentId,
       mode,
       desired_replicas: desiredReplicas,
-      running_replicas: runningReplicas,
+      running_replicas: effectiveRunningReplicas,
       health: healthCounts,
       state_counts: stateCounts,
       nodes: Array.from(nodeCounts.entries()).map(([id, entry]) => ({
@@ -2775,6 +2922,15 @@ export async function handleJoinTokenRequest(secretHeader: string | undefined) {
     return { status: 502, body: { error: 'swarm_unavailable' } } as const;
   }
 }
+
+export const __testing = {
+  parseTaskRecency,
+  taskGroupingKey,
+  selectLatestServiceTasks,
+  parsePlacementConstraint,
+  nodeMatchesPlacementConstraints,
+  countEligibleReadyNodesForService,
+};
 
 export function startTuningScheduler() {
   if (process.env.MZ_TUNING_SCHEDULER_ENABLED === '0') {
