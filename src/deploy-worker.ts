@@ -2275,6 +2275,57 @@ async function configureReplica(containerId: string, masterHost: string, replica
   ]);
 }
 
+async function configureReplicaViaSwarmJob(params: {
+  environmentId: number;
+  replicaServiceFullName: string;
+  masterHost: string;
+  replicaUser: string;
+}) {
+  const replicaSpec = await inspectServiceSpec(params.replicaServiceFullName);
+  if (!replicaSpec) {
+    throw new Error(`missing service: ${params.replicaServiceFullName}`);
+  }
+
+  const replicaTasks = await listServiceTasks(params.replicaServiceFullName);
+  const desiredRunning = replicaTasks.filter((task) => task.desired_state.toLowerCase() === 'running');
+  if (!desiredRunning.length) {
+    const summary = replicaTasks
+      .slice(0, 3)
+      .map((task) => `${task.name} ${task.current_state}${task.error ? ` (${task.error})` : ''}`)
+      .join('; ');
+    throw new Error(
+      `replica service has no desired running tasks${summary ? `: ${summary}` : ''}`,
+    );
+  }
+
+  const safeMasterHost = params.masterHost.replace(/'/g, "''");
+  const safeReplicaUser = params.replicaUser.replace(/'/g, "''");
+  const safeReplicaHost = params.replicaServiceFullName.replace(/'/g, "''");
+  const passRef = '${REPL_PASS}';
+  const script = [
+    'set -e',
+    'REPL_PASS="$(cat /run/secrets/db_replication_password)"',
+    'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+    `i=0; until mariadb -h '${safeReplicaHost}' -uroot -p"$ROOT_PASS" -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 30 ]; then echo "replica not ready" >&2; exit 1; fi; sleep 1; done`,
+    `mariadb -h '${safeReplicaHost}' -uroot -p"$ROOT_PASS" -e "CHANGE MASTER TO MASTER_HOST='${safeMasterHost}', MASTER_PORT=3306, MASTER_USER='${safeReplicaUser}', MASTER_PASSWORD='${passRef}', MASTER_USE_GTID=slave_pos;"`,
+    `mariadb -h '${safeReplicaHost}' -uroot -p"$ROOT_PASS" -e "START SLAVE;"`,
+  ].join(' && ');
+
+  const job = await runSwarmJob({
+    name: buildJobName('deploy-replica-config', params.environmentId),
+    image: replicaSpec.image,
+    networks: replicaSpec.networks.map((network) => network.name).filter(Boolean),
+    secrets: replicaSpec.secrets.map((secret) => ({ source: secret.secret_name, target: secret.file_name })),
+    env: replicaSpec.env,
+    command: ['sh', '-lc', script],
+    timeout_ms: 120_000,
+  });
+  if (!job.ok) {
+    const detail = (job.logs || job.error || '').trim();
+    throw new Error(detail || `replica config job failed (${job.state})`);
+  }
+}
+
 async function runDatabaseCommandWithRetry(
   stackName: string,
   containerId: string,
@@ -4144,9 +4195,12 @@ async function processDeployment(recordPath: string) {
   if (replicaServiceName === 'database-replica') {
     try {
       progress.detail('app_prepare', 'Configuring database replication');
-      const replicaContainerId = await waitForContainer(stackName, 'database-replica', 5 * 60 * 1000);
-      await waitForDatabase(replicaContainerId, 5 * 60 * 1000);
-      await configureReplica(replicaContainerId, stackService('database'), replicaUser);
+      await configureReplicaViaSwarmJob({
+        environmentId,
+        replicaServiceFullName: stackService('database-replica'),
+        masterHost: stackService('database'),
+        replicaUser,
+      });
       log('replica configured');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
