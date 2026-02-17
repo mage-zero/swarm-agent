@@ -9,6 +9,7 @@ import { enforceCommandPolicy } from './command-policy.js';
 import { parseListObjectsV2Xml } from './r2-list.js';
 import { getDbBackupZstdLevel } from './backup-utils.js';
 import { buildJobName, envServiceName, inspectServiceSpec, listServiceTasks, runSwarmJob } from './swarm.js';
+import { bootstrapMonitoringDashboards } from './monitoring-dashboards.js';
 
 type DeployPayload = {
   artifact?: string;
@@ -1725,6 +1726,16 @@ const monitoringHealthPollParsed = Number(process.env.MZ_MONITORING_HEALTH_POLL_
 const MONITORING_HEALTH_POLL_MS = Number.isFinite(monitoringHealthPollParsed) && monitoringHealthPollParsed > 0
   ? Math.max(5_000, monitoringHealthPollParsed)
   : 10_000;
+const monitoringDashboardsBootstrapRetriesParsed = Number(process.env.MZ_MONITORING_DASHBOARDS_BOOTSTRAP_RETRIES);
+const MONITORING_DASHBOARDS_BOOTSTRAP_RETRIES = Number.isFinite(monitoringDashboardsBootstrapRetriesParsed)
+  && monitoringDashboardsBootstrapRetriesParsed > 0
+  ? Math.floor(monitoringDashboardsBootstrapRetriesParsed)
+  : 3;
+const monitoringDashboardsBootstrapDelayParsed = Number(process.env.MZ_MONITORING_DASHBOARDS_BOOTSTRAP_DELAY_MS);
+const MONITORING_DASHBOARDS_BOOTSTRAP_DELAY_MS = Number.isFinite(monitoringDashboardsBootstrapDelayParsed)
+  && monitoringDashboardsBootstrapDelayParsed > 0
+  ? Math.max(1_000, monitoringDashboardsBootstrapDelayParsed)
+  : 5_000;
 
 type MonitoringRuntimeStatus = {
   serviceName: string;
@@ -1892,6 +1903,28 @@ async function ensureCloudflaredMonitoringNetwork(log: (msg: string) => void): P
   }
 }
 
+async function ensureMonitoringDashboards(log: (msg: string) => void): Promise<void> {
+  let lastError = '';
+  for (let attempt = 1; attempt <= MONITORING_DASHBOARDS_BOOTSTRAP_RETRIES; attempt += 1) {
+    try {
+      const result = await bootstrapMonitoringDashboards();
+      log(
+        `monitoring dashboards ready (${result.dashboard_ids.join(', ')}, objects=${result.upserted_objects})`
+      );
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      lastError = message;
+      if (attempt >= MONITORING_DASHBOARDS_BOOTSTRAP_RETRIES) {
+        break;
+      }
+      log(`monitoring dashboards bootstrap retry ${attempt}: ${message}`);
+      await new Promise((resolve) => setTimeout(resolve, MONITORING_DASHBOARDS_BOOTSTRAP_DELAY_MS));
+    }
+  }
+  throw new Error(`monitoring dashboards bootstrap failed: ${lastError || 'unknown error'}`);
+}
+
 /**
  * Ensure the mz-monitoring overlay network and monitoring stack exist.
  * Idempotent: skips only when required monitoring services are present and healthy.
@@ -1928,6 +1961,7 @@ async function ensureMonitoringStack(log: (msg: string) => void, envVars: NodeJS
   const healthy = missingServices.length === 0 && monitoringRuntimeHealthy(currentStatuses);
   if (healthy) {
     log('monitoring stack already deployed and healthy');
+    await ensureMonitoringDashboards(log);
     return;
   }
 
@@ -1951,6 +1985,7 @@ async function ensureMonitoringStack(log: (msg: string) => void, envVars: NodeJS
   ], { env: envVars });
   await ensureCloudflaredMonitoringNetwork(log);
   await waitForMonitoringRuntimeHealthy(log);
+  await ensureMonitoringDashboards(log);
   log('monitoring stack deployed and healthy');
 }
 
@@ -2570,11 +2605,21 @@ async function ensureMagentoEnvWrapper(containerId: string) {
     '  cp /usr/local/share/mz-env.php /var/www/html/magento/app/etc/env.php;',
     '  chown www-data:www-data /var/www/html/magento/app/etc/env.php /var/www/html/magento/app/etc/env.base.php;',
     'fi',
+    ';',
+    'if [ -f /var/www/html/magento/app/etc/config.php ]; then',
+    '  if [ ! -f /var/www/html/magento/app/etc/config.base.php ]; then',
+    '    cp /var/www/html/magento/app/etc/config.php /var/www/html/magento/app/etc/config.base.php;',
+    '  elif ! grep -q "config.base.php" /var/www/html/magento/app/etc/config.php; then',
+    '    cp /var/www/html/magento/app/etc/config.php /var/www/html/magento/app/etc/config.base.php;',
+    '  fi;',
+    '  cp /usr/local/share/mz-config.php /var/www/html/magento/app/etc/config.php;',
+    '  chown www-data:www-data /var/www/html/magento/app/etc/config.php /var/www/html/magento/app/etc/config.base.php;',
+    'fi',
   ].join(' ');
   const result = await runCommandCaptureWithStatus('docker', ['exec', '--user', 'root', containerId, 'sh', '-c', command]);
   if (result.code !== 0) {
     const output = (result.stderr || result.stdout || '').trim();
-    throw new Error(`env.php wrapper failed (exit ${result.code}): ${output || 'unknown error'}`);
+    throw new Error(`env/config wrapper failed (exit ${result.code}): ${output || 'unknown error'}`);
   }
 }
 
@@ -2591,7 +2636,7 @@ async function ensureMagentoEnvWrapperWithRetry(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (message.includes('is not running') || message.includes('No such container') || message.includes('exited with code 128')) {
-        log(`env.php wrapper retry ${attempt}: ${message}`);
+        log(`env/config wrapper retry ${attempt}: ${message}`);
         currentId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
         continue;
       }
@@ -3328,7 +3373,10 @@ async function enforceMagentoPerformance(
     'set -e;',
     'test -f /var/www/html/magento/app/etc/env.php;',
     'test -f /var/www/html/magento/app/etc/env.base.php;',
+    'test -f /var/www/html/magento/app/etc/config.php;',
+    'test -f /var/www/html/magento/app/etc/config.base.php;',
     'grep -q "env.base.php" /var/www/html/magento/app/etc/env.php;',
+    'grep -q "config.base.php" /var/www/html/magento/app/etc/config.php;',
     'grep -q "MAGE_MODE" /var/www/html/magento/app/etc/env.php;',
     'grep -q "cache_types" /var/www/html/magento/app/etc/env.php;',
   ].join(' ');
@@ -3589,6 +3637,92 @@ async function runSetupDbStatus(
     throw new Error(`setup:db:status failed (exit ${exitCode}): ${output}`);
   }
   return { needed: true, exitCode: 1, output: 'setup:db:status retries exhausted', containerId: currentId };
+}
+
+async function runAppConfigStatus(
+  containerId: string,
+  stackName: string,
+  log: (message: string) => void,
+): Promise<{ needed: boolean; exitCode: number; output: string; containerId: string }> {
+  let currentId = containerId;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    currentId = await ensureMagentoEnvWrapperWithRetry(currentId, stackName, log);
+    const result = await runMagentoCommandWithStatus(currentId, stackName, 'php bin/magento app:config:status');
+    const output = (result.stderr || result.stdout || '').trim();
+    const outputLower = output.toLowerCase();
+    const exitCode = result.code;
+
+    // Magento\Deploy\Console\Command\App\ConfigStatusCommand:
+    // - 0 => "Config files are up to date."
+    // - 2 => "Config files have changed. Run app:config:import ..."
+    const UP_TO_DATE = 'config files are up to date.';
+    const IMPORT_REQUIRED = 'config files have changed.';
+    const IMPORT_HINT = 'run app:config:import or setup:upgrade command to synchronize configuration.';
+
+    if (exitCode === 0 || outputLower.includes(UP_TO_DATE)) {
+      return { needed: false, exitCode, output, containerId: currentId };
+    }
+
+    if (
+      exitCode === 2
+      || outputLower.includes(IMPORT_REQUIRED)
+      || outputLower.includes(IMPORT_HINT)
+    ) {
+      return { needed: true, exitCode, output, containerId: currentId };
+    }
+
+    if (!output || output.includes('No such container') || output.includes('is not running')) {
+      log(`app:config:status retry ${attempt}: ${output || `exit ${exitCode}`}`);
+      currentId = await waitForContainer(stackName, 'php-fpm-admin', 60 * 1000);
+      await delay(2000);
+      continue;
+    }
+
+    log(`app:config:status failed exit=${exitCode}: ${output}`);
+    throw new Error(`app:config:status failed (exit ${exitCode}): ${output}`);
+  }
+  return { needed: true, exitCode: 2, output: 'app:config:status retries exhausted', containerId: currentId };
+}
+
+async function runAppConfigImport(
+  containerId: string,
+  stackName: string,
+  log: (message: string) => void,
+) {
+  let currentId = containerId;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    currentId = await ensureMagentoEnvWrapperWithRetry(currentId, stackName, log);
+    const result = await runMagentoCommandWithStatus(
+      currentId,
+      stackName,
+      'php bin/magento app:config:import --no-interaction'
+    );
+    if (result.code === 0) {
+      log('app:config:import ok');
+      return currentId;
+    }
+
+    const output = (result.stderr || result.stdout || '').trim();
+    const outputLower = output.toLowerCase();
+    if (
+      !output
+      || output.includes('No such container')
+      || output.includes('is not running')
+      || outputLower.includes('connection refused')
+      || outputLower.includes('connection to redis')
+      || outputLower.includes('sqlstate[hy000] [2002]')
+    ) {
+      log(`app:config:import retry ${attempt}: ${output || `exit ${result.code}`}`);
+      currentId = await waitForContainer(stackName, 'php-fpm-admin', 60 * 1000);
+      await waitForRedisCache(currentId, stackName, 5 * 60 * 1000);
+      await delay(2000);
+      continue;
+    }
+
+    throw new Error(`app:config:import failed (exit ${result.code}): ${output}`);
+  }
+
+  throw new Error('app:config:import failed after retries');
 }
 
 async function flushMagentoCache(
@@ -3908,12 +4042,29 @@ async function processDeployment(recordPath: string) {
     SMTP_AUTH_PASSWORD: mailCatcherEnabled ? '' : (process.env.SMTP_AUTH_PASSWORD || ''),
     SMTP_FROM_ADDRESS: process.env.SMTP_FROM_ADDRESS || (envHostnameOnly ? `no-reply@${envHostnameOnly}` : ''),
     SMTP_FROM_HOSTNAME: process.env.SMTP_FROM_HOSTNAME || envHostnameOnly,
-    // APM / Monitoring
-    MZ_APM_ENABLED: '1',
-    MZ_APM_SERVER_URL: `http://mz-monitoring_apm-server:8200`,
+    // APM + Magento observability module config (rendered into app/etc/config.php).
+    MZ_APM_ENABLED: process.env.MZ_APM_ENABLED || '1',
+    MZ_APM_SERVER_URL: process.env.MZ_APM_SERVER_URL || `http://mz-monitoring_apm-server:8200`,
     MZ_APM_SAMPLE_RATE: process.env.MZ_APM_SAMPLE_RATE || '1.0',
     MZ_APM_SERVICE_NAME: `mz-env-${environmentId}`,
     MZ_APM_ENVIRONMENT: envTypeRaw || 'production',
+    MZ_APM_SECRET_TOKEN: process.env.MZ_APM_SECRET_TOKEN || '',
+    MZ_APM_SECRET_TOKEN_FILE: process.env.MZ_APM_SECRET_TOKEN_FILE || '',
+    MZ_APM_DB_PROFILER_ENABLED: process.env.MZ_APM_DB_PROFILER_ENABLED || '1',
+    MZ_APM_STACK_TRACE_LIMIT: process.env.MZ_APM_STACK_TRACE_LIMIT || '1000',
+    MZ_APM_TIMEOUT: process.env.MZ_APM_TIMEOUT || '10',
+    MZ_LOG_STREAM_ENABLED: process.env.MZ_LOG_STREAM_ENABLED || '1',
+    MZ_LOG_STREAM_MIN_LEVEL: process.env.MZ_LOG_STREAM_MIN_LEVEL || 'warning',
+    MZ_LOG_STREAM_TRANSPORT: process.env.MZ_LOG_STREAM_TRANSPORT || 'stderr',
+    MZ_LOG_STREAM_DIRECT_URL: process.env.MZ_LOG_STREAM_DIRECT_URL || '',
+    MZ_LOG_STREAM_DIRECT_INDEX: process.env.MZ_LOG_STREAM_DIRECT_INDEX || 'mz-logs-magento',
+    MZ_LOG_STREAM_DIRECT_API_KEY: process.env.MZ_LOG_STREAM_DIRECT_API_KEY || '',
+    MZ_LOG_STREAM_DIRECT_API_KEY_FILE: process.env.MZ_LOG_STREAM_DIRECT_API_KEY_FILE || '',
+    MZ_LOG_STREAM_DIRECT_USERNAME: process.env.MZ_LOG_STREAM_DIRECT_USERNAME || '',
+    MZ_LOG_STREAM_DIRECT_PASSWORD: process.env.MZ_LOG_STREAM_DIRECT_PASSWORD || '',
+    MZ_LOG_STREAM_DIRECT_PASSWORD_FILE: process.env.MZ_LOG_STREAM_DIRECT_PASSWORD_FILE || '',
+    MZ_LOG_STREAM_DIRECT_TIMEOUT_MS: process.env.MZ_LOG_STREAM_DIRECT_TIMEOUT_MS || '500',
+    MZ_LOG_STREAM_DIRECT_VERIFY_TLS: process.env.MZ_LOG_STREAM_DIRECT_VERIFY_TLS || '1',
   };
   assertRequiredEnv(envVars, [
     'MAGE_VERSION',
@@ -4331,6 +4482,46 @@ async function processDeployment(recordPath: string) {
       }
       progress.detail('magento_steps', 'setup:upgrade complete; flushing cache');
       adminContainerId = await flushMagentoCache(adminContainerId, stackName, log);
+    }
+
+    progress.detail('magento_steps', 'Checking app:config:status');
+    const appConfigStatus = await runAppConfigStatus(adminContainerId, stackName, log);
+    adminContainerId = appConfigStatus.containerId;
+    recordMeta.magento_app_config_status = {
+      exit_code: appConfigStatus.exitCode,
+      needed: appConfigStatus.needed,
+      output: appConfigStatus.output || null,
+      checked_at: new Date().toISOString(),
+    };
+    writeJsonFileBestEffort(recordPath, recordMeta);
+
+    if (appConfigStatus.needed) {
+      log('app:config:import required; running import');
+      progress.detail('magento_steps', 'Running app:config:import');
+      adminContainerId = await runAppConfigImport(adminContainerId, stackName, log);
+      progress.detail('magento_steps', 'Verifying app:config:status after import');
+      const postImportStatus = await runAppConfigStatus(adminContainerId, stackName, log);
+      adminContainerId = postImportStatus.containerId;
+      recordMeta.magento_app_config_import = {
+        ran: true,
+        verified_needed: postImportStatus.needed,
+        verify_exit_code: postImportStatus.exitCode,
+        verify_output: postImportStatus.output || null,
+        executed_at: new Date().toISOString(),
+      };
+      writeJsonFileBestEffort(recordPath, recordMeta);
+      if (postImportStatus.needed) {
+        throw new Error(`app:config:import did not synchronize configuration: ${postImportStatus.output}`);
+      }
+      adminContainerId = await flushMagentoCache(adminContainerId, stackName, log);
+    } else {
+      log('app:config:status up to date; import not required');
+      recordMeta.magento_app_config_import = {
+        ran: false,
+        reason: 'up_to_date',
+        checked_at: new Date().toISOString(),
+      };
+      writeJsonFileBestEffort(recordPath, recordMeta);
     }
   } finally {
     dbContainerId = await setSearchEngine(stackName, dbContainerId, envVars.MYSQL_DATABASE || 'magento', searchEngine);

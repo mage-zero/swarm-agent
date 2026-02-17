@@ -16,6 +16,7 @@ import { handleMeshJoinRequest } from './mesh.js';
 import { handleDeployLogsBundle } from './deploy-logs.js';
 import { executeRunbook, handleServiceRestart, listRunbooks } from './support-runbooks.js';
 import { cleanupOrphanedRunbookJobs } from './swarm.js';
+import { handleMonitoringDashboardsBootstrap } from './monitoring-dashboards.js';
 import { Readable } from 'stream';
 
 export const createApp = () => {
@@ -93,6 +94,12 @@ export const createApp = () => {
       return c.json({ error: result.error }, (result.status || 500) as ContentfulStatusCode);
     }
     return c.json(result);
+  });
+
+  app.post('/v1/monitoring/dashboards/bootstrap', async (c) => {
+    const request = c.req.raw ?? (c.req as unknown as Request);
+    const result = await handleMonitoringDashboardsBootstrap(request);
+    return c.json(result.body, result.status as ContentfulStatusCode);
   });
 
   app.post('/v1/support/cleanup-jobs', async (c) => {

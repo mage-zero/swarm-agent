@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { runCommand } from './exec.js';
 import { buildNodeHeaders } from './node-hmac.js';
+import { bootstrapMonitoringDashboards } from './monitoring-dashboards.js';
 
 export type MigrationContext = {
   environmentId?: number;
@@ -312,4 +313,11 @@ registerMigration('setup-dashboards-dns', async (ctx) => {
 
   const result = await response.json() as { dashboards_hostname?: string };
   console.log(`upgrade.migration.dashboards_dns: hostname=${result.dashboards_hostname ?? 'unknown'}`);
+});
+
+registerMigration('bootstrap-monitoring-dashboards', async () => {
+  const result = await bootstrapMonitoringDashboards();
+  console.log(
+    `upgrade.migration.bootstrap_monitoring_dashboards: dashboards=${result.dashboard_ids.join(',')} objects=${result.upserted_objects}`
+  );
 });
