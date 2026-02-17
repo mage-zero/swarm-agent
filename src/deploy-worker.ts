@@ -3468,72 +3468,6 @@ async function toggleMagentoMaintenanceFlagOnService(params: {
   return { ok, details };
 }
 
-async function ensureMagentoWritePathsOnService(params: {
-  environmentId: number;
-  serviceName: 'php-fpm' | 'php-fpm-admin';
-  log: (message: string) => void;
-}): Promise<{ ok: boolean; details: string[] }> {
-  const serviceFullName = envServiceName(params.environmentId, params.serviceName);
-  const spec = await inspectServiceSpec(serviceFullName);
-  if (!spec) {
-    return { ok: false, details: [`missing service: ${serviceFullName}`] };
-  }
-
-  const tasks = await listServiceTasks(serviceFullName);
-  const desiredRunning = tasks.filter((task) => String(task.desired_state || '').toLowerCase() === 'running' && task.node);
-  const nodes = Array.from(new Set((desiredRunning.length ? desiredRunning : tasks).map((task) => task.node).filter(Boolean)));
-  if (!nodes.length) {
-    return { ok: false, details: [`no tasks/nodes found for service: ${serviceFullName}`] };
-  }
-
-  const networks = Array.from(new Set(spec.networks.map((network) => network.name).filter(Boolean)));
-  if (!networks.length) networks.push('mz-backend');
-  const secrets = spec.secrets.map((secret) => ({ source: secret.secret_name, target: secret.file_name }));
-  const mounts = spec.mounts.map((mount) => ({
-    type: mount.type,
-    source: mount.source,
-    target: mount.target,
-    read_only: mount.read_only,
-  }));
-  const writePaths = [
-    '/var/www/html/magento/var/log',
-    '/var/www/html/magento/var/report',
-    '/var/www/html/magento/var/session',
-    '/var/www/html/magento/var/cache',
-    '/var/www/html/magento/var/page_cache',
-    '/var/www/html/magento/var/tmp',
-    '/var/www/html/magento/var/export',
-    '/var/www/html/magento/var/import',
-    '/var/www/html/magento/pub/media',
-  ];
-  const script = `set -eu; mkdir -p ${writePaths.join(' ')}; chmod -R 0777 ${writePaths.join(' ')}`;
-
-  let ok = true;
-  const details: string[] = [];
-  for (const node of nodes) {
-    const jobName = buildJobName(`deploy-writepath-${params.serviceName}`, params.environmentId);
-    const job = await runSwarmJob({
-      name: jobName,
-      image: spec.image,
-      networks,
-      secrets,
-      mounts,
-      env: spec.env,
-      constraints: [`node.hostname==${node}`],
-      command: ['sh', '-lc', script],
-      timeout_ms: 90_000,
-    });
-    params.log(`write-path ${serviceFullName} on ${node}: ${job.ok ? 'ok' : job.state}`);
-    if (!job.ok) {
-      ok = false;
-      const jobOutput = (job.logs || job.error || '').trim();
-      details.push(`${serviceFullName} on ${node}: ${job.state}${jobOutput ? ` (${jobOutput})` : ''}`);
-    }
-  }
-
-  return { ok, details };
-}
-
 async function setMagentoMaintenanceMode(
   containerId: string,
   stackName: string,
@@ -4276,23 +4210,56 @@ async function processDeployment(recordPath: string) {
 
   progress.detail('app_prepare', 'Waiting for PHP containers');
   let adminContainerId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
-  const adminWritePathSetup = await ensureMagentoWritePathsOnService({
-    environmentId,
-    serviceName: 'php-fpm-admin',
-    log,
-  });
-  if (!adminWritePathSetup.ok) {
-    const detail = adminWritePathSetup.details.join(' | ');
-    log(`php-fpm-admin write path setup had issues${detail ? `: ${detail}` : ''}`);
+  const webContainerId = await findLocalContainer(stackName, 'php-fpm');
+  const writePathCommand = 'mkdir -p /var/www/html/magento/var/log /var/www/html/magento/var/report /var/www/html/magento/var/session /var/www/html/magento/var/cache /var/www/html/magento/var/page_cache /var/www/html/magento/var/tmp /var/www/html/magento/var/export /var/www/html/magento/var/import /var/www/html/magento/pub/media && chmod -R 0777 /var/www/html/magento/var/log /var/www/html/magento/var/report /var/www/html/magento/var/session /var/www/html/magento/var/cache /var/www/html/magento/var/page_cache /var/www/html/magento/var/tmp /var/www/html/magento/var/export /var/www/html/magento/var/import /var/www/html/magento/pub/media';
+  try {
+    await runCommand('docker', [
+      'exec',
+      '--user',
+      'root',
+      adminContainerId,
+      'sh',
+      '-c',
+      writePathCommand,
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log(`php-fpm-admin write path setup failed: ${message}`);
+    try {
+      const refreshedAdminId = await waitForContainer(stackName, 'php-fpm-admin', 60 * 1000);
+      if (refreshedAdminId && refreshedAdminId !== adminContainerId) {
+        adminContainerId = refreshedAdminId;
+        await runCommand('docker', [
+          'exec',
+          '--user',
+          'root',
+          adminContainerId,
+          'sh',
+          '-c',
+          writePathCommand,
+        ]);
+        log('php-fpm-admin write path setup retry succeeded');
+      }
+    } catch (retryError) {
+      const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
+      log(`php-fpm-admin write path setup retry skipped: ${retryMessage}`);
+    }
   }
-  const webWritePathSetup = await ensureMagentoWritePathsOnService({
-    environmentId,
-    serviceName: 'php-fpm',
-    log,
-  });
-  if (!webWritePathSetup.ok) {
-    const detail = webWritePathSetup.details.join(' | ');
-    log(`php-fpm write path setup had issues${detail ? `: ${detail}` : ''}`);
+  if (!webContainerId) {
+    log('php-fpm container not on manager; skipping write path setup');
+  } else {
+    await runCommand('docker', [
+      'exec',
+      '--user',
+      'root',
+      webContainerId,
+      'sh',
+      '-c',
+      writePathCommand,
+    ]).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`php-fpm write path setup skipped: ${message}`);
+    });
   }
   let upgradeWarning = false;
   progress.detail('app_prepare', 'Configuring search engine');
