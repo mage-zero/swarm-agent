@@ -900,6 +900,17 @@ function compareTaskRecency(candidate: any, current: any): number {
   return candidateRecency.taskId.localeCompare(currentRecency.taskId);
 }
 
+function desiredStateRank(task: any): number {
+  const desired = String(task?.DesiredState || '').toLowerCase();
+  if (desired === 'running') {
+    return 2;
+  }
+  if (desired === 'ready') {
+    return 1;
+  }
+  return 0;
+}
+
 function taskGroupingKey(task: any): string {
   const slotRaw = task?.Slot;
   const slot = typeof slotRaw === 'number'
@@ -932,6 +943,15 @@ function selectLatestServiceTasks(tasks: any[], serviceId: string): any[] {
     const current = latestByKey.get(key);
     if (!current) {
       latestByKey.set(key, task);
+      continue;
+    }
+    const candidateRank = desiredStateRank(task);
+    const currentRank = desiredStateRank(current);
+    if (candidateRank > currentRank) {
+      latestByKey.set(key, task);
+      continue;
+    }
+    if (candidateRank < currentRank) {
       continue;
     }
     if (compareTaskRecency(task, current) > 0) {

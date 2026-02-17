@@ -95,6 +95,31 @@ describe('service status helpers', () => {
     expect(selected[0]?.ID).toBe('a-running-newer-id');
   });
 
+  it('prefers desired running task over newer desired shutdown task in start-first updates', () => {
+    const tasks = [
+      {
+        ID: 'old-task-shutdown-newer',
+        ServiceID: 'svc-3',
+        DesiredState: 'shutdown',
+        Slot: 1,
+        Version: { Index: 200 },
+        Status: { State: 'shutdown', Timestamp: '2026-02-17T01:08:29.291Z' },
+      },
+      {
+        ID: 'new-task-running-current',
+        ServiceID: 'svc-3',
+        DesiredState: 'running',
+        Slot: 1,
+        Version: { Index: 199 },
+        Status: { State: 'running', Timestamp: '2026-02-17T01:08:25.706Z' },
+      },
+    ];
+
+    const selected = __testing.selectLatestServiceTasks(tasks, 'svc-3');
+    expect(selected).toHaveLength(1);
+    expect(selected[0]?.ID).toBe('new-task-running-current');
+  });
+
   it('counts eligible nodes for global services using placement constraints', () => {
     const service = {
       Spec: {

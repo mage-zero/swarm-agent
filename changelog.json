@@ -120,6 +120,16 @@
         "mz-control": ">=1.0.7"
       },
       "changes": []
+    },
+    {
+      "version": "0.4.6",
+      "date": "2026-02-17",
+      "summary": "Fix service-health regression by preferring desired-running tasks over newer shutdown tasks",
+      "requires": {
+        "cloud-swarm": ">=1.0.2",
+        "mz-control": ">=1.0.7"
+      },
+      "changes": []
     }
   ]
 }
