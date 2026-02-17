@@ -90,6 +90,16 @@
         "mz-control": ">=1.0.1"
       },
       "changes": []
+    },
+    {
+      "version": "0.4.3",
+      "date": "2026-02-16",
+      "summary": "Fix monitoring pull-through registry host resolution for multi-node upgrades",
+      "requires": {
+        "cloud-swarm": ">=1.0.2",
+        "mz-control": ">=1.0.7"
+      },
+      "changes": []
     }
   ]
 }

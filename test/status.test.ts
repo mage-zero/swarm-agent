@@ -70,6 +70,31 @@ describe('service status helpers', () => {
     expect(selected.map((task) => task.ID).sort()).toEqual(['new-slot-1', 'slot-2']);
   });
 
+  it('prefers newest status timestamp when task version index is tied', () => {
+    const tasks = [
+      {
+        ID: 'z-failed-older-id',
+        ServiceID: 'svc-2',
+        DesiredState: 'running',
+        NodeID: 'node-a',
+        Version: { Index: 141224 },
+        Status: { State: 'failed', Timestamp: '2026-02-05T23:38:32.287Z' },
+      },
+      {
+        ID: 'a-running-newer-id',
+        ServiceID: 'svc-2',
+        DesiredState: 'running',
+        NodeID: 'node-a',
+        Version: { Index: 141224 },
+        Status: { State: 'running', Timestamp: '2026-02-16T09:24:45.262Z' },
+      },
+    ];
+
+    const selected = __testing.selectLatestServiceTasks(tasks, 'svc-2');
+    expect(selected).toHaveLength(1);
+    expect(selected[0]?.ID).toBe('a-running-newer-id');
+  });
+
   it('counts eligible nodes for global services using placement constraints', () => {
     const service = {
       Spec: {

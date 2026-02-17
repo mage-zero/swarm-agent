@@ -853,14 +853,51 @@ function parseEnvironmentServiceName(name: string) {
   };
 }
 
-function parseTaskRecency(task: any): number {
-  const versionIndex = Number(task?.Version?.Index || 0);
-  if (Number.isFinite(versionIndex) && versionIndex > 0) {
-    return versionIndex;
+function parseTimestamp(value: unknown): number {
+  const text = String(value || '').trim();
+  if (!text) {
+    return 0;
   }
-  const timestamp = String(task?.Status?.Timestamp || task?.UpdatedAt || task?.CreatedAt || '').trim();
-  const parsed = timestamp ? Date.parse(timestamp) : 0;
+  const parsed = Date.parse(text);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+type TaskRecency = {
+  versionIndex: number;
+  statusTimestamp: number;
+  updatedAt: number;
+  createdAt: number;
+  taskId: string;
+};
+
+function parseTaskRecency(task: any): TaskRecency {
+  const versionIndex = Number(task?.Version?.Index || 0);
+  return {
+    versionIndex: Number.isFinite(versionIndex) && versionIndex > 0 ? versionIndex : 0,
+    statusTimestamp: parseTimestamp(task?.Status?.Timestamp),
+    updatedAt: parseTimestamp(task?.UpdatedAt),
+    createdAt: parseTimestamp(task?.CreatedAt),
+    taskId: String(task?.ID || ''),
+  };
+}
+
+function compareTaskRecency(candidate: any, current: any): number {
+  const candidateRecency = parseTaskRecency(candidate);
+  const currentRecency = parseTaskRecency(current);
+
+  if (candidateRecency.versionIndex !== currentRecency.versionIndex) {
+    return candidateRecency.versionIndex - currentRecency.versionIndex;
+  }
+  if (candidateRecency.statusTimestamp !== currentRecency.statusTimestamp) {
+    return candidateRecency.statusTimestamp - currentRecency.statusTimestamp;
+  }
+  if (candidateRecency.updatedAt !== currentRecency.updatedAt) {
+    return candidateRecency.updatedAt - currentRecency.updatedAt;
+  }
+  if (candidateRecency.createdAt !== currentRecency.createdAt) {
+    return candidateRecency.createdAt - currentRecency.createdAt;
+  }
+  return candidateRecency.taskId.localeCompare(currentRecency.taskId);
 }
 
 function taskGroupingKey(task: any): string {
@@ -897,18 +934,8 @@ function selectLatestServiceTasks(tasks: any[], serviceId: string): any[] {
       latestByKey.set(key, task);
       continue;
     }
-    const candidateRecency = parseTaskRecency(task);
-    const currentRecency = parseTaskRecency(current);
-    if (candidateRecency > currentRecency) {
+    if (compareTaskRecency(task, current) > 0) {
       latestByKey.set(key, task);
-      continue;
-    }
-    if (candidateRecency === currentRecency) {
-      const candidateId = String(task?.ID || '');
-      const currentId = String(current?.ID || '');
-      if (candidateId > currentId) {
-        latestByKey.set(key, task);
-      }
     }
   }
   return Array.from(latestByKey.values());

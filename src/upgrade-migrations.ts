@@ -26,6 +26,48 @@ const DEFAULT_MONITORING_ENV: Record<string, string> = {
   MZ_MONITORING_OPENSEARCH_RESERVE_MEMORY: '512M',
 };
 
+function isLoopbackHost(host: string): boolean {
+  const value = String(host || '').trim().toLowerCase();
+  return value === '127.0.0.1' || value === 'localhost' || value === '::1';
+}
+
+async function swarmHasMultipleNodes(): Promise<boolean> {
+  const result = await runCommand('docker', ['node', 'ls', '--format', '{{.ID}}'], 12_000);
+  if (result.code !== 0) {
+    return false;
+  }
+  const nodes = (result.stdout || '').split('\n').map((line) => line.trim()).filter(Boolean);
+  return nodes.length > 1;
+}
+
+async function detectWireGuardIpV4(): Promise<string | null> {
+  const result = await runCommand('ip', ['-4', 'addr', 'show', 'dev', 'wg0'], 12_000);
+  if (result.code !== 0) {
+    return null;
+  }
+  const match = (result.stdout || '').match(/\binet\s+(\d+\.\d+\.\d+\.\d+)\//);
+  return match?.[1] || null;
+}
+
+async function resolveRegistryPullHost(candidate: string): Promise<string> {
+  const trimmed = String(candidate || '').trim();
+  if (!trimmed) {
+    return '127.0.0.1';
+  }
+  if (!isLoopbackHost(trimmed)) {
+    return trimmed;
+  }
+  if (!(await swarmHasMultipleNodes())) {
+    return trimmed;
+  }
+  const wgIp = await detectWireGuardIpV4();
+  if (wgIp) {
+    console.log(`upgrade.migration.registry_pull_host: using WireGuard IP ${wgIp}`);
+    return wgIp;
+  }
+  return trimmed;
+}
+
 /**
  * Registry of migration functions keyed by change ID.
  * Each release's changelog.json references change IDs that map to functions here.
@@ -51,7 +93,7 @@ function readEnvFile(filePath: string): Record<string, string> {
   return output;
 }
 
-function buildMonitoringEnv(cloudSwarmDir: string): NodeJS.ProcessEnv {
+async function buildMonitoringEnv(cloudSwarmDir: string): Promise<NodeJS.ProcessEnv> {
   const fromFile = readEnvFile(path.join(cloudSwarmDir, 'config', 'versions.env'));
   const env: NodeJS.ProcessEnv = {
     ...process.env,
@@ -62,6 +104,16 @@ function buildMonitoringEnv(cloudSwarmDir: string): NodeJS.ProcessEnv {
       env[key] = value;
     }
   }
+  const registryPullHostCandidate = String(env.REGISTRY_PULL_HOST || env.REGISTRY_HOST || '127.0.0.1').trim() || '127.0.0.1';
+  const registryPullHost = await resolveRegistryPullHost(registryPullHostCandidate);
+  const registryPort = String(env.REGISTRY_PORT || '5000').trim() || '5000';
+
+  env.REGISTRY_PULL_HOST = registryPullHost;
+  env.REGISTRY_HOST = registryPullHost;
+  env.REGISTRY_PORT = registryPort;
+  env.REGISTRY_PUSH_HOST = String(env.REGISTRY_PUSH_HOST || '127.0.0.1').trim() || '127.0.0.1';
+  env.REGISTRY_CACHE_HOST = String(env.REGISTRY_CACHE_HOST || env.REGISTRY_PUSH_HOST).trim() || env.REGISTRY_PUSH_HOST;
+  env.REGISTRY_CACHE_PORT = String(env.REGISTRY_CACHE_PORT || registryPort).trim() || registryPort;
   return env;
 }
 
@@ -185,7 +237,7 @@ registerMigration('build-monitoring-images', async (ctx) => {
   if (!fs.existsSync(scriptPath)) {
     throw new Error(`build-monitoring.sh not found at ${scriptPath}`);
   }
-  const env = buildMonitoringEnv(ctx.cloudSwarmDir);
+  const env = await buildMonitoringEnv(ctx.cloudSwarmDir);
   const result = await runCommand('bash', [scriptPath], 600_000, {
     cwd: ctx.cloudSwarmDir,
     env,
@@ -205,7 +257,7 @@ registerMigration('deploy-monitoring-stack', async (ctx) => {
     throw new Error(`Monitoring stack files not found in ${stacksDir}`);
   }
 
-  const env = buildMonitoringEnv(ctx.cloudSwarmDir);
+  const env = await buildMonitoringEnv(ctx.cloudSwarmDir);
 
   const net = await runCommand('docker', [
     'network', 'create', '--driver', 'overlay', '--attachable', 'mz-monitoring',
