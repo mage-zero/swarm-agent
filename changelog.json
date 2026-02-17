@@ -100,6 +100,16 @@
         "mz-control": ">=1.0.7"
       },
       "changes": []
+    },
+    {
+      "version": "0.4.4",
+      "date": "2026-02-17",
+      "summary": "Fix cross-node deploy prep by running replica and write-path setup through Swarm jobs",
+      "requires": {
+        "cloud-swarm": ">=1.0.2",
+        "mz-control": ">=1.0.7"
+      },
+      "changes": []
     }
   ]
 }
