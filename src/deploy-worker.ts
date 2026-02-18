@@ -1440,6 +1440,35 @@ async function runCommandLoggedWithRetry(
   }
 }
 
+function readCommandLogTail(logDir: string, label: string, stream: 'stdout' | 'stderr', maxBytes = 128 * 1024): string {
+  const safeLabel = label.replace(/[^a-z0-9._-]/gi, '_');
+  const filePath = path.join(logDir, `${safeLabel}.${stream}.log`);
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    if (!raw) return '';
+    return raw.length > maxBytes ? raw.slice(raw.length - maxBytes) : raw;
+  } catch {
+    return '';
+  }
+}
+
+function detectMissingRegistryManifest(logDir: string, label: string): { matched: boolean; imageRef: string } {
+  const stderrTail = readCommandLogTail(logDir, label, 'stderr');
+  if (!stderrTail) {
+    return { matched: false, imageRef: '' };
+  }
+  const hasManifestNotFound = /manifests\/sha256:[0-9a-f]{64}\s+not found/i.test(stderrTail);
+  const hasResolveMetadataFailure = /failed to resolve source metadata for\s+.+?:\s+failed to copy/i.test(stderrTail);
+  if (!hasManifestNotFound || !hasResolveMetadataFailure) {
+    return { matched: false, imageRef: '' };
+  }
+  const imageMatch = stderrTail.match(/failed to resolve source metadata for\s+(.+?)(?::\s+failed to copy)/i);
+  return {
+    matched: true,
+    imageRef: imageMatch?.[1]?.trim() || '',
+  };
+}
+
 async function runCommandCapture(command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) {
   enforceCommandPolicy(command, args, { source: 'deploy-worker.runCommandCapture' });
   return await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
@@ -4529,6 +4558,7 @@ async function processDeployment(recordPath: string) {
     log(`magento images already present in registry for ${mageVersion}; skipping build-magento`);
   } else {
     progress.detail('build_images', 'Building Magento application image');
+    let rebuiltServiceImagesForManifestRecovery = false;
     await runCommandLoggedWithRetry(
       'bash',
       [path.join(CLOUD_SWARM_DIR, 'scripts/build-magento.sh'), artifactPath],
@@ -4539,6 +4569,30 @@ async function processDeployment(recordPath: string) {
         onRetry: async () => {
           await maybeAggressivePrune('build-magento-retry');
           await ensureMinimumFreeSpace('build-magento-retry');
+          if (rebuiltServiceImagesForManifestRecovery) {
+            return;
+          }
+          const manifestFailure = detectMissingRegistryManifest(logDir, 'build-magento');
+          if (!manifestFailure.matched) {
+            return;
+          }
+          rebuiltServiceImagesForManifestRecovery = true;
+          const imageHint = manifestFailure.imageRef ? ` (${manifestFailure.imageRef})` : '';
+          log(`build-magento recovery: detected missing registry manifest${imageHint}; rebuilding service images`);
+          await runCommandLoggedWithRetry(
+            'bash',
+            [path.join(CLOUD_SWARM_DIR, 'scripts/build-services.sh')],
+            { cwd: CLOUD_SWARM_DIR, env: envVars, logDir, label: 'build-services-recovery' },
+            {
+              retries: DEPLOY_BUILD_RETRIES,
+              log,
+              onRetry: async () => {
+                await maybeAggressivePrune('build-services-recovery-retry');
+                await ensureMinimumFreeSpace('build-services-recovery-retry');
+              },
+            }
+          );
+          log('build-magento recovery: service image rebuild complete');
         },
       }
     );
