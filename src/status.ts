@@ -188,8 +188,13 @@ const CONFIG_PATH = process.env.STATUS_CONFIG_PATH || '/opt/status/data.json';
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
 const CLOUD_SWARM_DIR = process.env.MZ_CLOUD_SWARM_DIR || '/opt/mage-zero/cloud-swarm';
+const AGENT_DIR = process.env.MZ_AGENT_DIR || '/opt/mage-zero/agent';
+const RELEASES_DIR = `${AGENT_DIR}/releases`;
 const VERSION_PATH = process.env.MZ_SWARM_AGENT_VERSION_PATH
   || '/opt/mage-zero/agent/version';
+const UPGRADE_STATE_PATH = `${AGENT_DIR}/upgrade-state.json`;
+const UPGRADE_APPROVED_PATH = `${AGENT_DIR}/upgrade-approved.json`;
+const UPGRADE_AVAILABLE_PATH = `${AGENT_DIR}/upgrade-available.json`;
 const AI_TUNING_DISABLED = process.env.MZ_AI_TUNING_DISABLED === '1';
 const INSPECTION_HISTORY_PATH = process.env.MZ_INSPECTION_HISTORY_PATH
   || `${NODE_DIR}/inspection-history.json`;
@@ -197,6 +202,22 @@ const INSPECTION_INTERVAL_MS = Number(process.env.MZ_INSPECTION_INTERVAL_MS || 6
 const INSPECTION_RETENTION_MS = Number(process.env.MZ_INSPECTION_RETENTION_MS || 24 * 60 * 60 * 1000);
 const MIB = 1024 * 1024;
 const GIB = 1024 * 1024 * 1024;
+
+type UpgradeStatusPayload = {
+  running_version: string;
+  reported_version?: string;
+  approved_version?: string;
+  approved_scheduled_at?: string;
+  available_target_version?: string;
+  available_detected_at?: string;
+  downloaded_versions: string[];
+  pending_migrations: boolean;
+  last_check_at?: string;
+  last_blocked_reason?: string;
+  last_blocked_at?: string;
+  last_error?: string;
+  last_error_at?: string;
+};
 
 let cachedAgentVersion: string | null = null;
 
@@ -549,6 +570,107 @@ function readCloudInitStatus() {
   } catch {
     return null;
   }
+}
+
+function readJsonFile(pathname: string): Record<string, unknown> | null {
+  try {
+    const raw = fs.readFileSync(pathname, 'utf8').trim();
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeSemver(value: unknown): string {
+  const version = String(value ?? '').trim();
+  return /^\d+\.\d+\.\d+$/.test(version) ? version : '';
+}
+
+function listDownloadedVersions(limit = 8): string[] {
+  try {
+    const entries = fs.readdirSync(RELEASES_DIR, { withFileTypes: true });
+    const versions = entries
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => normalizeSemver(entry.name))
+      .filter((version) => version !== '');
+    versions.sort((a, b) => {
+      const pa = a.split('.').map((part) => Number(part));
+      const pb = b.split('.').map((part) => Number(part));
+      for (let i = 0; i < 3; i += 1) {
+        const diff = (pb[i] || 0) - (pa[i] || 0);
+        if (diff !== 0) {
+          return diff;
+        }
+      }
+      return 0;
+    });
+    return versions.slice(0, Math.max(1, limit));
+  } catch {
+    return [];
+  }
+}
+
+function readUpgradeStatusPayload(): UpgradeStatusPayload {
+  const state = readJsonFile(UPGRADE_STATE_PATH) || {};
+  const approved = readJsonFile(UPGRADE_APPROVED_PATH) || {};
+  const available = readJsonFile(UPGRADE_AVAILABLE_PATH) || {};
+
+  const runningVersion = normalizeSemver(readAgentVersion()) || 'unknown';
+  const reportedVersion = normalizeSemver(state.reported_version);
+  const approvedVersion = normalizeSemver(approved.target);
+  const availableTargetVersion = normalizeSemver(available.target);
+  const downloadedVersions = listDownloadedVersions();
+
+  const payload: UpgradeStatusPayload = {
+    running_version: runningVersion,
+    downloaded_versions: downloadedVersions,
+    pending_migrations: Boolean(state.pending_migrations),
+  };
+
+  if (reportedVersion) {
+    payload.reported_version = reportedVersion;
+  }
+  if (approvedVersion) {
+    payload.approved_version = approvedVersion;
+  }
+  const approvedScheduledAt = String(approved.scheduled_at || '').trim();
+  if (approvedScheduledAt) {
+    payload.approved_scheduled_at = approvedScheduledAt;
+  }
+  if (availableTargetVersion) {
+    payload.available_target_version = availableTargetVersion;
+  }
+  const availableDetectedAt = String(available.detected_at || '').trim();
+  if (availableDetectedAt) {
+    payload.available_detected_at = availableDetectedAt;
+  }
+
+  const lastCheckAt = String(state.last_check_at || '').trim();
+  if (lastCheckAt) {
+    payload.last_check_at = lastCheckAt;
+  }
+  const lastBlockedReason = String(state.last_blocked_reason || '').trim();
+  if (lastBlockedReason) {
+    payload.last_blocked_reason = lastBlockedReason;
+  }
+  const lastBlockedAt = String(state.last_blocked_at || '').trim();
+  if (lastBlockedAt) {
+    payload.last_blocked_at = lastBlockedAt;
+  }
+  const lastError = String(state.last_error || '').trim();
+  if (lastError) {
+    payload.last_error = lastError;
+  }
+  const lastErrorAt = String(state.last_error_at || '').trim();
+  if (lastErrorAt) {
+    payload.last_error_at = lastErrorAt;
+  }
+
+  return payload;
 }
 
 function timingSafeEquals(a: string, b: string): boolean {
@@ -2901,10 +3023,12 @@ export async function pushStatus() {
 
   const cloudInitStatus = readCloudInitStatus();
   const cloudInitPayload = cloudInitStatus ? JSON.stringify(cloudInitStatus) : null;
+  const upgradeStatus = readUpgradeStatusPayload();
   const masterSshPublicKey = readNodeFile('stack_master_ssh.pub');
   const payload: Record<string, unknown> = {
     status: nodeStatus,
     cloud_init_status: cloudInitPayload,
+    upgrade_status: upgradeStatus,
   };
   if (stackStatus) {
     payload.stack_status = stackStatus;

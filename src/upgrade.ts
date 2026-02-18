@@ -53,6 +53,15 @@ type UpgradeState = {
   reported_version?: string;
   last_check_at?: string;
   pending_migrations?: boolean;
+  last_blocked_reason?: string;
+  last_blocked_at?: string;
+  last_error?: string;
+  last_error_at?: string;
+};
+
+type UpgradeApproved = {
+  target?: string;
+  scheduled_at?: string;
 };
 
 // Environment type ordering for sequential upgrade execution
@@ -111,6 +120,35 @@ function writeUpgradeState(state: UpgradeState): void {
 function writeUpgradeApproved(target: string, scheduledAt: string): void {
   const data = { target, scheduled_at: scheduledAt };
   fs.writeFileSync(UPGRADE_APPROVED_PATH, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function readUpgradeApproved(): UpgradeApproved | null {
+  try {
+    const raw = fs.readFileSync(UPGRADE_APPROVED_PATH, 'utf8');
+    return JSON.parse(raw) as UpgradeApproved;
+  } catch {
+    return null;
+  }
+}
+
+function markUpgradeBlocked(state: UpgradeState, reason: string): void {
+  state.last_blocked_reason = reason;
+  state.last_blocked_at = new Date().toISOString();
+}
+
+function clearUpgradeBlocked(state: UpgradeState): void {
+  delete state.last_blocked_reason;
+  delete state.last_blocked_at;
+}
+
+function markUpgradeError(state: UpgradeState, reason: string): void {
+  state.last_error = reason;
+  state.last_error_at = new Date().toISOString();
+}
+
+function clearUpgradeError(state: UpgradeState): void {
+  delete state.last_error;
+  delete state.last_error_at;
 }
 
 async function fetchJson(
@@ -547,6 +585,8 @@ export async function executeUpgradePlan(changelog: ChangelogVersion[]): Promise
   // Clear pending state
   const state = readUpgradeState();
   state.pending_migrations = false;
+  clearUpgradeBlocked(state);
+  clearUpgradeError(state);
   writeUpgradeState(state);
 
   console.log('upgrade.execute: upgrade plan completed');
@@ -639,6 +679,7 @@ function computeUpgradeDowntimeMinutes(
 async function checkUpgrades(): Promise<void> {
   const config = readConfig();
   const state = readUpgradeState();
+  state.last_check_at = new Date().toISOString();
 
   // On startup after updater swaps binary: detect pending migrations
   if (state.pending_migrations) {
@@ -648,10 +689,16 @@ async function checkUpgrades(): Promise<void> {
       const changelog = readCurrentChangelog();
       if (changelog.length > 0) {
         await executeUpgradePlan(changelog);
+      } else {
+        markUpgradeBlocked(state, 'pending_migrations_without_changelog');
+        writeUpgradeState(state);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error('upgrade.execute.failed:', message);
+      markUpgradeError(state, message);
+      markUpgradeBlocked(state, 'upgrade_execution_failed');
+      writeUpgradeState(state);
       await reportUpgradeStatus(config, {
         status: 'failed',
         failure_reason: message,
@@ -689,6 +736,8 @@ async function checkUpgrades(): Promise<void> {
       const { satisfied, missing } = await checkRequires(allRequires, config);
       if (!satisfied) {
         console.warn('upgrade.startup: requirements not satisfied:', missing);
+        markUpgradeBlocked(state, `requirements_unsatisfied: ${missing.join('; ')}`);
+        writeUpgradeState(state);
         return;
       }
 
@@ -704,7 +753,8 @@ async function checkUpgrades(): Promise<void> {
       try {
         const result = await reportUpgradeAvailable(config, upgradeData);
         state.reported_version = currentVersion;
-        state.last_check_at = new Date().toISOString();
+        clearUpgradeBlocked(state);
+        clearUpgradeError(state);
 
         if (result.auto_upgrade || totalDowntime === 0) {
           // Zero downtime or auto-approved — execute immediately
@@ -724,24 +774,40 @@ async function checkUpgrades(): Promise<void> {
           console.log(`upgrade.startup: reported ${currentVersion} as available, waiting for approval`);
         }
       } catch (err) {
-        console.error('upgrade.startup.report.failed:', err instanceof Error ? err.message : err);
+        const message = err instanceof Error ? err.message : String(err);
+        console.error('upgrade.startup.report.failed:', message);
+        markUpgradeError(state, message);
+        markUpgradeBlocked(state, 'startup_report_failed');
+        writeUpgradeState(state);
       }
       return;
     }
 
     // Version changed but no pending changelog entries — just update state
     state.reported_version = currentVersion;
+    clearUpgradeBlocked(state);
+    clearUpgradeError(state);
     writeUpgradeState(state);
   }
 
   // Check for upgrade-available.json (written by updater for future versions)
   const upgrade = readUpgradeAvailable();
   if (!upgrade) {
+    const approved = readUpgradeApproved();
+    if (!approved?.target) {
+      clearUpgradeBlocked(state);
+    }
+    writeUpgradeState(state);
     return;
   }
 
   if (upgrade.current !== currentVersion) {
     // Stale file, updater wrote it for a different version
+    markUpgradeBlocked(
+      state,
+      `stale_upgrade_file: current=${currentVersion || 'unknown'} expected=${upgrade.current || 'unknown'}`,
+    );
+    writeUpgradeState(state);
     return;
   }
 
@@ -757,18 +823,23 @@ async function checkUpgrades(): Promise<void> {
       const { satisfied, missing } = await checkRequires(allRequires, config);
       if (!satisfied) {
         console.warn('upgrade.check: requirements not satisfied:', missing);
+        markUpgradeBlocked(state, `requirements_unsatisfied: ${missing.join('; ')}`);
+        writeUpgradeState(state);
         return;
       }
 
       const result = await reportUpgradeAvailable(config, upgrade);
 
       state.reported_version = upgrade.target;
-      state.last_check_at = new Date().toISOString();
+      clearUpgradeBlocked(state);
+      clearUpgradeError(state);
       writeUpgradeState(state);
 
       if (result.auto_upgrade) {
         // Zero-downtime: mark pending and let updater swap on next tick
         state.pending_migrations = true;
+        clearUpgradeBlocked(state);
+        clearUpgradeError(state);
         writeUpgradeState(state);
         // Write approved file so updater knows to proceed immediately
         writeUpgradeApproved(upgrade.target, new Date().toISOString());
@@ -776,7 +847,11 @@ async function checkUpgrades(): Promise<void> {
         return;
       }
     } catch (err) {
-      console.error('upgrade.report.failed:', err instanceof Error ? err.message : err);
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('upgrade.report.failed:', message);
+      markUpgradeError(state, message);
+      markUpgradeBlocked(state, 'report_available_failed');
+      writeUpgradeState(state);
       return;
     }
   }
@@ -793,19 +868,35 @@ async function checkUpgrades(): Promise<void> {
         const scheduledAtTs = Date.parse(scheduled.scheduled_at);
         if (!Number.isNaN(scheduledAtTs) && scheduledAtTs > Date.now()) {
           console.log(`upgrade.scheduled: waiting until ${scheduled.scheduled_at} for ${upgrade.target}`);
+          markUpgradeBlocked(state, `waiting_for_scheduled_window:${scheduled.scheduled_at}`);
+          writeUpgradeState(state);
           return;
         }
 
         // Write approved file for the updater to pick up
         writeUpgradeApproved(upgrade.target, scheduled.scheduled_at);
         state.pending_migrations = true;
+        clearUpgradeBlocked(state);
+        clearUpgradeError(state);
         writeUpgradeState(state);
         console.log(`upgrade.scheduled: upgrade to ${upgrade.target} at ${scheduled.scheduled_at}`);
+      } else {
+        markUpgradeBlocked(state, `waiting_for_approval:${upgrade.target}`);
+        writeUpgradeState(state);
       }
     } catch (err) {
-      console.error('upgrade.poll.failed:', err instanceof Error ? err.message : err);
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('upgrade.poll.failed:', message);
+      markUpgradeError(state, message);
+      markUpgradeBlocked(state, 'schedule_poll_failed');
+      writeUpgradeState(state);
     }
+    return;
   }
+
+  clearUpgradeBlocked(state);
+  clearUpgradeError(state);
+  writeUpgradeState(state);
 }
 
 /**
