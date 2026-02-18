@@ -1,15 +1,15 @@
 {
-  "version": "0.4.11",
+  "version": "0.4.12",
   "date": "2026-02-18",
-  "summary": "Restore VPS cockpit dashboard layout and preserve sectioned dashboard titles",
+  "summary": "Fix VPS cockpit overflow and harden host trend visualizations",
   "requires": {
     "cloud-swarm": ">=1.0.3",
     "mz-control": ">=1.0.7"
   },
   "changes": [
     {
-      "id": "restore-vps-cockpit-dashboard",
-      "description": "Use the final VPS cockpit layout (vertical servers with semi-circular gauges plus CPU/Memory/Root trends) as the default dashboard bootstrap.",
+      "id": "fix-vps-cockpit-overflow-and-trends",
+      "description": "Reduce cockpit visualization height to avoid unnecessary scrolling, correct host metrics KQL wildcard filtering, and harden CPU/Memory trend timestamp/value transforms so charts render even with sparse buckets.",
       "phase": "pre_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
