@@ -260,16 +260,36 @@ async function reportUpgradeStatus(
   const baseUrl = (config.mz_control_base_url || process.env.MZ_CONTROL_BASE_URL || '').trim();
   const nodeId = readNodeFile('node-id');
   const nodeSecret = readNodeFile('node-secret');
+  const upgradeId = Number(payload.upgrade_id ?? 0);
+  const environmentId = Number(payload.environment_id ?? 0);
 
   if (!baseUrl || !nodeId || !nodeSecret) {
     return;
+  }
+
+  // Magento upgrade status endpoint requires either upgrade_id or environment_id.
+  // Stack-scoped migration progress has neither and should not block execution.
+  if (upgradeId <= 0 && environmentId <= 0) {
+    return;
+  }
+
+  const normalizedPayload: Record<string, unknown> = { ...payload };
+  if (upgradeId > 0) {
+    normalizedPayload.upgrade_id = upgradeId;
+  } else {
+    delete normalizedPayload.upgrade_id;
+  }
+  if (environmentId > 0) {
+    normalizedPayload.environment_id = environmentId;
+  } else {
+    delete normalizedPayload.environment_id;
   }
 
   await fetchJson(
     baseUrl,
     '/v1/agent/upgrade/status',
     'POST',
-    JSON.stringify(payload),
+    JSON.stringify(normalizedPayload),
     nodeId,
     nodeSecret,
   );
