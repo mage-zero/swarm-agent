@@ -577,7 +577,7 @@ function buildSavedObjects(): SavedObject[] {
   ) as Record<string, unknown>;
   (vpsResourceCockpitSpec as { title?: unknown }).title = 'VPS Resource Snapshot (%)';
   if (typeof (vpsResourceCockpitSpec as { height?: unknown }).height === 'number') {
-    (vpsResourceCockpitSpec as { height: number }).height = 360;
+    (vpsResourceCockpitSpec as { height: number }).height = 380;
   }
   const cockpitTransforms = (vpsResourceCockpitSpec as { transform?: Array<Record<string, unknown>> }).transform;
   if (Array.isArray(cockpitTransforms)) {
@@ -587,7 +587,7 @@ function buildSavedObjects(): SavedObject[] {
       } else if (transform.as === 'metric_spacing') {
         transform.calculate = '104';
       } else if (transform.as === 'panel_y1') {
-        transform.calculate = 'datum.cy + 270';
+        transform.calculate = 'datum.cy + 290';
       }
     }
   }
@@ -853,7 +853,7 @@ function buildSavedObjects(): SavedObject[] {
   const operationsDashboardPanels = JSON.stringify([
     {
       panelIndex: '1',
-      gridData: { x: 0, y: 0, w: 48, h: 16, i: '1' },
+      gridData: { x: 0, y: 0, w: 48, h: 15, i: '1' },
       type: 'visualization',
       id: VIS_VPS_RESOURCE_COCKPIT_ID,
       embeddableConfig: {},
@@ -861,7 +861,7 @@ function buildSavedObjects(): SavedObject[] {
     },
     {
       panelIndex: '2',
-      gridData: { x: 0, y: 16, w: 16, h: 14, i: '2' },
+      gridData: { x: 0, y: 15, w: 16, h: 14, i: '2' },
       type: 'visualization',
       id: VIS_VPS_CPU_TREND_ID,
       embeddableConfig: {},
@@ -869,7 +869,7 @@ function buildSavedObjects(): SavedObject[] {
     },
     {
       panelIndex: '3',
-      gridData: { x: 16, y: 16, w: 16, h: 14, i: '3' },
+      gridData: { x: 16, y: 15, w: 16, h: 14, i: '3' },
       type: 'visualization',
       id: VIS_VPS_MEM_TREND_ID,
       embeddableConfig: {},
@@ -877,7 +877,7 @@ function buildSavedObjects(): SavedObject[] {
     },
     {
       panelIndex: '4',
-      gridData: { x: 32, y: 16, w: 16, h: 14, i: '4' },
+      gridData: { x: 32, y: 15, w: 16, h: 14, i: '4' },
       type: 'visualization',
       id: VIS_VPS_ROOT_TREND_ID,
       embeddableConfig: {},
