@@ -1,15 +1,15 @@
 {
-  "version": "0.4.10",
+  "version": "0.4.11",
   "date": "2026-02-18",
-  "summary": "Prevent deploy hangs by timing out setup:db:status and retrying safely",
+  "summary": "Restore VPS cockpit dashboard layout and preserve sectioned dashboard titles",
   "requires": {
     "cloud-swarm": ">=1.0.3",
     "mz-control": ">=1.0.7"
   },
   "changes": [
     {
-      "id": "timeout-setup-db-status",
-      "description": "Run setup:db:status with a bounded timeout and treat timeout/termination outcomes as retryable so deploys do not stall indefinitely.",
+      "id": "restore-vps-cockpit-dashboard",
+      "description": "Use the final VPS cockpit layout (vertical servers with semi-circular gauges plus CPU/Memory/Root trends) as the default dashboard bootstrap.",
       "phase": "pre_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
