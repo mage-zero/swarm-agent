@@ -15,6 +15,11 @@ export type MigrationContext = {
 
 export type MigrationFn = (ctx: MigrationContext) => Promise<void>;
 
+type StackSnapshot = {
+  stack_type: string;
+  dashboards_hostname: string;
+};
+
 const CLOUD_SWARM_REPO = process.env.MZ_CLOUD_SWARM_REPO || 'git@github.com:mage-zero/cloud-swarm.git';
 const CLOUD_SWARM_KEY_PATH = process.env.MZ_CLOUD_SWARM_KEY_PATH || '/opt/mage-zero/keys/cloud-swarm-deploy';
 const DEFAULT_MONITORING_ENV: Record<string, string> = {
@@ -27,6 +32,11 @@ const DEFAULT_MONITORING_ENV: Record<string, string> = {
   MZ_MONITORING_OPENSEARCH_RESERVE_MEMORY: '512M',
 };
 const MONITORING_DASHBOARDS_REQUIRED = (process.env.MZ_MONITORING_DASHBOARDS_REQUIRED || '0') === '1';
+
+function isMonitoringEligibleStackType(stackType: string): boolean {
+  const value = String(stackType || '').trim().toLowerCase();
+  return value === 'production' || value === 'performance';
+}
 
 function isLoopbackHost(host: string): boolean {
   const value = String(host || '').trim().toLowerCase();
@@ -68,6 +78,53 @@ async function resolveRegistryPullHost(candidate: string): Promise<string> {
     return wgIp;
   }
   return trimmed;
+}
+
+async function fetchStackSnapshot(ctx: MigrationContext): Promise<StackSnapshot> {
+  const baseUrl = ctx.mzControlBaseUrl || '';
+  const nodeId = ctx.nodeId || '';
+  const nodeSecret = ctx.nodeSecret || '';
+  const stackId = Number(ctx.stackId || 0);
+
+  if (!baseUrl || !nodeId || !nodeSecret || !stackId) {
+    throw new Error('Missing mz-control connection details for stack snapshot');
+  }
+
+  const url = new URL(`/v1/agent/stack/${stackId}`, baseUrl);
+  const body = '';
+  const headers = buildNodeHeaders('GET', url.pathname, '', body, nodeId, nodeSecret);
+
+  const response = await fetch(url.toString(), {
+    method: 'GET',
+    headers: {
+      'Accept': 'application/json',
+      ...headers,
+    },
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Stack snapshot fetch failed: ${response.status} - ${errorBody}`);
+  }
+
+  const payload = await response.json() as { stack?: Record<string, unknown> };
+  const stack = (payload && typeof payload === 'object' && payload.stack && typeof payload.stack === 'object')
+    ? payload.stack
+    : {};
+
+  return {
+    stack_type: String(stack.stack_type || '').trim(),
+    dashboards_hostname: String(stack.dashboards_hostname || '').trim(),
+  };
+}
+
+async function monitoringStackExists(): Promise<boolean> {
+  const result = await runCommand('docker', ['stack', 'ls', '--format', '{{.Name}}'], 15_000);
+  if (result.code !== 0) {
+    throw new Error(`Unable to list docker stacks: ${result.stderr || result.stdout}`);
+  }
+  const names = (result.stdout || '').split('\n').map((line) => line.trim()).filter(Boolean);
+  return names.includes('mz-monitoring');
 }
 
 /**
@@ -329,4 +386,31 @@ registerMigration('bootstrap-monitoring-dashboards', async () => {
     }
     console.warn(`upgrade.migration.bootstrap_monitoring_dashboards: skipped (${message})`);
   }
+});
+
+registerMigration('recover-monitoring-dashboards', async (ctx) => {
+  const stack = await fetchStackSnapshot(ctx);
+  const stackType = String(stack.stack_type || '').trim();
+  if (!isMonitoringEligibleStackType(stackType)) {
+    console.log(`upgrade.migration.recover_monitoring_dashboards: skipped for stack_type=${stackType || 'unknown'}`);
+    return;
+  }
+
+  const existingHostname = String(stack.dashboards_hostname || '').trim();
+  const hasMonitoringStack = await monitoringStackExists();
+
+  if (!hasMonitoringStack) {
+    console.log('upgrade.migration.recover_monitoring_dashboards: monitoring stack missing; deploying');
+    await executeMigration('build-monitoring-images', ctx);
+    await executeMigration('deploy-monitoring-stack', ctx);
+    await executeMigration('connect-cloudflared-to-monitoring', ctx);
+  }
+
+  if (!existingHostname) {
+    console.log('upgrade.migration.recover_monitoring_dashboards: dashboards hostname missing; configuring dns');
+    await executeMigration('setup-dashboards-dns', ctx);
+  }
+
+  await executeMigration('bootstrap-monitoring-dashboards', ctx);
+  console.log('upgrade.migration.recover_monitoring_dashboards: complete');
 });
