@@ -1,15 +1,15 @@
 {
-  "version": "0.4.13",
+  "version": "0.4.14",
   "date": "2026-02-18",
-  "summary": "Refine VPS resource panel title and compact dashboard layout",
+  "summary": "Rename server-group dashboard and fix VPS panel cropping",
   "requires": {
     "cloud-swarm": ">=1.0.3",
     "mz-control": ">=1.0.7"
   },
   "changes": [
     {
-      "id": "refine-vps-resource-snapshot-layout",
-      "description": "Rename the VPS dial panel to snapshot semantics and tighten top/bottom panel split so the resource gauges take roughly half-height while retaining the 3-column trend row.",
+      "id": "rename-server-group-and-fix-vps-crop",
+      "description": "Rename the first infrastructure dashboard to '1) Server Group' and add one grid row to the top VPS panel to remove vertical clipping while preserving chart rendering.",
       "phase": "pre_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
