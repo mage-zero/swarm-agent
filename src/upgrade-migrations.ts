@@ -170,8 +170,15 @@ async function buildMonitoringEnv(cloudSwarmDir: string): Promise<NodeJS.Process
   env.REGISTRY_PULL_HOST = registryPullHost;
   env.REGISTRY_HOST = registryPullHost;
   env.REGISTRY_PORT = registryPort;
-  env.REGISTRY_PUSH_HOST = String(env.REGISTRY_PUSH_HOST || '127.0.0.1').trim() || '127.0.0.1';
-  env.REGISTRY_CACHE_HOST = String(env.REGISTRY_CACHE_HOST || env.REGISTRY_PUSH_HOST).trim() || env.REGISTRY_PUSH_HOST;
+  const configuredPushHost = String(env.REGISTRY_PUSH_HOST || '127.0.0.1').trim() || '127.0.0.1';
+  env.REGISTRY_PUSH_HOST = isLoopbackHost(configuredPushHost) && !isLoopbackHost(registryPullHost)
+    ? registryPullHost
+    : configuredPushHost;
+
+  const configuredCacheHost = String(env.REGISTRY_CACHE_HOST || env.REGISTRY_PUSH_HOST).trim() || env.REGISTRY_PUSH_HOST;
+  env.REGISTRY_CACHE_HOST = isLoopbackHost(configuredCacheHost) && !isLoopbackHost(registryPullHost)
+    ? registryPullHost
+    : configuredCacheHost;
   env.REGISTRY_CACHE_PORT = String(env.REGISTRY_CACHE_PORT || registryPort).trim() || registryPort;
   return env;
 }

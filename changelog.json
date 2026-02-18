@@ -1,7 +1,7 @@
 {
-  "version": "0.4.22",
+  "version": "0.4.23",
   "date": "2026-02-18",
-  "summary": "Retry monitoring dashboards recovery and ignore stack-level status pings without target ids",
+  "summary": "Retry monitoring dashboards recovery with registry push host fallback and ignore stack-level status pings without target ids",
   "requires": {
     "cloud-swarm": ">=1.0.3",
     "mz-control": ">=1.0.7"
