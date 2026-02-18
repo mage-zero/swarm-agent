@@ -1,0 +1,71 @@
+name: Auto Tag Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-tag-release-main
+  cancel-in-progress: false
+
+jobs:
+  tag-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Resolve versions
+        id: versions
+        run: |
+          set -euo pipefail
+          PACKAGE_VERSION="$(node -p "String(require('./package.json').version || '').trim()")"
+          CHANGELOG_VERSION="$(node -p "String(require('./changelog.json').version || '').trim()")"
+
+          if [ -z "${PACKAGE_VERSION}" ]; then
+            echo "::error::package.json version is missing"
+            exit 1
+          fi
+          if [ "${PACKAGE_VERSION}" != "${CHANGELOG_VERSION}" ]; then
+            echo "::error::package.json version (${PACKAGE_VERSION}) does not match changelog.json version (${CHANGELOG_VERSION:-missing})"
+            exit 1
+          fi
+
+          echo "version=${PACKAGE_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tag=v${PACKAGE_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check whether tag already exists
+        id: tag-check
+        env:
+          TAG: ${{ steps.versions.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+            echo "Tag ${TAG} already exists; skipping."
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+            echo "Tag ${TAG} does not exist yet; creating."
+          fi
+
+      - name: Create and push tag
+        if: steps.tag-check.outputs.exists == 'false'
+        env:
+          TAG: ${{ steps.versions.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "${TAG}"
