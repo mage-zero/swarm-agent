@@ -171,14 +171,17 @@ async function buildMonitoringEnv(cloudSwarmDir: string): Promise<NodeJS.Process
   env.REGISTRY_HOST = registryPullHost;
   env.REGISTRY_PORT = registryPort;
   const configuredPushHost = String(env.REGISTRY_PUSH_HOST || '127.0.0.1').trim() || '127.0.0.1';
-  env.REGISTRY_PUSH_HOST = isLoopbackHost(configuredPushHost) && !isLoopbackHost(registryPullHost)
-    ? registryPullHost
-    : configuredPushHost;
-
-  const configuredCacheHost = String(env.REGISTRY_CACHE_HOST || env.REGISTRY_PUSH_HOST).trim() || env.REGISTRY_PUSH_HOST;
-  env.REGISTRY_CACHE_HOST = isLoopbackHost(configuredCacheHost) && !isLoopbackHost(registryPullHost)
-    ? registryPullHost
-    : configuredCacheHost;
+  const configuredCacheHost = String(env.REGISTRY_CACHE_HOST || configuredPushHost).trim() || configuredPushHost;
+  env.REGISTRY_PUSH_HOST = configuredPushHost;
+  env.REGISTRY_CACHE_HOST = configuredCacheHost;
+  const needsHostNetwork =
+    !isLoopbackHost(registryPullHost)
+    && (isLoopbackHost(configuredPushHost) || isLoopbackHost(configuredCacheHost));
+  if (needsHostNetwork && !String(env.BUILDX_NETWORK || '').trim()) {
+    // Buildx runs in a container. With loopback registry targets, force host
+    // networking so 127.0.0.1 resolves to the host-published registry.
+    env.BUILDX_NETWORK = 'host';
+  }
   env.REGISTRY_CACHE_PORT = String(env.REGISTRY_CACHE_PORT || registryPort).trim() || registryPort;
   return env;
 }

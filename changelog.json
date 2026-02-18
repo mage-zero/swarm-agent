@@ -1,7 +1,7 @@
 {
-  "version": "0.4.24",
+  "version": "0.4.25",
   "date": "2026-02-18",
-  "summary": "Retry monitoring dashboards recovery with registry host fallback, safe stack status handling, and single-flight upgrade checks",
+  "summary": "Retry monitoring recovery with buildx host-network fallback, safe stack status handling, and single-flight upgrade checks",
   "requires": {
     "cloud-swarm": ">=1.0.3",
     "mz-control": ">=1.0.7"
