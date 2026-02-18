@@ -1,22 +1,15 @@
 {
-  "version": "0.4.26",
+  "version": "0.4.27",
   "date": "2026-02-18",
-  "summary": "Refresh monitoring stack host metadata so dashboards continue matching node hostnames, with monitoring recovery retained",
+  "summary": "Rerun monitoring host metadata refresh against latest cloud-swarm templates so host.name aligns to node hostnames for VPS dashboards",
   "requires": {
     "cloud-swarm": ">=1.0.3",
     "mz-control": ">=1.0.7"
   },
   "changes": [
     {
-      "id": "recover-monitoring-dashboards",
-      "description": "Detect eligible server groups missing monitoring dashboards provisioning and automatically deploy monitoring stack, dashboards DNS, and saved objects.",
-      "phase": "pre_migrate",
-      "downtimeMinutes": 0,
-      "scope": "stack"
-    },
-    {
-      "id": "refresh-monitoring-host-metadata",
-      "description": "Rebuild and redeploy monitoring components for production/performance server groups so host metadata follows Swarm node hostnames and VPS dashboards continue resolving hosts.",
+      "id": "refresh-monitoring-host-metadata-v2",
+      "description": "Rebuild and redeploy monitoring components again for production/performance server groups after cloud-swarm monitoring template updates, restoring vmi* host.name fields used by dashboards.",
       "phase": "pre_migrate",
       "downtimeMinutes": 0,
       "scope": "stack"

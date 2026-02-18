@@ -440,3 +440,7 @@ registerMigration('refresh-monitoring-host-metadata', async (ctx) => {
   await executeMigration('bootstrap-monitoring-dashboards', ctx);
   console.log('upgrade.migration.refresh_monitoring_host_metadata: complete');
 });
+
+registerMigration('refresh-monitoring-host-metadata-v2', async (ctx) => {
+  await executeMigration('refresh-monitoring-host-metadata', ctx);
+});
