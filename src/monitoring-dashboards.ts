@@ -620,14 +620,14 @@ function buildSavedObjects(): SavedObject[] {
       if (textField === 'metric_label') {
         mark.align = 'right';
         mark.baseline = 'middle';
-        mark.dx = -8;
-        mark.dy = 12;
+        mark.dx = -14;
+        delete mark.dy;
         layer.mark = mark;
       } else if (textField === 'value_label') {
         mark.align = 'left';
         mark.baseline = 'middle';
-        mark.dx = 8;
-        mark.dy = 12;
+        mark.dx = -8;
+        delete mark.dy;
         layer.mark = mark;
       }
     }
