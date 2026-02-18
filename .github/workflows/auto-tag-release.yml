@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 concurrency:
   group: auto-tag-release-main
@@ -71,16 +70,60 @@ jobs:
           git tag -a "${TAG}" -m "Release ${TAG}"
           git push origin "${TAG}"
 
-      - name: Trigger release workflow when release is missing
+      - name: Check whether release already exists
+        id: release-check
         env:
           TAG: ${{ steps.versions.outputs.tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
             echo "Release ${TAG} already exists; nothing to do."
-            exit 0
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+            echo "Release ${TAG} is missing; building and publishing."
           fi
 
-          echo "Release ${TAG} is missing; dispatching release workflow."
-          gh workflow run release.yml --ref "${TAG}"
+      - name: Install dependencies
+        if: steps.release-check.outputs.exists == 'false'
+        run: npm ci
+
+      - name: Run tests
+        if: steps.release-check.outputs.exists == 'false'
+        run: npm test
+
+      - name: Run coverage
+        if: steps.release-check.outputs.exists == 'false'
+        run: npm run test:coverage
+
+      - name: Typecheck build
+        if: steps.release-check.outputs.exists == 'false'
+        run: npm run build
+
+      - name: Build release bundle
+        if: steps.release-check.outputs.exists == 'false'
+        run: npm run build:bundle
+
+      - name: Generate checksum
+        if: steps.release-check.outputs.exists == 'false'
+        run: |
+          cd dist
+          sha256sum swarm-agent.cjs > swarm-agent.cjs.sha256
+
+      - name: Copy changelog to dist
+        if: steps.release-check.outputs.exists == 'false'
+        run: cp changelog.json dist/changelog.json
+
+      - name: Publish release
+        if: steps.release-check.outputs.exists == 'false'
+        env:
+          TAG: ${{ steps.versions.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${TAG}" \
+            --title "${TAG}" \
+            dist/swarm-agent.cjs \
+            dist/swarm-agent.cjs.sha256 \
+            dist/changelog.json
