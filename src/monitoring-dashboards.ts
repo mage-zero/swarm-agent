@@ -5,6 +5,7 @@ import { buildSignature } from './node-hmac.js';
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DASHBOARDS_CONTAINER_FILTER = 'name=mz-monitoring_opensearch-dashboards';
 const DASHBOARDS_BASE_URL = 'http://127.0.0.1:5601';
+const OPENSEARCH_BASE_URL = 'http://opensearch:9200';
 const DASHBOARDS_READY_TIMEOUT_MS = Number(process.env.MZ_DASHBOARDS_READY_TIMEOUT_MS || 180_000);
 const DASHBOARDS_READY_POLL_MS = Number(process.env.MZ_DASHBOARDS_READY_POLL_MS || 3_000);
 
@@ -179,6 +180,55 @@ async function dashboardsRequest(
     throw new Error(`Dashboards API call failed: ${result.stderr || result.stdout}`.trim());
   }
   return parseDashboardsApiOutput(result.stdout || '');
+}
+
+async function opensearchRequest(
+  containerId: string,
+  method: 'GET' | 'PUT',
+  path: string,
+  body?: Record<string, unknown>,
+): Promise<DashboardsApiResponse> {
+  const args = [
+    'exec',
+    containerId,
+    'curl',
+    '-sS',
+    '--max-time',
+    '20',
+    '-X',
+    method,
+    `${OPENSEARCH_BASE_URL}${path}`,
+    '-H',
+    'content-type: application/json',
+    '-w',
+    '\n%{http_code}',
+  ];
+  if (body) {
+    args.push('-d', JSON.stringify(body));
+  }
+
+  const result = await runCommand('docker', args, 30_000);
+  if (result.code !== 0) {
+    throw new Error(`OpenSearch API call failed: ${result.stderr || result.stdout}`.trim());
+  }
+  return parseDashboardsApiOutput(result.stdout || '');
+}
+
+function isReadOnlyAllowDeleteBlockError(message: string): boolean {
+  const lower = String(message || '').toLowerCase();
+  return (
+    lower.includes('read-only-allow-delete')
+    || (lower.includes('cluster_block_exception') && lower.includes('flood-stage watermark'))
+  );
+}
+
+async function clearReadOnlyAllowDeleteBlocks(containerId: string): Promise<void> {
+  const response = await opensearchRequest(containerId, 'PUT', '/_all/_settings', {
+    'index.blocks.read_only_allow_delete': null,
+  });
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(`Failed to clear OpenSearch read_only_allow_delete block: ${response.status} ${response.body}`);
+  }
 }
 
 function isDashboardsReady(response: DashboardsApiResponse): boolean {
@@ -1135,19 +1185,34 @@ export async function bootstrapMonitoringDashboards(): Promise<BootstrapResult> 
   const containerId = await findDashboardsContainerId();
   await waitForDashboardsReady(containerId);
 
-  for (const deprecatedObject of DEPRECATED_SAVED_OBJECTS) {
-    await deleteSavedObjectIfExists(containerId, deprecatedObject.type, deprecatedObject.id);
-  }
+  const runBootstrap = async () => {
+    for (const deprecatedObject of DEPRECATED_SAVED_OBJECTS) {
+      await deleteSavedObjectIfExists(containerId, deprecatedObject.type, deprecatedObject.id);
+    }
 
-  const objects = buildSavedObjects();
-  for (const object of objects) {
-    await upsertSavedObject(containerId, object);
+    const objects = buildSavedObjects();
+    for (const object of objects) {
+      await upsertSavedObject(containerId, object);
+    }
+    return objects.length;
+  };
+
+  let upsertedObjects = 0;
+  try {
+    upsertedObjects = await runBootstrap();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!isReadOnlyAllowDeleteBlockError(message)) {
+      throw error;
+    }
+    await clearReadOnlyAllowDeleteBlocks(containerId);
+    upsertedObjects = await runBootstrap();
   }
 
   return {
     dashboard_id: DASHBOARD_OPS_ID,
     dashboard_ids: [DASHBOARD_OPS_ID, DASHBOARD_MAGENTO_CONTAINERS_ID],
-    upserted_objects: objects.length,
+    upserted_objects: upsertedObjects,
     container_id: containerId,
   };
 }

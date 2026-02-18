@@ -224,7 +224,7 @@ for version in "${VERSIONS[@]}"; do
   fi
 
   curl -fsSL "${base_url}/changelog.json" -o "${release_dir}/changelog.json" 2>/dev/null \
-    || echo '{"versions":[]}' > "${release_dir}/changelog.json"
+    || echo '{}' > "${release_dir}/changelog.json"
 
   # Verify SHA256
   expected_hash="$(cut -d ' ' -f1 "${release_dir}/swarm-agent.cjs.sha256")"
@@ -253,11 +253,10 @@ import json
 try:
     data = json.load(open('${changelog_path}'))
     total = 0
-    for v in data.get('versions', []):
-        if v.get('version') == '${version}':
-            for c in v.get('changes', []):
-                if c.get('phase') == 'migrate':
-                    total += c.get('downtimeMinutes', 0)
+    if data.get('version') == '${version}':
+        for c in data.get('changes', []):
+            if c.get('phase') == 'migrate':
+                total += c.get('downtimeMinutes', 0)
     print(total)
 except:
     print(0)
@@ -279,10 +278,8 @@ for version in "${VERSIONS[@]}"; do
 import json
 try:
     data = json.load(open('${changelog_path}'))
-    for v in data.get('versions', []):
-        if v.get('version') == '${version}':
-            print(json.dumps(v))
-            break
+    if data.get('version') == '${version}':
+        print(json.dumps(data))
 except:
     pass
 " 2>/dev/null || echo "")

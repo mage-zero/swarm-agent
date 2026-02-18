@@ -8,6 +8,7 @@ import { ensureCloudSwarmRepo, executeMigration } from './upgrade-migrations.js'
 const AGENT_DIR = process.env.MZ_AGENT_DIR || '/opt/mage-zero/agent';
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const CLOUD_SWARM_DIR = process.env.MZ_CLOUD_SWARM_DIR || '/opt/mage-zero/cloud-swarm';
+const RELEASES_DIR = path.join(AGENT_DIR, 'releases');
 const VERSION_PATH = process.env.MZ_SWARM_AGENT_VERSION_PATH || `${AGENT_DIR}/version`;
 const UPGRADE_AVAILABLE_PATH = `${AGENT_DIR}/upgrade-available.json`;
 const UPGRADE_APPROVED_PATH = `${AGENT_DIR}/upgrade-approved.json`;
@@ -315,6 +316,68 @@ function compareSemver(a: string, b: string): number {
     if (va !== vb) return va - vb;
   }
   return 0;
+}
+
+function isStableSemver(version: string): boolean {
+  return /^\d+\.\d+\.\d+$/.test(String(version || '').trim());
+}
+
+function readSingleChangelogFromFile(changelogPath: string): ChangelogVersion | null {
+  try {
+    const raw = fs.readFileSync(changelogPath, 'utf8');
+    const parsed = JSON.parse(raw) as Partial<ChangelogVersion> | null;
+    if (!parsed || typeof parsed !== 'object') {
+      return null;
+    }
+
+    const version = String(parsed.version || '').trim();
+    if (!isStableSemver(version)) {
+      return null;
+    }
+
+    return {
+      version,
+      date: String(parsed.date || '').trim(),
+      summary: String(parsed.summary || '').trim(),
+      requires: (parsed.requires && typeof parsed.requires === 'object') ? parsed.requires : {},
+      changes: Array.isArray(parsed.changes) ? parsed.changes : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+function readReleaseDirectoryChangelog(releasesDir: string = RELEASES_DIR): ChangelogVersion[] {
+  if (!fs.existsSync(releasesDir)) {
+    return [];
+  }
+
+  const collected: ChangelogVersion[] = [];
+  const entries = fs.readdirSync(releasesDir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const version = String(entry.name || '').trim();
+    if (!isStableSemver(version)) {
+      continue;
+    }
+    const changelogPath = path.join(releasesDir, version, 'changelog.json');
+    if (!fs.existsSync(changelogPath)) {
+      continue;
+    }
+    const entryForRelease = readSingleChangelogFromFile(changelogPath);
+    if (entryForRelease?.version === version) {
+      collected.push(entryForRelease);
+    }
+  }
+
+  const latestByVersion = new Map<string, ChangelogVersion>();
+  for (const item of collected) {
+    latestByVersion.set(item.version, item);
+  }
+
+  return Array.from(latestByVersion.values()).sort((a, b) => compareSemver(a.version, b.version));
 }
 
 /**
@@ -756,12 +819,17 @@ function readCurrentChangelog(): ChangelogVersion[] {
     return upgrade.changelog;
   }
 
-  // Try bundled changelog first (alongside the running binary)
+  // Prefer release-path changelogs staged by updater (one file per version).
+  const releasePathChangelog = readReleaseDirectoryChangelog(RELEASES_DIR);
+  if (releasePathChangelog.length > 0) {
+    return releasePathChangelog;
+  }
+
+  // Fallback: bundled changelog alongside the running binary.
   const bundledPath = path.join(AGENT_DIR, 'changelog.json');
   try {
-    const raw = fs.readFileSync(bundledPath, 'utf8');
-    const parsed = JSON.parse(raw) as { versions?: ChangelogVersion[] };
-    return parsed.versions || [];
+    const bundled = readSingleChangelogFromFile(bundledPath);
+    return bundled ? [bundled] : [];
   } catch {
     // ignore
   }
@@ -790,3 +858,9 @@ export function startUpgradeScheduler(): void {
   setTimeout(tick, 5_000);
   upgradeTimer = setInterval(tick, UPGRADE_CHECK_INTERVAL_MS);
 }
+
+export const __testing = {
+  compareSemver,
+  readSingleChangelogFromFile,
+  readReleaseDirectoryChangelog,
+};

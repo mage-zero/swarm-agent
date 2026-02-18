@@ -15,6 +15,71 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify changelog entry for release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ ! -f package.json ]; then
+            echo "::error::package.json is missing"
+            exit 1
+          fi
+          if [ ! -f changelog.json ]; then
+            echo "::error::changelog.json is missing"
+            exit 1
+          fi
+
+          VERSION="${RELEASE_TAG#v}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$RELEASE_TAG" ]; then
+            echo "::error::Release tag must start with 'v' (got: ${RELEASE_TAG})"
+            exit 1
+          fi
+
+          export VERSION
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          release_tag = os.environ.get("RELEASE_TAG", "")
+          version = os.environ.get("VERSION", "")
+          if not version:
+            print(f"::error::Could not parse version from release tag '{release_tag}'")
+            sys.exit(1)
+
+          try:
+            with open("package.json", "r", encoding="utf-8") as f:
+              package_json = json.load(f)
+          except Exception as exc:
+            print(f"::error::Unable to read package.json: {exc}")
+            sys.exit(1)
+
+          package_version = str(package_json.get("version", "")).strip()
+          if package_version != version:
+            print(
+              f"::error::Release tag {release_tag} expects version {version}, "
+              f"but package.json has {package_version or 'missing'}"
+            )
+            sys.exit(1)
+
+          try:
+            with open("changelog.json", "r", encoding="utf-8") as f:
+              changelog = json.load(f)
+          except Exception as exc:
+            print(f"::error::Unable to read changelog.json: {exc}")
+            sys.exit(1)
+
+          entry_version = str(changelog.get("version", "")).strip() if isinstance(changelog, dict) else ""
+          if entry_version != version:
+            print(
+              f"::error::changelog.json version {entry_version or 'missing'} does not match "
+              f"release tag {release_tag} (expected {version})"
+            )
+            sys.exit(1)
+
+          print(f"Validated release metadata for {release_tag} (version {version})")
+          PY
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -23,7 +88,16 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Build
+      - name: Run tests
+        run: npm test
+
+      - name: Run coverage
+        run: npm run test:coverage
+
+      - name: Typecheck build
+        run: npm run build
+
+      - name: Build release bundle
         run: npm run build:bundle
 
       - name: Generate checksum

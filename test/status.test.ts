@@ -137,4 +137,77 @@ describe('service status helpers', () => {
 
     expect(__testing.countEligibleReadyNodesForService(service, readyNodes)).toBe(1);
   });
+
+  it('parses placement constraints with quoted values and rejects invalid forms', () => {
+    expect(__testing.parsePlacementConstraint(`node.labels.role == "database"`)).toEqual({
+      key: 'node.labels.role',
+      operator: '==',
+      value: 'database',
+    });
+    expect(__testing.parsePlacementConstraint(`node.role != 'manager'`)).toEqual({
+      key: 'node.role',
+      operator: '!=',
+      value: 'manager',
+    });
+    expect(__testing.parsePlacementConstraint('not-a-constraint')).toBeNull();
+  });
+
+  it('evaluates node placement constraints including missing labels', () => {
+    const node = {
+      ID: 'node-1',
+      Spec: { Role: 'worker', Labels: { tier: 'app' } },
+      Description: {
+        Hostname: 'worker-1',
+        Platform: { OS: 'linux', Architecture: 'x86_64' },
+        Engine: { Labels: { storage: 'ssd' } },
+      },
+    };
+
+    expect(__testing.nodeMatchesPlacementConstraints(node, [
+      'node.role == worker',
+      'node.labels.tier == app',
+      'engine.labels.storage == ssd',
+      'node.role != manager',
+    ])).toBe(true);
+    expect(__testing.nodeMatchesPlacementConstraints(node, ['node.labels.region == eu-west-1'])).toBe(false);
+  });
+
+  it('builds stable grouping keys and recency from partial task payloads', () => {
+    expect(__testing.taskGroupingKey({ Slot: 3 })).toBe('slot:3');
+    expect(__testing.taskGroupingKey({ Slot: 0, NodeID: 'node-a' })).toBe('node:node-a');
+    expect(__testing.taskGroupingKey({ ID: 'task-a' })).toBe('task:task-a');
+
+    expect(__testing.parseTaskRecency({ ID: 'x', Version: { Index: 'invalid' } })).toEqual({
+      versionIndex: 0,
+      statusTimestamp: 0,
+      updatedAt: 0,
+      createdAt: 0,
+      taskId: 'x',
+    });
+  });
+
+  it('uses updated_at and created_at to break recency ties when version is absent', () => {
+    const tasks = [
+      {
+        ID: 'old',
+        ServiceID: 'svc-4',
+        DesiredState: 'running',
+        NodeID: 'node-a',
+        UpdatedAt: '2026-02-10T00:00:00.000Z',
+        CreatedAt: '2026-02-09T00:00:00.000Z',
+      },
+      {
+        ID: 'new',
+        ServiceID: 'svc-4',
+        DesiredState: 'running',
+        NodeID: 'node-a',
+        UpdatedAt: '2026-02-11T00:00:00.000Z',
+        CreatedAt: '2026-02-09T00:00:00.000Z',
+      },
+    ];
+
+    const selected = __testing.selectLatestServiceTasks(tasks, 'svc-4');
+    expect(selected).toHaveLength(1);
+    expect(selected[0]?.ID).toBe('new');
+  });
 });

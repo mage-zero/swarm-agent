@@ -95,6 +95,8 @@ type PlannerTuningPayloadLike = {
 type DeployHistoryEntry = {
   artifacts: string[];
   imageTags: string[];
+  failedArtifacts?: string[];
+  failedImageTags?: string[];
   updated_at?: string;
 };
 
@@ -107,7 +109,9 @@ const DEPLOY_HISTORY_FILE = process.env.MZ_DEPLOY_HISTORY_FILE || path.join(DEPL
 const LEGACY_DEPLOY_HISTORY_FILE = path.join(DEPLOY_QUEUE_DIR, 'history.json');
 const DEPLOY_RECORD_FILENAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i;
 const DEPLOY_RETAIN_COUNT = Math.max(1, Number(process.env.MZ_DEPLOY_RETAIN_COUNT || 2));
-const DEPLOY_FAILED_RETAIN_COUNT = Math.max(0, Number(process.env.MZ_DEPLOY_FAILED_RETAIN_COUNT || 3));
+const DEPLOY_FAILED_ARTIFACT_RETAIN_COUNT = Math.max(0, Number(process.env.MZ_DEPLOY_FAILED_ARTIFACT_RETAIN_COUNT || 1));
+const DEPLOY_FAILED_IMAGE_RETAIN_COUNT = Math.max(0, Number(process.env.MZ_DEPLOY_FAILED_IMAGE_RETAIN_COUNT || 1));
+const DEPLOY_FAILED_RETAIN_COUNT = Math.max(0, Number(process.env.MZ_DEPLOY_FAILED_RETAIN_COUNT || 1));
 const DEPLOY_CLEANUP_ENABLED = (process.env.MZ_DEPLOY_CLEANUP_ENABLED || '1') !== '0';
 const DEPLOY_SMOKE_AUTO_HEAL_ENABLED = (process.env.MZ_DEPLOY_SMOKE_AUTO_HEAL_ENABLED || '1') !== '0';
 const DEPLOY_SMOKE_AUTO_HEAL_ROUNDS = Math.max(0, Number(process.env.MZ_DEPLOY_SMOKE_AUTO_HEAL_ROUNDS || 1));
@@ -136,6 +140,14 @@ const REGISTRY_CLEANUP_ENABLED = (process.env.MZ_REGISTRY_CLEANUP_ENABLED || '1'
 // from inside the BuildKit container (where loopback/service DNS differ).
 const REGISTRY_CLEANUP_HOST = process.env.MZ_REGISTRY_CLEANUP_HOST || '127.0.0.1';
 const REGISTRY_CLEANUP_PORT = process.env.MZ_REGISTRY_CLEANUP_PORT || '5000';
+const REGISTRY_CLEANUP_REPOSITORIES = (() => {
+  const parsed = (process.env.MZ_REGISTRY_CLEANUP_REPOSITORIES || 'mz-magento,mz-nginx-app')
+    .split(',')
+    .map((value) => stripRegistryHost(String(value || '').replace(/^\/+/, '').trim()))
+    .filter(Boolean);
+  const unique = Array.from(new Set(parsed));
+  return unique.length ? unique : ['mz-magento', 'mz-nginx-app'];
+})();
 const DEPLOY_MIN_FREE_GB = Number(process.env.MZ_DEPLOY_MIN_FREE_GB || 15);
 const DEPLOY_AGGRESSIVE_PRUNE_ENABLED = (process.env.MZ_DEPLOY_AGGRESSIVE_PRUNE_ENABLED || '1') !== '0';
 const DEPLOY_AGGRESSIVE_PRUNE_MIN_FREE_GB = Number(
@@ -143,6 +155,8 @@ const DEPLOY_AGGRESSIVE_PRUNE_MIN_FREE_GB = Number(
 );
 const DEPLOY_ABORT_MIN_FREE_GB = Number(process.env.MZ_DEPLOY_ABORT_MIN_FREE_GB || 5);
 const DEPLOY_BUILD_RETRIES = Math.max(0, Number(process.env.MZ_DEPLOY_BUILD_RETRIES || 1));
+const DEPLOY_SKIP_SERVICE_BUILD_IF_PRESENT = (process.env.MZ_DEPLOY_SKIP_SERVICE_BUILD_IF_PRESENT || '1') !== '0';
+const DEPLOY_SKIP_APP_BUILD_IF_PRESENT = (process.env.MZ_DEPLOY_SKIP_APP_BUILD_IF_PRESENT || '1') !== '0';
 const REGISTRY_GC_ENABLED = (process.env.MZ_REGISTRY_GC_ENABLED || '0') === '1';
 const REGISTRY_GC_SCRIPT = process.env.MZ_REGISTRY_GC_SCRIPT
   || path.join(process.env.MZ_CLOUD_SWARM_DIR || '/opt/mage-zero/cloud-swarm', 'scripts/registry-gc.sh');
@@ -499,25 +513,107 @@ function writeDeploymentHistory(history: DeployHistory) {
   fs.writeFileSync(DEPLOY_HISTORY_FILE, JSON.stringify(history, null, 2));
 }
 
+function normalizeHistoryList(values: unknown): string[] {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+  const output: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const normalized = String(value || '').replace(/^\/+/, '').trim();
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    output.push(normalized);
+  }
+  return output;
+}
+
+function getDeploymentHistoryEntry(history: DeployHistory, key: string): Required<Pick<DeployHistoryEntry, 'artifacts' | 'imageTags' | 'failedArtifacts' | 'failedImageTags'>> {
+  const entry = history[key] || {};
+  return {
+    artifacts: normalizeHistoryList((entry as DeployHistoryEntry).artifacts),
+    imageTags: normalizeHistoryList((entry as DeployHistoryEntry).imageTags),
+    failedArtifacts: normalizeHistoryList((entry as DeployHistoryEntry).failedArtifacts),
+    failedImageTags: normalizeHistoryList((entry as DeployHistoryEntry).failedImageTags),
+  };
+}
+
 function updateDeploymentHistory(
   history: DeployHistory,
   key: string,
   artifactKey: string,
   imageTag: string
 ) {
-  const existing = history[key] || { artifacts: [], imageTags: [] };
-  const artifacts = [artifactKey, ...existing.artifacts.filter((item) => item !== artifactKey)];
-  const imageTags = [imageTag, ...existing.imageTags.filter((item) => item !== imageTag)];
+  const existing = getDeploymentHistoryEntry(history, key);
+  const normalizedArtifactKey = String(artifactKey || '').replace(/^\/+/, '').trim();
+  const normalizedImageTag = String(imageTag || '').trim();
+  const artifacts = [normalizedArtifactKey, ...existing.artifacts.filter((item) => item !== normalizedArtifactKey)];
+  const imageTags = [normalizedImageTag, ...existing.imageTags.filter((item) => item !== normalizedImageTag)];
   const keepArtifacts = artifacts.slice(0, DEPLOY_RETAIN_COUNT);
   const keepImageTags = imageTags.slice(0, DEPLOY_RETAIN_COUNT);
   const removedArtifacts = artifacts.slice(DEPLOY_RETAIN_COUNT);
   const removedImageTags = imageTags.slice(DEPLOY_RETAIN_COUNT);
+
+  // A successful deploy supersedes failed retries: purge failed retention immediately.
+  const removedFailedArtifacts = [...existing.failedArtifacts];
+  const removedFailedImageTags = [...existing.failedImageTags];
   history[key] = {
     artifacts: keepArtifacts,
     imageTags: keepImageTags,
+    failedArtifacts: [],
+    failedImageTags: [],
     updated_at: new Date().toISOString(),
   };
-  return { keepArtifacts, keepImageTags, removedArtifacts, removedImageTags };
+  return {
+    keepArtifacts,
+    keepImageTags,
+    removedArtifacts,
+    removedImageTags,
+    removedFailedArtifacts,
+    removedFailedImageTags,
+  };
+}
+
+function updateFailedDeploymentHistory(
+  history: DeployHistory,
+  key: string,
+  artifactKey: string,
+  imageTag: string
+) {
+  const existing = getDeploymentHistoryEntry(history, key);
+  const normalizedArtifactKey = String(artifactKey || '').replace(/^\/+/, '').trim();
+  const normalizedImageTag = String(imageTag || '').trim();
+
+  const failedArtifacts = normalizedArtifactKey
+    ? [normalizedArtifactKey, ...existing.failedArtifacts.filter((item) => item !== normalizedArtifactKey)]
+    : [...existing.failedArtifacts];
+  const failedImageTags = normalizedImageTag
+    ? [normalizedImageTag, ...existing.failedImageTags.filter((item) => item !== normalizedImageTag)]
+    : [...existing.failedImageTags];
+
+  const keepFailedArtifacts = failedArtifacts.slice(0, DEPLOY_FAILED_ARTIFACT_RETAIN_COUNT);
+  const keepFailedImageTags = failedImageTags.slice(0, DEPLOY_FAILED_IMAGE_RETAIN_COUNT);
+  const removedFailedArtifacts = failedArtifacts.slice(DEPLOY_FAILED_ARTIFACT_RETAIN_COUNT);
+  const removedFailedImageTags = failedImageTags.slice(DEPLOY_FAILED_IMAGE_RETAIN_COUNT);
+
+  history[key] = {
+    artifacts: existing.artifacts,
+    imageTags: existing.imageTags,
+    failedArtifacts: keepFailedArtifacts,
+    failedImageTags: keepFailedImageTags,
+    updated_at: new Date().toISOString(),
+  };
+
+  return {
+    keepArtifacts: existing.artifacts,
+    keepImageTags: existing.imageTags,
+    keepFailedArtifacts,
+    keepFailedImageTags,
+    removedFailedArtifacts,
+    removedFailedImageTags,
+  };
 }
 
 function parseImageReference(reference: string) {
@@ -841,34 +937,197 @@ async function cleanupLocalImages(
   return removals;
 }
 
-async function cleanupRegistryImages(removals: Array<{ repo: string; tag: string }>) {
-  if (!REGISTRY_CLEANUP_ENABLED || !removals.length) {
-    return;
+function isAllowedRegistryCleanupHost(repoHost: string) {
+  if (!repoHost) {
+    return true;
   }
-  const registryBase = `http://${REGISTRY_CLEANUP_HOST}:${REGISTRY_CLEANUP_PORT}`;
-  for (const removal of removals) {
-    const repoHost = getRegistryHost(removal.repo);
-    if (repoHost && ![REGISTRY_CLEANUP_HOST, 'registry', 'localhost', '127.0.0.1'].includes(repoHost)) {
+  const cleanupHost = String(REGISTRY_CLEANUP_HOST || '').trim().toLowerCase();
+  const cleanupPort = String(REGISTRY_CLEANUP_PORT || '').trim();
+  const normalizedHost = String(repoHost || '').trim().toLowerCase();
+  const allowed = new Set([
+    cleanupHost,
+    cleanupPort ? `${cleanupHost}:${cleanupPort}` : '',
+    'registry',
+    cleanupPort ? `registry:${cleanupPort}` : '',
+    'localhost',
+    cleanupPort ? `localhost:${cleanupPort}` : '',
+    '127.0.0.1',
+    cleanupPort ? `127.0.0.1:${cleanupPort}` : '',
+    '::1',
+    cleanupPort ? `[::1]:${cleanupPort}` : '',
+  ]);
+  return allowed.has(normalizedHost);
+}
+
+function normalizeRegistryRemoval(removal: { repo: string; tag: string }): { repo: string; tag: string } | null {
+  const repoRaw = String(removal.repo || '').trim();
+  const tag = String(removal.tag || '').trim();
+  if (!repoRaw || !tag) {
+    return null;
+  }
+  const repoHost = getRegistryHost(repoRaw);
+  if (!isAllowedRegistryCleanupHost(repoHost)) {
+    return null;
+  }
+  const repo = stripRegistryHost(repoRaw).replace(/^\/+/, '').trim();
+  if (!repo) {
+    return null;
+  }
+  return { repo, tag };
+}
+
+async function fetchWithShortTimeout(url: string, init: RequestInit = {}, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function listRegistryTags(repository: string): Promise<string[]> {
+  const repo = String(repository || '').replace(/^\/+/, '').trim();
+  if (!repo) {
+    return [];
+  }
+  const tagsUrl = `http://${REGISTRY_CLEANUP_HOST}:${REGISTRY_CLEANUP_PORT}/v2/${repo}/tags/list?n=10000`;
+  try {
+    const response = await fetchWithShortTimeout(tagsUrl);
+    if (!response.ok) {
+      return [];
+    }
+    return parseRegistryTagsResponse(await response.text());
+  } catch {
+    return [];
+  }
+}
+
+async function resolveRegistryManifestDigest(repository: string, reference: string): Promise<string | null> {
+  const repo = String(repository || '').replace(/^\/+/, '').trim();
+  const ref = String(reference || '').trim();
+  if (!repo || !ref) {
+    return null;
+  }
+  const manifestUrl = `http://${REGISTRY_CLEANUP_HOST}:${REGISTRY_CLEANUP_PORT}/v2/${repo}/manifests/${ref}`;
+  try {
+    const response = await fetchWithShortTimeout(manifestUrl, {
+      method: 'HEAD',
+      headers: {
+        'Accept': 'application/vnd.docker.distribution.manifest.v2+json',
+      },
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const digest = String(response.headers.get('docker-content-digest') || '').trim();
+    return digest || null;
+  } catch {
+    return null;
+  }
+}
+
+async function deleteRegistryManifestDigest(repository: string, digest: string): Promise<boolean> {
+  const repo = String(repository || '').replace(/^\/+/, '').trim();
+  const value = String(digest || '').trim();
+  if (!repo || !value) {
+    return false;
+  }
+  const manifestUrl = `http://${REGISTRY_CLEANUP_HOST}:${REGISTRY_CLEANUP_PORT}/v2/${repo}/manifests/${value}`;
+  try {
+    const response = await fetchWithShortTimeout(manifestUrl, { method: 'DELETE' });
+    if (response.status === 404) {
+      return false;
+    }
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function cleanupRegistryImages(params: {
+  environmentId: number;
+  keepImageTags: Set<string>;
+  removals: Array<{ repo: string; tag: string }>;
+}) {
+  if (!REGISTRY_CLEANUP_ENABLED) {
+    return { deleted: 0 };
+  }
+
+  const prefix = `env-${params.environmentId}-`;
+  const keepTags = new Set(
+    Array.from(params.keepImageTags)
+      .map((tag) => String(tag || '').trim())
+      .filter((tag) => tag.startsWith(prefix))
+  );
+
+  const normalizedRemovals = params.removals
+    .map((item) => normalizeRegistryRemoval(item))
+    .filter((item): item is { repo: string; tag: string } => Boolean(item))
+    .filter((item) => item.tag.startsWith(prefix) && !keepTags.has(item.tag));
+
+  const repos = new Set<string>(REGISTRY_CLEANUP_REPOSITORIES);
+  for (const removal of normalizedRemovals) {
+    repos.add(removal.repo);
+  }
+
+  let deleted = 0;
+  for (const repo of repos) {
+    if (!repo) continue;
+
+    const listed = await listRegistryTags(repo);
+    const deleteTags = new Set<string>();
+
+    for (const tag of listed) {
+      const normalizedTag = String(tag || '').trim();
+      if (!normalizedTag || !normalizedTag.startsWith(prefix)) {
+        continue;
+      }
+      if (!keepTags.has(normalizedTag)) {
+        deleteTags.add(normalizedTag);
+      }
+    }
+
+    for (const removal of normalizedRemovals) {
+      if (removal.repo !== repo) continue;
+      if (!keepTags.has(removal.tag)) {
+        deleteTags.add(removal.tag);
+      }
+    }
+
+    if (!deleteTags.size) {
       continue;
     }
-    const repoName = stripRegistryHost(removal.repo);
-    if (!repoName) continue;
-    try {
-      const { stdout } = await runCommandCapture('curl', [
-        '-fsSI',
-        '-H',
-        'Accept: application/vnd.docker.distribution.manifest.v2+json',
-        `${registryBase}/v2/${repoName}/manifests/${removal.tag}`,
-      ]);
-      const digestLine = stdout.split('\n').find((line) => line.toLowerCase().startsWith('docker-content-digest:'));
-      if (!digestLine) continue;
-      const digest = digestLine.split(':').slice(1).join(':').trim();
-      if (!digest) continue;
-      await runCommand('curl', ['-fsSL', '-X', 'DELETE', `${registryBase}/v2/${repoName}/manifests/${digest}`]);
-    } catch {
-      // ignore registry cleanup failures
+
+    const keepDigests = new Set<string>();
+    for (const tag of keepTags) {
+      const digest = await resolveRegistryManifestDigest(repo, tag);
+      if (digest) {
+        keepDigests.add(digest);
+      }
+    }
+
+    const deleteDigests = new Set<string>();
+    for (const tag of deleteTags) {
+      const digest = await resolveRegistryManifestDigest(repo, tag);
+      if (!digest) {
+        continue;
+      }
+      if (keepDigests.has(digest)) {
+        continue;
+      }
+      deleteDigests.add(digest);
+    }
+
+    for (const digest of deleteDigests) {
+      const removed = await deleteRegistryManifestDigest(repo, digest);
+      if (removed) {
+        deleted += 1;
+      }
     }
   }
+
+  return { deleted };
 }
 
 async function runRegistryGc() {
@@ -934,7 +1193,12 @@ async function cleanupDeploymentResources(params: {
   const normalizedArtifactKey = params.artifactKey.replace(/^\/+/, '');
   const repo = params.repository || inferRepositoryFromArtifactKey(normalizedArtifactKey) || 'unknown';
   const key = `env:${params.environmentId}:${repo}`;
-  const { keepArtifacts, keepImageTags, removedArtifacts, removedImageTags } = updateDeploymentHistory(
+  const {
+    keepArtifacts,
+    keepImageTags,
+    removedArtifacts,
+    removedFailedArtifacts,
+  } = updateDeploymentHistory(
     history,
     key,
     normalizedArtifactKey,
@@ -949,7 +1213,17 @@ async function cleanupDeploymentResources(params: {
   const keepArtifactBases = new Set(keepArtifacts.map((item) => path.basename(item)));
   await cleanupWorkDirs(keepArtifactBases);
 
-  for (const objectKey of removedArtifacts) {
+  const keepArtifactSet = new Set(
+    keepArtifacts
+      .map((item) => String(item || '').replace(/^\/+/, '').trim())
+      .filter(Boolean)
+  );
+  const removedArtifactKeys = Array.from(new Set(
+    [...removedArtifacts, ...removedFailedArtifacts]
+      .map((item) => String(item || '').replace(/^\/+/, '').trim())
+      .filter((item) => Boolean(item) && !keepArtifactSet.has(item))
+  ));
+  for (const objectKey of removedArtifactKeys) {
     try {
       await deleteR2Object(params.r2, objectKey);
     } catch {
@@ -968,11 +1242,13 @@ async function cleanupDeploymentResources(params: {
   });
 
   const keepImageTagSet = new Set(keepImageTags);
-  const removedImageTagSet = new Set(removedImageTags);
   const removals = await cleanupLocalImages(params.environmentId, keepImageTagSet, params.stackName);
-  if (removedImageTagSet.size) {
-    const filtered = removals.filter((item) => removedImageTagSet.has(item.tag));
-    await cleanupRegistryImages(filtered);
+  const registryCleanup = await cleanupRegistryImages({
+    environmentId: params.environmentId,
+    keepImageTags: keepImageTagSet,
+    removals,
+  });
+  if (registryCleanup.deleted > 0) {
     await runRegistryGc();
   }
 
@@ -1690,6 +1966,90 @@ function resolveImageTag(artifactKey: string, ref: string, deploymentId: string)
   return deploymentId.slice(0, 8);
 }
 
+function parseRegistryTagsResponse(raw: string): string[] {
+  try {
+    const parsed = JSON.parse(raw) as { tags?: unknown };
+    return Array.isArray(parsed.tags)
+      ? parsed.tags.map((value) => String(value || '').trim()).filter(Boolean)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+async function registryImageTagExists(
+  registryHost: string,
+  registryPort: string,
+  repository: string,
+  tag: string,
+): Promise<boolean> {
+  const host = String(registryHost || '').trim();
+  const port = String(registryPort || '').trim();
+  const repo = String(repository || '').replace(/^\/+/, '').trim();
+  const imageTag = String(tag || '').trim();
+  if (!host || !port || !repo || !imageTag) {
+    return false;
+  }
+
+  const tagsUrl = `http://${host}:${port}/v2/${repo}/tags/list`;
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5_000);
+    const response = await fetch(tagsUrl, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (response.ok) {
+      const tags = parseRegistryTagsResponse(await response.text());
+      if (tags.includes(imageTag)) {
+        return true;
+      }
+    }
+  } catch {
+    // Fallback below handles non-HTTP responses and daemon-side registry config.
+  }
+
+  const manifestRef = `${host}:${port}/${repo}:${imageTag}`;
+  const manifest = await runCommandCaptureWithStatus('docker', ['manifest', 'inspect', manifestRef]);
+  return manifest.code === 0;
+}
+
+async function collectMissingServiceImages(envVars: NodeJS.ProcessEnv): Promise<string[]> {
+  const registryHost = String(envVars.REGISTRY_PULL_HOST || envVars.REGISTRY_HOST || '127.0.0.1').trim() || '127.0.0.1';
+  const registryPort = String(envVars.REGISTRY_PORT || '5000').trim() || '5000';
+  const targets = [
+    { repository: 'mz-varnish', tag: String(envVars.VARNISH_VERSION || '').trim() },
+    { repository: 'mz-nginx', tag: String(envVars.NGINX_VERSION || '').trim() },
+    { repository: 'mz-php-fpm', tag: String(envVars.PHP_VERSION || '').trim() },
+    { repository: 'mz-mariadb', tag: String(envVars.MARIADB_VERSION || '').trim() },
+    { repository: 'mz-proxysql', tag: String(envVars.PROXYSQL_VERSION || '').trim() },
+    { repository: 'mz-opensearch', tag: String(envVars.OPENSEARCH_VERSION || '').trim() },
+    { repository: 'mz-rabbitmq', tag: String(envVars.RABBITMQ_VERSION || '').trim() },
+    { repository: 'mz-cloudflared', tag: String(envVars.CLOUDFLARED_VERSION || '').trim() },
+  ];
+  const missing: string[] = [];
+  for (const target of targets) {
+    if (!target.tag) {
+      missing.push(`${target.repository}:<missing-version>`);
+      continue;
+    }
+    const exists = await registryImageTagExists(registryHost, registryPort, target.repository, target.tag);
+    if (!exists) {
+      missing.push(`${target.repository}:${target.tag}`);
+    }
+  }
+  return missing;
+}
+
+async function appImagesExist(envVars: NodeJS.ProcessEnv, mageVersion: string): Promise<boolean> {
+  const registryHost = String(envVars.REGISTRY_PULL_HOST || envVars.REGISTRY_HOST || '127.0.0.1').trim() || '127.0.0.1';
+  const registryPort = String(envVars.REGISTRY_PORT || '5000').trim() || '5000';
+  const magentoExists = await registryImageTagExists(registryHost, registryPort, 'mz-magento', mageVersion);
+  if (!magentoExists) {
+    return false;
+  }
+  const nginxAppExists = await registryImageTagExists(registryHost, registryPort, 'mz-nginx-app', mageVersion);
+  return nginxAppExists;
+}
+
 async function ensureCloudSwarmRepo() {
   ensureDir(path.dirname(CLOUD_SWARM_DIR));
   const repoExists = fs.existsSync(path.join(CLOUD_SWARM_DIR, '.git'));
@@ -1736,6 +2096,7 @@ const MONITORING_DASHBOARDS_BOOTSTRAP_DELAY_MS = Number.isFinite(monitoringDashb
   && monitoringDashboardsBootstrapDelayParsed > 0
   ? Math.max(1_000, monitoringDashboardsBootstrapDelayParsed)
   : 5_000;
+const MONITORING_DASHBOARDS_REQUIRED = (process.env.MZ_MONITORING_DASHBOARDS_REQUIRED || '0') === '1';
 
 type MonitoringRuntimeStatus = {
   serviceName: string;
@@ -1922,7 +2283,11 @@ async function ensureMonitoringDashboards(log: (msg: string) => void): Promise<v
       await new Promise((resolve) => setTimeout(resolve, MONITORING_DASHBOARDS_BOOTSTRAP_DELAY_MS));
     }
   }
-  throw new Error(`monitoring dashboards bootstrap failed: ${lastError || 'unknown error'}`);
+  const message = `monitoring dashboards bootstrap failed: ${lastError || 'unknown error'}`;
+  if (MONITORING_DASHBOARDS_REQUIRED) {
+    throw new Error(message);
+  }
+  log(`${message}; continuing deploy`);
 }
 
 /**
@@ -3620,7 +3985,16 @@ async function runSetupDbStatus(
       return { needed: true, exitCode, output, containerId: currentId };
     }
 
-    if (!output || output.includes('No such container') || output.includes('is not running')) {
+    const transientFailure = !output
+      || output.includes('No such container')
+      || output.includes('is not running')
+      || outputLower.includes('connection refused')
+      || outputLower.includes('connection to redis')
+      || outputLower.includes('sqlstate[hy000] [2002]')
+      || outputLower.includes('server has gone away')
+      || outputLower.includes('too many connections');
+
+    if (transientFailure) {
       log(`setup:db:status retry ${attempt}: ${output || `exit ${exitCode}`}`);
       currentId = await waitForContainer(stackName, 'php-fpm-admin', 60 * 1000);
       await delay(2000);
@@ -3636,7 +4010,7 @@ async function runSetupDbStatus(
     log(`setup:db:status failed exit=${exitCode}: ${output}`);
     throw new Error(`setup:db:status failed (exit ${exitCode}): ${output}`);
   }
-  return { needed: true, exitCode: 1, output: 'setup:db:status retries exhausted', containerId: currentId };
+  throw new Error('setup:db:status failed after retries; refusing to run setup:upgrade/backup without a definitive status');
 }
 
 async function runAppConfigStatus(
@@ -4122,36 +4496,54 @@ async function processDeployment(recordPath: string) {
   log('docker secrets ready');
 
   progress.start('build_images');
-  progress.detail('build_images', 'Building service images (database, search, cache)');
-  await runCommandLoggedWithRetry(
-    'bash',
-    [path.join(CLOUD_SWARM_DIR, 'scripts/build-services.sh')],
-    { cwd: CLOUD_SWARM_DIR, env: envVars, logDir, label: 'build-services' },
-    {
-      retries: DEPLOY_BUILD_RETRIES,
-      log,
-      onRetry: async () => {
-        await maybeAggressivePrune('build-services-retry');
-        await ensureMinimumFreeSpace('build-services-retry');
-      },
-    }
-  );
-  log('built base services');
-  progress.detail('build_images', 'Building Magento application image');
-  await runCommandLoggedWithRetry(
-    'bash',
-    [path.join(CLOUD_SWARM_DIR, 'scripts/build-magento.sh'), artifactPath],
-    { cwd: CLOUD_SWARM_DIR, env: envVars, logDir, label: 'build-magento' },
-    {
-      retries: DEPLOY_BUILD_RETRIES,
-      log,
-      onRetry: async () => {
-        await maybeAggressivePrune('build-magento-retry');
-        await ensureMinimumFreeSpace('build-magento-retry');
-      },
-    }
-  );
-  log('built magento images');
+  const missingServiceImages = DEPLOY_SKIP_SERVICE_BUILD_IF_PRESENT
+    ? await collectMissingServiceImages(envVars)
+    : ['forced'];
+  if (!missingServiceImages.length) {
+    progress.detail('build_images', 'Skipping service image build (images present in registry)');
+    log('base service images already present in registry; skipping build-services');
+  } else {
+    progress.detail('build_images', 'Building service images (database, search, cache)');
+    log(`building service images; missing: ${missingServiceImages.join(', ')}`);
+    await runCommandLoggedWithRetry(
+      'bash',
+      [path.join(CLOUD_SWARM_DIR, 'scripts/build-services.sh')],
+      { cwd: CLOUD_SWARM_DIR, env: envVars, logDir, label: 'build-services' },
+      {
+        retries: DEPLOY_BUILD_RETRIES,
+        log,
+        onRetry: async () => {
+          await maybeAggressivePrune('build-services-retry');
+          await ensureMinimumFreeSpace('build-services-retry');
+        },
+      }
+    );
+    log('built base services');
+  }
+
+  const appImagePresent = DEPLOY_SKIP_APP_BUILD_IF_PRESENT
+    ? await appImagesExist(envVars, mageVersion)
+    : false;
+  if (appImagePresent) {
+    progress.detail('build_images', `Skipping Magento image build (mz-magento/mz-nginx-app:${mageVersion} present)`);
+    log(`magento images already present in registry for ${mageVersion}; skipping build-magento`);
+  } else {
+    progress.detail('build_images', 'Building Magento application image');
+    await runCommandLoggedWithRetry(
+      'bash',
+      [path.join(CLOUD_SWARM_DIR, 'scripts/build-magento.sh'), artifactPath],
+      { cwd: CLOUD_SWARM_DIR, env: envVars, logDir, label: 'build-magento' },
+      {
+        retries: DEPLOY_BUILD_RETRIES,
+        log,
+        onRetry: async () => {
+          await maybeAggressivePrune('build-magento-retry');
+          await ensureMinimumFreeSpace('build-magento-retry');
+        },
+      }
+    );
+    log('built magento images');
+  }
   progress.ok('build_images');
 
   const cohortServicesPre = await resolveReleaseCohortServices(stackName);
@@ -4432,6 +4824,8 @@ async function processDeployment(recordPath: string) {
   progress.ok('app_prepare');
 
   progress.start('magento_steps');
+  progress.detail('magento_steps', 'Flushing cache before setup:db:status');
+  adminContainerId = await flushMagentoCache(adminContainerId, stackName, log);
   const dbStatus = await runSetupDbStatus(adminContainerId, stackName, log);
   adminContainerId = dbStatus.containerId;
   recordMeta.magento_setup_db_status = {
@@ -4445,9 +4839,8 @@ async function processDeployment(recordPath: string) {
   let maintenanceEnabled = false;
   try {
     if (!dbStatus.needed) {
-      log('setup:upgrade not required; flushing cache only');
-      progress.detail('magento_steps', 'setup:upgrade not required; flushing cache');
-      adminContainerId = await flushMagentoCache(adminContainerId, stackName, log);
+      log('setup:upgrade not required; cache already flushed before status check');
+      progress.detail('magento_steps', 'setup:upgrade not required; continuing');
     } else {
       log('setup:upgrade required; enabling maintenance + pre-upgrade DB backup');
       progress.detail('magento_steps', 'setup:upgrade required; enabling maintenance + DB backup');
@@ -4739,14 +5132,25 @@ async function cleanupFailedArtifact(record: Record<string, any>) {
     const repository = String(payload.repository || '').trim() || inferRepositoryFromArtifactKey(normalizedArtifactKey) || 'unknown';
     const history = readDeploymentHistory();
     const key = `env:${environmentId}:${repository}`;
-    const entry = history[key] || { artifacts: [] };
-    const keepSet = new Set(
-      (Array.isArray(entry.artifacts) ? entry.artifacts : [])
-        .map((item) => String(item || '').replace(/^\/+/, '').trim())
-        .filter(Boolean)
+    const deploymentId = String(record?.id || '').trim();
+    const ref = String(payload.ref || '').trim();
+    const imageTag = resolveImageTag(normalizedArtifactKey, ref, deploymentId);
+    const failedImageTag = imageTag ? `env-${environmentId}-${imageTag}` : '';
+    const {
+      keepArtifacts,
+      keepImageTags,
+      keepFailedImageTags,
+      removedFailedArtifacts,
+      removedFailedImageTags,
+    } = updateFailedDeploymentHistory(
+      history,
+      key,
+      normalizedArtifactKey,
+      failedImageTag
     );
+    writeDeploymentHistory(history);
 
-    if (keepSet.has(normalizedArtifactKey)) {
+    if (!DEPLOY_CLEANUP_ENABLED) {
       return;
     }
 
@@ -4754,14 +5158,66 @@ async function cleanupFailedArtifact(record: Record<string, any>) {
     const baseUrl = (config.mz_control_base_url || process.env.MZ_CONTROL_BASE_URL || '').trim();
     const nodeId = readNodeFile('node-id');
     const nodeSecret = readNodeFile('node-secret');
-    if (!baseUrl || !nodeId || !nodeSecret) {
+    const hasR2Context = Boolean(baseUrl && nodeId && nodeSecret);
+    if (!hasR2Context && removedFailedArtifacts.length) {
       console.warn('cleanup skip: missing mz-control base URL or node credentials');
-      return;
     }
 
-    const r2: R2PresignContext = { baseUrl, nodeId, nodeSecret, environmentId };
-    await deleteR2Object(r2, normalizedArtifactKey);
-    console.warn(`cleanup: deleted failed artifact ${normalizedArtifactKey}`);
+    if (hasR2Context) {
+      const keepArtifactSet = new Set(
+        keepArtifacts
+          .map((item) => String(item || '').replace(/^\/+/, '').trim())
+          .filter(Boolean)
+      );
+      const overflowFailedArtifacts = removedFailedArtifacts
+        .map((item) => String(item || '').replace(/^\/+/, '').trim())
+        .filter((item) => Boolean(item) && !keepArtifactSet.has(item));
+
+      const r2: R2PresignContext = {
+        baseUrl: String(baseUrl),
+        nodeId: String(nodeId),
+        nodeSecret: String(nodeSecret),
+        environmentId,
+      };
+      for (const objectKey of overflowFailedArtifacts) {
+        try {
+          await deleteR2Object(r2, objectKey);
+          console.warn(`cleanup: deleted failed artifact ${objectKey}`);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn(`cleanup: failed to delete artifact ${objectKey}: ${message}`);
+        }
+      }
+    }
+
+    const keepImageTagSet = new Set(
+      [...keepImageTags, ...keepFailedImageTags]
+        .map((item) => String(item || '').trim())
+        .filter(Boolean)
+    );
+    const stackName = `mz-env-${environmentId}`;
+    const localRemovals = await cleanupLocalImages(environmentId, keepImageTagSet, stackName);
+
+    const explicitRegistryRemovals = [
+      ...localRemovals,
+      ...removedFailedImageTags
+        .map((tag) => String(tag || '').trim())
+        .filter(Boolean)
+        .flatMap((tag) => ([
+          { repo: 'mz-magento', tag },
+          { repo: 'mz-nginx-app', tag },
+        ])),
+    ];
+    const registryCleanup = await cleanupRegistryImages({
+      environmentId,
+      keepImageTags: keepImageTagSet,
+      removals: explicitRegistryRemovals,
+    });
+    if (registryCleanup.deleted > 0) {
+      await runRegistryGc();
+    }
+
+    await maybeAggressivePrune('post-failed-deploy');
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`cleanup failed artifact error: ${message}`);

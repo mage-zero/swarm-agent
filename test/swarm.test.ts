@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { envServiceName, summarizeServiceTasks } from '../src/swarm.js';
+import { buildJobName, envServiceName, pickNetworkName, pickSecretName, summarizeServiceTasks } from '../src/swarm.js';
 
 describe('swarm helpers', () => {
   it('builds stack-qualified service names', () => {
@@ -47,5 +47,32 @@ describe('swarm helpers', () => {
     expect(summary.running).toBe(0);
     expect(summary.issues.length).toBeGreaterThan(0);
   });
-});
 
+  it('selects secret and network names from service spec', () => {
+    const spec = {
+      service_name: 'mz-env-5_php-fpm',
+      image: 'registry:5000/mz-php-fpm:8.3',
+      networks: [
+        { name: 'mz-public', aliases: ['nginx'] },
+        { name: 'mz-backend', aliases: ['php-fpm', 'php'] },
+      ],
+      secrets: [
+        { file_name: 'db_root_password', secret_name: 'mz_env_5_db_root_password_v1' },
+      ],
+      mounts: [],
+      env: {},
+    };
+
+    expect(pickSecretName(spec, 'db_root_password')).toBe('mz_env_5_db_root_password_v1');
+    expect(pickSecretName(spec, 'missing')).toBeNull();
+    expect(pickNetworkName(spec, 'php-fpm')).toBe('mz-backend');
+    expect(pickNetworkName(spec, 'missing-alias')).toBe('mz-public');
+  });
+
+  it('builds bounded, lowercase swarm job names', () => {
+    const name = buildJobName('Promote_DB@Replica', 5);
+    expect(name.startsWith('mz-rb-promote-db-replica-5-')).toBe(true);
+    expect(name).toMatch(/^[a-z0-9-]+$/);
+    expect(name.length).toBeLessThanOrEqual(63);
+  });
+});

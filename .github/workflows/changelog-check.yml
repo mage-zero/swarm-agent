@@ -24,15 +24,21 @@ jobs:
       - name: Validate changelog schema
         run: ajv validate -s changelog.schema.json -d changelog.json
 
-      - name: Check version entry exists
+      - name: Check single changelog entry matches package version
         run: |
           VERSION=$(node -p "require('./package.json').version")
-          FOUND=$(node -p "
-            const cl = require('./changelog.json');
-            cl.versions.some(v => v.version === '${VERSION}') ? 'yes' : 'no'
-          ")
-          if [ "$FOUND" != "yes" ]; then
-            echo "::error::changelog.json is missing an entry for version ${VERSION}"
-            exit 1
-          fi
-          echo "Found changelog entry for version ${VERSION}"
+          export VERSION
+          node - <<'NODE'
+          const fs = require('fs');
+
+          const version = String(process.env.VERSION || '').trim();
+          const changelog = JSON.parse(fs.readFileSync('changelog.json', 'utf8'));
+
+          const changelogVersion = String(changelog.version || '').trim();
+          if (changelogVersion !== version) {
+            console.error(`::error::changelog.json version (${changelogVersion || 'missing'}) must match package.json version (${version})`);
+            process.exit(1);
+          }
+
+          console.log(`Validated changelog.json for version ${version}`);
+          NODE

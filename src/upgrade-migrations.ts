@@ -26,6 +26,7 @@ const DEFAULT_MONITORING_ENV: Record<string, string> = {
   MZ_MONITORING_OPENSEARCH_LIMIT_MEMORY: '1536M',
   MZ_MONITORING_OPENSEARCH_RESERVE_MEMORY: '512M',
 };
+const MONITORING_DASHBOARDS_REQUIRED = (process.env.MZ_MONITORING_DASHBOARDS_REQUIRED || '0') === '1';
 
 function isLoopbackHost(host: string): boolean {
   const value = String(host || '').trim().toLowerCase();
@@ -316,8 +317,16 @@ registerMigration('setup-dashboards-dns', async (ctx) => {
 });
 
 registerMigration('bootstrap-monitoring-dashboards', async () => {
-  const result = await bootstrapMonitoringDashboards();
-  console.log(
-    `upgrade.migration.bootstrap_monitoring_dashboards: dashboards=${result.dashboard_ids.join(',')} objects=${result.upserted_objects}`
-  );
+  try {
+    const result = await bootstrapMonitoringDashboards();
+    console.log(
+      `upgrade.migration.bootstrap_monitoring_dashboards: dashboards=${result.dashboard_ids.join(',')} objects=${result.upserted_objects}`
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (MONITORING_DASHBOARDS_REQUIRED) {
+      throw error;
+    }
+    console.warn(`upgrade.migration.bootstrap_monitoring_dashboards: skipped (${message})`);
+  }
 });
