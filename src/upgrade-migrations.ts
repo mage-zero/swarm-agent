@@ -424,3 +424,19 @@ registerMigration('recover-monitoring-dashboards', async (ctx) => {
   await executeMigration('bootstrap-monitoring-dashboards', ctx);
   console.log('upgrade.migration.recover_monitoring_dashboards: complete');
 });
+
+registerMigration('refresh-monitoring-host-metadata', async (ctx) => {
+  const stack = await fetchStackSnapshot(ctx);
+  const stackType = String(stack.stack_type || '').trim();
+  if (!isMonitoringEligibleStackType(stackType)) {
+    console.log(`upgrade.migration.refresh_monitoring_host_metadata: skipped for stack_type=${stackType || 'unknown'}`);
+    return;
+  }
+
+  console.log('upgrade.migration.refresh_monitoring_host_metadata: rebuilding and redeploying monitoring stack');
+  await executeMigration('build-monitoring-images', ctx);
+  await executeMigration('deploy-monitoring-stack', ctx);
+  await executeMigration('connect-cloudflared-to-monitoring', ctx);
+  await executeMigration('bootstrap-monitoring-dashboards', ctx);
+  console.log('upgrade.migration.refresh_monitoring_host_metadata: complete');
+});
