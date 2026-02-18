@@ -1,10 +1,18 @@
 {
-  "version": "0.4.8",
+  "version": "0.4.9",
   "date": "2026-02-18",
-  "summary": "Harden deploy resiliency and CI validation, and move changelog artifacts to single-version release format",
+  "summary": "Recover automatically when local registry manifests go missing during Magento image builds",
   "requires": {
     "cloud-swarm": ">=1.0.3",
     "mz-control": ">=1.0.7"
   },
-  "changes": []
+  "changes": [
+    {
+      "id": "recover-missing-registry-manifest",
+      "description": "Detect missing local registry manifests during build-magento retries and rebuild base service images automatically before retrying.",
+      "phase": "pre_migrate",
+      "downtimeMinutes": 0,
+      "scope": "environment"
+    }
+  ]
 }
