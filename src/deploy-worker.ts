@@ -157,6 +157,13 @@ const DEPLOY_ABORT_MIN_FREE_GB = Number(process.env.MZ_DEPLOY_ABORT_MIN_FREE_GB 
 const DEPLOY_BUILD_RETRIES = Math.max(0, Number(process.env.MZ_DEPLOY_BUILD_RETRIES || 1));
 const DEPLOY_SKIP_SERVICE_BUILD_IF_PRESENT = (process.env.MZ_DEPLOY_SKIP_SERVICE_BUILD_IF_PRESENT || '1') !== '0';
 const DEPLOY_SKIP_APP_BUILD_IF_PRESENT = (process.env.MZ_DEPLOY_SKIP_APP_BUILD_IF_PRESENT || '1') !== '0';
+const setupDbStatusTimeoutParsed = Number(process.env.MZ_SETUP_DB_STATUS_TIMEOUT_SECONDS || 120);
+const SETUP_DB_STATUS_TIMEOUT_SECONDS = Math.max(
+  30,
+  Number.isFinite(setupDbStatusTimeoutParsed) && setupDbStatusTimeoutParsed > 0
+    ? Math.floor(setupDbStatusTimeoutParsed)
+    : 120
+);
 const REGISTRY_GC_ENABLED = (process.env.MZ_REGISTRY_GC_ENABLED || '0') === '1';
 const REGISTRY_GC_SCRIPT = process.env.MZ_REGISTRY_GC_SCRIPT
   || path.join(process.env.MZ_CLOUD_SWARM_DIR || '/opt/mage-zero/cloud-swarm', 'scripts/registry-gc.sh');
@@ -3978,10 +3985,17 @@ async function runSetupDbStatus(
   stackName: string,
   log: (message: string) => void,
 ): Promise<{ needed: boolean; exitCode: number; output: string; containerId: string }> {
+  const setupDbStatusCommand = [
+    'if command -v timeout >/dev/null 2>&1; then',
+    `timeout ${SETUP_DB_STATUS_TIMEOUT_SECONDS} php bin/magento setup:db:status;`,
+    'else',
+    'php bin/magento setup:db:status;',
+    'fi',
+  ].join(' ');
   let currentId = containerId;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     currentId = await ensureMagentoEnvWrapperWithRetry(currentId, stackName, log);
-    const result = await runMagentoCommandWithStatus(currentId, stackName, 'php bin/magento setup:db:status');
+    const result = await runMagentoCommandWithStatus(currentId, stackName, setupDbStatusCommand);
     const output = (result.stderr || result.stdout || '').trim();
     const outputLower = output.toLowerCase();
     const exitCode = result.code;
@@ -4017,6 +4031,10 @@ async function runSetupDbStatus(
     const transientFailure = !output
       || output.includes('No such container')
       || output.includes('is not running')
+      || exitCode === 124
+      || outputLower.includes('timed out')
+      || outputLower.includes('terminated')
+      || outputLower.includes('killed')
       || outputLower.includes('connection refused')
       || outputLower.includes('connection to redis')
       || outputLower.includes('sqlstate[hy000] [2002]')
