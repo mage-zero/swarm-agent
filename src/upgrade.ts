@@ -697,6 +697,13 @@ function computeUpgradeDowntimeMinutes(
  * Main upgrade check loop. Runs every 60s on manager only.
  */
 async function checkUpgrades(): Promise<void> {
+  if (upgradeCheckRunning) {
+    console.log('upgrade.check: previous run still in progress; skipping');
+    return;
+  }
+
+  upgradeCheckRunning = true;
+  try {
   const config = readConfig();
   const state = readUpgradeState();
   state.last_check_at = new Date().toISOString();
@@ -917,6 +924,9 @@ async function checkUpgrades(): Promise<void> {
   clearUpgradeBlocked(state);
   clearUpgradeError(state);
   writeUpgradeState(state);
+  } finally {
+    upgradeCheckRunning = false;
+  }
 }
 
 /**
@@ -949,6 +959,7 @@ function readCurrentChangelog(): ChangelogVersion[] {
 }
 
 let upgradeTimer: ReturnType<typeof setInterval> | null = null;
+let upgradeCheckRunning = false;
 
 /**
  * Start the upgrade scheduler. Runs every 60s on manager only.
