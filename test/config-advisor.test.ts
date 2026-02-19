@@ -141,4 +141,75 @@ describe('config advisor', () => {
     expect(admin?.changes['php.memory_limit']).toBe(384 * MIB);
     expect(admin?.changes['fpm.pm.max_children']).toBe(12);
   });
+
+  it('applies php clamp boundaries for very small and very large memory limits', () => {
+    const inspection: PlannerInspectionPayload = {
+      generated_at: '2026-02-19T00:00:00.000Z',
+      services: [],
+    };
+    const resources: PlannerResources = {
+      services: {
+        'php-fpm': {
+          limits: { cpu_cores: 1, memory_bytes: 300 * MIB },
+          reservations: { cpu_cores: 0.5, memory_bytes: 128 * MIB },
+        },
+        'php-fpm-admin': {
+          limits: { cpu_cores: 2, memory_bytes: 80 * GIB },
+          reservations: { cpu_cores: 1, memory_bytes: 2 * GIB },
+        },
+      },
+    };
+
+    const changes = buildConfigChanges(inspection, resources);
+    const php = changes.find((entry) => entry.service === 'php-fpm');
+    const phpAdmin = changes.find((entry) => entry.service === 'php-fpm-admin');
+
+    expect(php).toBeTruthy();
+    expect(phpAdmin).toBeTruthy();
+
+    expect(php?.changes['fpm.pm.max_children']).toBe(2);
+    expect(php?.changes['php.memory_limit']).toBe(256 * MIB);
+    expect(php?.changes['opcache.memory_consumption']).toBe(128 * MIB);
+    expect(php?.changes['opcache.max_accelerated_files']).toBe(60000);
+    expect(php?.changes['fpm.pm.start_servers']).toBe(2);
+    expect(php?.changes['fpm.pm.min_spare_servers']).toBe(1);
+    expect(php?.changes['fpm.pm.max_spare_servers']).toBe(2);
+
+    expect(phpAdmin?.changes['fpm.pm.max_children']).toBe(32);
+    expect(phpAdmin?.changes['php.memory_limit']).toBe(1024 * MIB);
+    expect(phpAdmin?.changes['opcache.memory_consumption']).toBe(1024 * MIB);
+    expect(phpAdmin?.changes['opcache.interned_strings_buffer']).toBe(64 * MIB);
+    expect(phpAdmin?.changes['opcache.max_accelerated_files']).toBe(100000);
+  });
+
+  it('applies database query-cache thresholds and max_connections clamp', () => {
+    const inspection: PlannerInspectionPayload = {
+      generated_at: '2026-02-19T00:00:00.000Z',
+      services: [],
+    };
+    const resources: PlannerResources = {
+      services: {
+        database: {
+          limits: { cpu_cores: 2, memory_bytes: GIB },
+          reservations: { cpu_cores: 1, memory_bytes: 512 * MIB },
+        },
+        'database-replica': {
+          limits: { cpu_cores: 2, memory_bytes: 20 * GIB },
+          reservations: { cpu_cores: 1, memory_bytes: 2 * GIB },
+        },
+      },
+    };
+
+    const changes = buildConfigChanges(inspection, resources);
+    const primary = changes.find((entry) => entry.service === 'database');
+    const replica = changes.find((entry) => entry.service === 'database-replica');
+
+    expect(primary).toBeTruthy();
+    expect(replica).toBeTruthy();
+
+    expect(primary?.changes['query_cache_size']).toBe(32 * MIB);
+    expect(primary?.changes['max_connections']).toBe(150);
+    expect(replica?.changes['query_cache_size']).toBe(64 * MIB);
+    expect(replica?.changes['max_connections']).toBe(600);
+  });
 });

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { enforceCommandPolicy } from '../src/command-policy.js';
 
 describe('command policy', () => {
@@ -46,9 +46,28 @@ describe('command policy', () => {
     expect(() => enforceCommandPolicy('python', ['-c', 'print(1)'], { source: 'test' })).toThrow(/not allowlisted/i);
   });
 
+  it('does not enforce command checks when mode is off', () => {
+    process.env.MZ_COMMAND_POLICY_MODE = 'off';
+    expect(() => enforceCommandPolicy('python', ['-c', 'print(1)'], { source: 'test' })).not.toThrow();
+  });
+
+  it('warns instead of throwing when mode is audit', () => {
+    process.env.MZ_COMMAND_POLICY_MODE = 'audit';
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(() => enforceCommandPolicy('python', ['-c', 'print(1)'], { source: 'test' })).not.toThrow();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0]?.[0] || '')).toMatch(/command policy violation/i);
+  });
+
   it('blocks bash -lc', () => {
     process.env.MZ_COMMAND_POLICY_MODE = 'enforce';
     expect(() => enforceCommandPolicy('bash', ['-lc', 'echo hi'], { source: 'test' })).toThrow(/bash -lc/i);
+  });
+
+  it('blocks curl payload flags that can mutate state', () => {
+    process.env.MZ_COMMAND_POLICY_MODE = 'enforce';
+    expect(() => enforceCommandPolicy('curl', ['-d', 'k=v', 'https://example.test'], { source: 'test' })).toThrow(/not allowlisted/i);
+    expect(() => enforceCommandPolicy('curl', ['--data', 'k=v', 'https://example.test'], { source: 'test' })).toThrow(/not allowlisted/i);
   });
 
   it('allows deploy bash scripts with expected args', () => {

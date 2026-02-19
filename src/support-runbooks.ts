@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
 import { buildNodeHeaders, buildSignature } from './node-hmac.js';
-import { readConfig } from './status.js';
+import { approveTuningProfile, buildPlannerPayload, readConfig } from './status.js';
 import { getDeployPauseFilePath, isDeployPaused, readDeployPausedAt, setDeployPaused } from './deploy-pause.js';
 import { runCommand, runCommandToFile } from './exec.js';
 import { getDbBackupZstdLevel } from './backup-utils.js';
@@ -245,6 +245,27 @@ const RUNBOOKS: RunbookDefinition[] = [
     description: 'Show disk usage and Docker storage usage on the node.',
     safe: true,
     supports_remediation: false,
+  },
+  {
+    id: 'swarm_capacity_summary',
+    name: 'Swarm capacity summary',
+    description: 'Inspect Swarm node resource capacity and task placement errors for the environment.',
+    safe: true,
+    supports_remediation: false,
+  },
+  {
+    id: 'swarm_tuning_profile_summary',
+    name: 'Swarm tuning profile summary',
+    description: 'Propose a tuning profile from planner data that can be approved for deploys or applied immediately.',
+    safe: true,
+    supports_remediation: false,
+  },
+  {
+    id: 'swarm_tuning_profile_apply',
+    name: 'Apply swarm tuning profile',
+    description: 'Approve a tuning profile and optionally apply resource changes to live environment services.',
+    safe: false,
+    supports_remediation: true,
   },
   {
     id: 'db_replication_status',
@@ -1001,6 +1022,57 @@ function buildDbProbeScript(environmentId: number) {
   ].join(' && ');
 }
 
+type SwarmNodeCapacity = {
+  id: string;
+  hostname: string;
+  labels: Record<string, string>;
+  availability: string;
+  status: string;
+  role: string;
+  manager_status: string;
+  resources: {
+    nano_cpus: number | null;
+    memory_bytes: number | null;
+    cpu_cores: number | null;
+    memory_gb: number | null;
+  };
+};
+
+function parseNodeResourceStats(raw: string): SwarmNodeCapacity['resources'] {
+  let nanoCpus: number | null = null;
+  let memoryBytes: number | null = null;
+  try {
+    const parsed = JSON.parse(String(raw || '').trim() || '{}') as Record<string, unknown>;
+    const nano = Number(parsed.NanoCPUs ?? parsed.nano_cpus ?? 0);
+    const memory = Number(parsed.MemoryBytes ?? parsed.memory_bytes ?? 0);
+    if (Number.isFinite(nano) && nano > 0) nanoCpus = nano;
+    if (Number.isFinite(memory) && memory > 0) memoryBytes = memory;
+  } catch {
+    nanoCpus = null;
+    memoryBytes = null;
+  }
+  const cpuCores = nanoCpus !== null ? Math.round((nanoCpus / 1_000_000_000) * 100) / 100 : null;
+  const memoryGb = memoryBytes !== null ? Math.round((memoryBytes / (1024 ** 3)) * 100) / 100 : null;
+  return {
+    nano_cpus: nanoCpus,
+    memory_bytes: memoryBytes,
+    cpu_cores: cpuCores,
+    memory_gb: memoryGb,
+  };
+}
+
+function hasCapacityPlacementSignal(value: string): boolean {
+  const lower = String(value || '').toLowerCase();
+  if (!lower) return false;
+  return (
+    lower.includes('insufficient resources')
+    || lower.includes('no suitable node')
+    || lower.includes('insufficient memory')
+    || lower.includes('insufficient cpu')
+    || lower.includes('out of memory')
+  );
+}
+
 async function getNodeLabels(): Promise<Array<{ id: string; hostname: string; labels: Record<string, string>; availability: string; status: string; role: string }>> {
   const ls = await runCommand('docker', ['node', 'ls', '--format', '{{.ID}}|{{.Hostname}}|{{.Status}}|{{.Availability}}|{{.ManagerStatus}}'], 12_000);
   if (ls.code !== 0) return [];
@@ -1020,6 +1092,50 @@ async function getNodeLabels(): Promise<Array<{ id: string; hostname: string; la
       labels = {};
     }
     out.push({ ...node, labels });
+  }
+  return out;
+}
+
+async function getSwarmNodeCapacities(): Promise<SwarmNodeCapacity[]> {
+  const ls = await runCommand('docker', ['node', 'ls', '--format', '{{.ID}}|{{.Hostname}}|{{.Status}}|{{.Availability}}|{{.ManagerStatus}}'], 12_000);
+  if (ls.code !== 0) return [];
+  const nodes = ls.stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [id, hostname, status, availability, managerStatus] = line.split('|');
+      const managerState = (managerStatus || '').trim();
+      const role = managerState !== '' ? 'manager' : 'worker';
+      return {
+        id: (id || '').trim(),
+        hostname: (hostname || '').trim(),
+        status: (status || '').trim(),
+        availability: (availability || '').trim(),
+        manager_status: managerState,
+        role,
+      };
+    })
+    .filter((node) => node.id && node.hostname);
+
+  const out: SwarmNodeCapacity[] = [];
+  for (const node of nodes) {
+    const labelsInspect = await runCommand('docker', ['node', 'inspect', node.id, '--format', '{{json .Spec.Labels}}'], 12_000);
+    const resourcesInspect = await runCommand('docker', ['node', 'inspect', node.id, '--format', '{{json .Description.Resources}}'], 12_000);
+
+    let labels: Record<string, string> = {};
+    try {
+      const parsed = JSON.parse(labelsInspect.stdout.trim() || '{}') as Record<string, string>;
+      if (parsed && typeof parsed === 'object') labels = parsed;
+    } catch {
+      labels = {};
+    }
+
+    out.push({
+      ...node,
+      labels,
+      resources: parseNodeResourceStats(resourcesInspect.stdout),
+    });
   }
   return out;
 }
@@ -1885,6 +2001,12 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
   switch (runbookId) {
     case 'disk_usage_summary':
       return runDiskUsageSummary();
+    case 'swarm_capacity_summary':
+      return runSwarmCapacitySummary(environmentId);
+    case 'swarm_tuning_profile_summary':
+      return runSwarmTuningProfileSummary(environmentId);
+    case 'swarm_tuning_profile_apply':
+      return runSwarmTuningProfileApply(environmentId, input);
     case 'db_replication_status':
       return runDbReplicationStatus(environmentId);
     case 'db_replica_enable':
@@ -2544,6 +2666,531 @@ async function runDiskUsageSummary(): Promise<RunbookResult> {
     data: {
       df: dfOut,
       docker_system_df: dockerOut,
+    },
+  };
+}
+
+async function runSwarmCapacitySummary(environmentId: number): Promise<RunbookResult> {
+  const nodes = await getSwarmNodeCapacities();
+  const services = await listEnvironmentServices(environmentId);
+
+  const taskIssues: string[] = [];
+  let capacityIssueCount = 0;
+
+  for (const service of services) {
+    const tasks = await listServiceTasks(service.name);
+    for (const task of tasks) {
+      const state = String(task.current_state || '').trim();
+      const error = String(task.error || '').trim();
+      const stateLower = state.toLowerCase();
+      const relevantState = stateLower.startsWith('pending') || stateLower.startsWith('rejected') || stateLower.startsWith('failed');
+      const capacitySignal = hasCapacityPlacementSignal(`${state} ${error}`);
+      if (!relevantState && !capacitySignal) {
+        continue;
+      }
+      if (capacitySignal) {
+        capacityIssueCount += 1;
+      }
+      if (taskIssues.length < 25) {
+        const suffix = error ? ` (${error})` : '';
+        taskIssues.push(`${service.name}: ${task.name} on ${task.node || '(unknown node)'}: ${state}${suffix}`);
+      }
+    }
+  }
+
+  const diskSummary = await runDiskUsageSummary();
+  const managerUsageLine = String((diskSummary.data?.df as string || '').split('\n').slice(-1)[0] || '').trim();
+
+  const observations: string[] = [
+    `Nodes inspected: ${nodes.length}`,
+    ...nodes.map((node) => {
+      const cpuText = node.resources.cpu_cores !== null ? `${node.resources.cpu_cores} cores` : 'unknown CPU';
+      const memoryText = node.resources.memory_gb !== null ? `${node.resources.memory_gb} GB` : 'unknown memory';
+      const managerText = node.manager_status ? ` manager=${node.manager_status}` : '';
+      return `${node.hostname} (${node.role}) status=${node.status}/${node.availability} resources=${cpuText}, ${memoryText}${managerText}`;
+    }),
+    capacityIssueCount > 0
+      ? `Capacity-related task issues: ${capacityIssueCount}`
+      : 'No capacity-related task issues detected.',
+    managerUsageLine ? `Manager root filesystem: ${managerUsageLine}` : 'Manager root filesystem usage unavailable.',
+  ];
+
+  const status: RunbookResult['status'] = capacityIssueCount > 0
+    ? 'warning'
+    : nodes.length === 0
+      ? 'failed'
+      : 'ok';
+
+  return {
+    runbook_id: 'swarm_capacity_summary',
+    status,
+    summary: capacityIssueCount > 0
+      ? 'Detected task placement failures consistent with capacity pressure.'
+      : 'No capacity placement failures detected from current task state.',
+    observations,
+    data: {
+      environment_id: environmentId,
+      nodes,
+      capacity_issue_count: capacityIssueCount,
+      task_issues: taskIssues,
+      manager_disk: diskSummary.data || {},
+    },
+  };
+}
+
+type TuningProfileType = 'tuning' | 'capacity_change';
+
+type TuningResourceSpec = {
+  limits: { cpu_cores: number; memory_bytes: number };
+  reservations: { cpu_cores: number; memory_bytes: number };
+};
+
+type TuningServiceApplyResult = {
+  service: string;
+  service_name: string;
+  status: 'updated' | 'skipped' | 'failed';
+  detail: string;
+  update_state?: string;
+  update_message?: string;
+};
+
+function normalizeProfileType(value: unknown): TuningProfileType {
+  const lower = String(value || '').trim().toLowerCase();
+  if (lower === 'capacity_change') {
+    return 'capacity_change';
+  }
+  return 'tuning';
+}
+
+function parseBooleanInput(value: unknown, fallback: boolean): boolean {
+  if (typeof value === 'boolean') return value;
+  const lower = String(value || '').trim().toLowerCase();
+  if (!lower) return fallback;
+  if (['1', 'true', 'yes', 'y', 'on'].includes(lower)) return true;
+  if (['0', 'false', 'no', 'n', 'off'].includes(lower)) return false;
+  return fallback;
+}
+
+function formatCpuCoresForServiceUpdate(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`invalid_cpu_cores:${value}`);
+  }
+  const normalized = Math.round(value * 100) / 100;
+  return String(normalized);
+}
+
+function formatMemoryBytesForServiceUpdate(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    throw new Error(`invalid_memory_bytes:${bytes}`);
+  }
+  const MIB = 1024 * 1024;
+  const GIB = 1024 * MIB;
+  if (bytes % GIB === 0) {
+    return `${bytes / GIB}G`;
+  }
+  if (bytes % MIB === 0) {
+    return `${bytes / MIB}M`;
+  }
+  return String(Math.round(bytes));
+}
+
+function toTuningResourceSpec(value: unknown): TuningResourceSpec | null {
+  if (!value || typeof value !== 'object') return null;
+  const limits = (value as Record<string, unknown>).limits as Record<string, unknown> | undefined;
+  const reservations = (value as Record<string, unknown>).reservations as Record<string, unknown> | undefined;
+  const limitCpu = Number(limits?.cpu_cores ?? 0);
+  const limitMem = Number(limits?.memory_bytes ?? 0);
+  const reserveCpu = Number(reservations?.cpu_cores ?? 0);
+  const reserveMem = Number(reservations?.memory_bytes ?? 0);
+  if (!Number.isFinite(limitCpu) || limitCpu <= 0) return null;
+  if (!Number.isFinite(limitMem) || limitMem <= 0) return null;
+  if (!Number.isFinite(reserveCpu) || reserveCpu <= 0) return null;
+  if (!Number.isFinite(reserveMem) || reserveMem <= 0) return null;
+  return {
+    limits: {
+      cpu_cores: limitCpu,
+      memory_bytes: Math.round(limitMem),
+    },
+    reservations: {
+      cpu_cores: reserveCpu,
+      memory_bytes: Math.round(reserveMem),
+    },
+  };
+}
+
+function summarizePlannerProfile(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object') return null;
+  const profile = value as Record<string, unknown>;
+  const resources = (profile.resources && typeof profile.resources === 'object')
+    ? (profile.resources as Record<string, unknown>)
+    : null;
+  const services = (resources?.services && typeof resources.services === 'object')
+    ? (resources.services as Record<string, unknown>)
+    : {};
+  const adjustments = (profile.adjustments && typeof profile.adjustments === 'object')
+    ? (profile.adjustments as Record<string, unknown>)
+    : {};
+  return {
+    id: String(profile.id || ''),
+    status: String(profile.status || ''),
+    strategy: String(profile.strategy || ''),
+    summary: String(profile.summary || ''),
+    confidence: Number(profile.confidence || 0) || 0,
+    updated_at: String(profile.updated_at || profile.created_at || ''),
+    service_count: Object.keys(services).length,
+    adjustment_count: Object.keys(adjustments).length,
+  };
+}
+
+function summarizeCapacityChangeProfile(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object') return null;
+  const profile = value as Record<string, unknown>;
+  return {
+    id: String(profile.id || ''),
+    status: String(profile.status || ''),
+    strategy: String(profile.strategy || ''),
+    change: String(profile.change || ''),
+    summary: String(profile.summary || ''),
+    ready: Boolean(profile.ready),
+    updated_at: String(profile.updated_at || profile.created_at || ''),
+  };
+}
+
+function buildSuggestedApplyInputFromPlanner(planner: Record<string, unknown>): Record<string, unknown> | null {
+  const tuning = (planner.tuning && typeof planner.tuning === 'object')
+    ? (planner.tuning as Record<string, unknown>)
+    : {};
+  const incremental = (tuning.incremental_profile && typeof tuning.incremental_profile === 'object')
+    ? (tuning.incremental_profile as Record<string, unknown>)
+    : null;
+  const recommended = (tuning.recommended_profile && typeof tuning.recommended_profile === 'object')
+    ? (tuning.recommended_profile as Record<string, unknown>)
+    : null;
+
+  const incrementalId = String(incremental?.id || '').trim();
+  if (incrementalId) {
+    return { profile_type: 'tuning', profile_id: incrementalId, apply_now: true };
+  }
+  const recommendedId = String(recommended?.id || '').trim();
+  if (recommendedId) {
+    return { profile_type: 'tuning', profile_id: recommendedId, apply_now: true };
+  }
+
+  const capacityChange = (planner.capacity_change && typeof planner.capacity_change === 'object')
+    ? (planner.capacity_change as Record<string, unknown>)
+    : {};
+  const capacityRecommended = (capacityChange.recommended_profile && typeof capacityChange.recommended_profile === 'object')
+    ? (capacityChange.recommended_profile as Record<string, unknown>)
+    : null;
+  const capacityReady = Boolean(capacityRecommended?.ready);
+  const capacityId = String(capacityRecommended?.id || '').trim();
+  if (capacityId && capacityReady) {
+    return { profile_type: 'capacity_change', profile_id: capacityId, apply_now: false };
+  }
+  return null;
+}
+
+async function applyTuningResourcesToEnvironment(
+  environmentId: number,
+  resourcesByService: Record<string, unknown>,
+): Promise<{
+  updated: number;
+  skipped: number;
+  failed: number;
+  results: TuningServiceApplyResult[];
+}> {
+  const services = await listEnvironmentServices(environmentId);
+  const serviceNames = new Set(services.map((service) => service.name));
+  const results: TuningServiceApplyResult[] = [];
+  let updated = 0;
+  let skipped = 0;
+  let failed = 0;
+
+  for (const [service, rawSpec] of Object.entries(resourcesByService || {})) {
+    const serviceName = envServiceName(environmentId, service);
+    const spec = toTuningResourceSpec(rawSpec);
+    if (!spec) {
+      skipped += 1;
+      results.push({
+        service,
+        service_name: serviceName,
+        status: 'skipped',
+        detail: 'Skipped: invalid or missing resource spec.',
+      });
+      continue;
+    }
+    if (!serviceNames.has(serviceName)) {
+      skipped += 1;
+      results.push({
+        service,
+        service_name: serviceName,
+        status: 'skipped',
+        detail: 'Skipped: service is not present in this environment.',
+      });
+      continue;
+    }
+
+    const args = [
+      'service',
+      'update',
+      '--limit-cpu',
+      formatCpuCoresForServiceUpdate(spec.limits.cpu_cores),
+      '--limit-memory',
+      formatMemoryBytesForServiceUpdate(spec.limits.memory_bytes),
+      '--reserve-cpu',
+      formatCpuCoresForServiceUpdate(spec.reservations.cpu_cores),
+      '--reserve-memory',
+      formatMemoryBytesForServiceUpdate(spec.reservations.memory_bytes),
+      serviceName,
+    ];
+    const updatedResult = await runCommand('docker', args, 45_000);
+    if (updatedResult.code !== 0) {
+      failed += 1;
+      results.push({
+        service,
+        service_name: serviceName,
+        status: 'failed',
+        detail: updatedResult.stderr.trim() || updatedResult.stdout.trim() || 'docker service update failed',
+      });
+      continue;
+    }
+
+    updated += 1;
+    const updateState = await inspectServiceUpdateStatus(serviceName);
+    results.push({
+      service,
+      service_name: serviceName,
+      status: 'updated',
+      detail: 'Service resource update triggered.',
+      update_state: updateState?.state || '',
+      update_message: updateState?.message || '',
+    });
+  }
+
+  return { updated, skipped, failed, results };
+}
+
+async function runSwarmTuningProfileSummary(environmentId: number): Promise<RunbookResult> {
+  let planner: Record<string, unknown>;
+  try {
+    planner = await buildPlannerPayload() as unknown as Record<string, unknown>;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      runbook_id: 'swarm_tuning_profile_summary',
+      status: 'failed',
+      summary: 'Unable to build planner payload for tuning recommendations.',
+      observations: [message || 'Planner payload generation failed.'],
+      data: { environment_id: environmentId },
+    };
+  }
+
+  const tuning = (planner.tuning && typeof planner.tuning === 'object')
+    ? (planner.tuning as Record<string, unknown>)
+    : {};
+  const capacityChange = (planner.capacity_change && typeof planner.capacity_change === 'object')
+    ? (planner.capacity_change as Record<string, unknown>)
+    : {};
+
+  const activeProfileId = String(tuning.active_profile_id || '').trim();
+  const baseProfile = summarizePlannerProfile(tuning.base_profile);
+  const recommendedProfile = summarizePlannerProfile(tuning.recommended_profile);
+  const incrementalProfile = summarizePlannerProfile(tuning.incremental_profile);
+  const capacityRecommended = summarizeCapacityChangeProfile(capacityChange.recommended_profile);
+  const suggestedApplyInput = buildSuggestedApplyInputFromPlanner(planner);
+
+  const observations: string[] = [
+    activeProfileId
+      ? `Active tuning profile: ${activeProfileId}`
+      : 'Active tuning profile: base',
+    recommendedProfile
+      ? `Recommended tuning profile: ${String(recommendedProfile.id || '')} (${String(recommendedProfile.summary || 'no summary')})`
+      : 'No recommended tuning profile currently available.',
+    incrementalProfile
+      ? `Incremental tuning profile: ${String(incrementalProfile.id || '')} (${String(incrementalProfile.summary || 'no summary')})`
+      : 'No incremental tuning profile currently available.',
+    capacityRecommended
+      ? `Capacity change recommendation: ${String(capacityRecommended.id || '')} (${String(capacityRecommended.summary || 'no summary')})`
+      : 'No capacity change recommendation currently available.',
+    suggestedApplyInput
+      ? `Suggested apply input: ${JSON.stringify(suggestedApplyInput)}`
+      : 'No apply-ready profile suggestion at this time.',
+  ];
+
+  return {
+    runbook_id: 'swarm_tuning_profile_summary',
+    status: suggestedApplyInput ? 'warning' : 'ok',
+    summary: suggestedApplyInput
+      ? 'Tuning/capacity profile proposal available for approval and apply.'
+      : 'No apply-ready tuning or capacity-change profile currently available.',
+    observations,
+    data: {
+      environment_id: environmentId,
+      tuning: {
+        active_profile_id: activeProfileId || String(baseProfile?.id || 'base'),
+        base_profile: baseProfile,
+        recommended_profile: recommendedProfile,
+        incremental_profile: incrementalProfile,
+      },
+      capacity_change: {
+        recommended_profile: capacityRecommended,
+      },
+      suggested_apply_input: suggestedApplyInput,
+    },
+  };
+}
+
+async function runSwarmTuningProfileApply(environmentId: number, input: Record<string, unknown>): Promise<RunbookResult> {
+  const rawType = String(input.profile_type || '').trim().toLowerCase();
+  const explicitType = rawType === 'tuning' || rawType === 'capacity_change';
+  let profileType: TuningProfileType = normalizeProfileType(rawType);
+  let profileId = String(input.profile_id || '').trim();
+
+  let suggestedInput: Record<string, unknown> | null = null;
+  if (!profileId) {
+    try {
+      const planner = await buildPlannerPayload() as unknown as Record<string, unknown>;
+      suggestedInput = buildSuggestedApplyInputFromPlanner(planner);
+      if (!explicitType && suggestedInput?.profile_type) {
+        profileType = normalizeProfileType(suggestedInput.profile_type);
+      }
+      if (suggestedInput && (!explicitType || normalizeProfileType(suggestedInput.profile_type) === profileType)) {
+        profileId = String(suggestedInput.profile_id || '').trim();
+      }
+    } catch {
+      // Ignore planner errors here; we'll fail with missing profile_id below.
+    }
+  }
+
+  if (!profileId) {
+    return {
+      runbook_id: 'swarm_tuning_profile_apply',
+      status: 'failed',
+      summary: 'Missing profile_id and no apply-ready profile was found.',
+      observations: [
+        'Run swarm_tuning_profile_summary first to get suggested_apply_input.',
+      ],
+      data: {
+        environment_id: environmentId,
+        profile_type: profileType,
+        suggested_apply_input: suggestedInput,
+      },
+    };
+  }
+
+  const applyNowDefault = profileType === 'tuning';
+  const applyNow = parseBooleanInput(input.apply_now, applyNowDefault);
+  const approval = approveTuningProfile(profileId, profileType);
+  if (approval.status !== 200) {
+    const detail = JSON.stringify(approval.body || {});
+    return {
+      runbook_id: 'swarm_tuning_profile_apply',
+      status: approval.status === 409 ? 'warning' : 'failed',
+      summary: `Unable to approve ${profileType} profile ${profileId}.`,
+      observations: [
+        `Approval status: ${approval.status}`,
+        detail,
+      ],
+      data: {
+        environment_id: environmentId,
+        profile_type: profileType,
+        profile_id: profileId,
+        approval: approval.body,
+      },
+    };
+  }
+
+  if (profileType === 'capacity_change') {
+    return {
+      runbook_id: 'swarm_tuning_profile_apply',
+      status: 'ok',
+      summary: `Approved capacity change profile ${profileId}.`,
+      observations: [
+        'Capacity change approval was recorded.',
+        'Capacity change execution (node add/remove) is handled by provisioning workflows.',
+      ],
+      data: {
+        environment_id: environmentId,
+        profile_type: profileType,
+        profile_id: profileId,
+        apply_now: false,
+        approval: approval.body,
+      },
+      remediation: {
+        attempted: true,
+        actions: [`Approved capacity_change profile ${profileId}`],
+      },
+    };
+  }
+
+  if (!applyNow) {
+    return {
+      runbook_id: 'swarm_tuning_profile_apply',
+      status: 'ok',
+      summary: `Approved tuning profile ${profileId}.`,
+      observations: [
+        'Profile approved and set as active for subsequent deploys.',
+        'apply_now=false: no live service updates were executed.',
+      ],
+      data: {
+        environment_id: environmentId,
+        profile_type: profileType,
+        profile_id: profileId,
+        apply_now: false,
+        approval: approval.body,
+      },
+      remediation: {
+        attempted: true,
+        actions: [`Approved tuning profile ${profileId}`],
+      },
+    };
+  }
+
+  const approvedProfile = (approval.body.approved_profile && typeof approval.body.approved_profile === 'object')
+    ? (approval.body.approved_profile as Record<string, unknown>)
+    : {};
+  const approvedResources = (approvedProfile.resources && typeof approvedProfile.resources === 'object')
+    ? (approvedProfile.resources as Record<string, unknown>)
+    : {};
+  const resourcesByService = (approvedResources.services && typeof approvedResources.services === 'object')
+    ? (approvedResources.services as Record<string, unknown>)
+    : {};
+
+  const applyResult = await applyTuningResourcesToEnvironment(environmentId, resourcesByService);
+  const status: RunbookResult['status'] = applyResult.failed > 0
+    ? (applyResult.updated > 0 ? 'warning' : 'failed')
+    : (applyResult.updated > 0 ? 'ok' : 'warning');
+
+  const observations: string[] = [
+    `Services updated: ${applyResult.updated}`,
+    `Services skipped: ${applyResult.skipped}`,
+    `Services failed: ${applyResult.failed}`,
+    ...applyResult.results.slice(0, 30).map((entry) => {
+      const statePart = entry.update_state ? ` update=${entry.update_state}` : '';
+      const msgPart = entry.update_message ? ` (${entry.update_message})` : '';
+      return `${entry.service_name}: ${entry.status}${statePart} - ${entry.detail}${msgPart}`;
+    }),
+  ];
+
+  return {
+    runbook_id: 'swarm_tuning_profile_apply',
+    status,
+    summary: `Approved tuning profile ${profileId} and applied live service updates.`,
+    observations,
+    data: {
+      environment_id: environmentId,
+      profile_type: profileType,
+      profile_id: profileId,
+      apply_now: true,
+      approval: approval.body,
+      apply_result: applyResult,
+    },
+    remediation: {
+      attempted: true,
+      actions: [
+        `Approved tuning profile ${profileId}`,
+        `Applied resource updates to ${applyResult.updated} services`,
+      ],
     },
   };
 }
@@ -4303,5 +4950,9 @@ export const __testing = {
   parseDbReplicationProbe,
   buildDbProbeScript,
   parseProxySqlHostgroups,
+  parseNodeResourceStats,
+  hasCapacityPlacementSignal,
+  normalizeProfileType,
+  buildSuggestedApplyInputFromPlanner,
   pickLatestDeploymentState,
 };

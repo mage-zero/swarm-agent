@@ -130,6 +130,52 @@ describe('tuning helpers', () => {
     expect(incremental.adjustments.app?.source).toBe('incremental');
   });
 
+  it('preserves base-only and recommended-only services in incremental profile blending', () => {
+    const base: PlannerResources = {
+      services: {
+        shared: {
+          limits: { cpu_cores: 1, memory_bytes: 100 * MIB },
+          reservations: { cpu_cores: 0.5, memory_bytes: 50 * MIB },
+        },
+        baseOnly: {
+          limits: { cpu_cores: 0.6, memory_bytes: 200 * MIB },
+          reservations: { cpu_cores: 0.3, memory_bytes: 100 * MIB },
+        },
+      },
+    };
+    const recommended: PlannerTuningProfile = {
+      id: 'recommended',
+      status: 'recommended',
+      strategy: 'deterministic',
+      resources: {
+        services: {
+          shared: {
+            limits: { cpu_cores: 3, memory_bytes: 300 * MIB },
+            reservations: { cpu_cores: 1.5, memory_bytes: 150 * MIB },
+          },
+          recOnly: {
+            limits: { cpu_cores: 0.8, memory_bytes: 256 * MIB },
+            reservations: { cpu_cores: 0.4, memory_bytes: 128 * MIB },
+          },
+        },
+      },
+      adjustments: {},
+      placements: [],
+      created_at: '2026-02-19T00:00:00.000Z',
+      updated_at: '2026-02-19T00:00:00.000Z',
+    };
+
+    const incremental = buildIncrementalProfile(base, recommended, '2026-02-19T01:00:00.000Z');
+    expect(incremental.resources.services.shared.limits.cpu_cores).toBe(2);
+    expect(incremental.resources.services.shared.limits.memory_bytes).toBe(200 * MIB);
+
+    expect(incremental.resources.services.baseOnly).toEqual(base.services.baseOnly);
+    expect(incremental.resources.services.recOnly).toEqual(recommended.resources.services.recOnly);
+    expect(incremental.adjustments.shared?.source).toBe('incremental');
+    expect(incremental.adjustments.baseOnly).toBeUndefined();
+    expect(incremental.adjustments.recOnly).toBeUndefined();
+  });
+
   it('prunes stale approved profiles while keeping undated entries', () => {
     const nowMs = Date.parse('2026-02-17T00:00:00.000Z');
     const kept = pruneApprovedProfiles(
@@ -169,6 +215,37 @@ describe('tuning helpers', () => {
     );
 
     expect(kept.map((profile) => profile.id).sort()).toEqual(['fresh', 'undated']);
+  });
+
+  it('keeps profiles with invalid timestamps when pruning', () => {
+    const nowMs = Date.parse('2026-02-19T00:00:00.000Z');
+    const kept = pruneApprovedProfiles(
+      [
+        {
+          id: 'invalid-date',
+          status: 'approved',
+          strategy: 'x',
+          resources: sampleResources(),
+          adjustments: {},
+          placements: [],
+          created_at: 'still-not-a-date',
+          updated_at: 'not-a-date',
+        },
+        {
+          id: 'stale-valid',
+          status: 'approved',
+          strategy: 'x',
+          resources: sampleResources(),
+          adjustments: {},
+          placements: [],
+          created_at: '2020-01-01T00:00:00.000Z',
+          updated_at: '2020-01-01T00:00:00.000Z',
+        },
+      ],
+      nowMs,
+    );
+
+    expect(kept.map((profile) => profile.id).sort()).toEqual(['invalid-date']);
   });
 
   it('builds placement hints based on reservation footprint and available node memory', () => {

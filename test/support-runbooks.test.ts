@@ -125,6 +125,87 @@ describe('support-runbooks helpers', () => {
     expect(retry?.supports_remediation).toBe(true);
   });
 
+  it('registers swarm_capacity_summary as a safe diagnostic runbook', async () => {
+    const runbooks = await listRunbooks();
+    const capacity = runbooks.find((entry) => entry.id === 'swarm_capacity_summary');
+    expect(capacity).toBeTruthy();
+    expect(capacity?.safe).toBe(true);
+    expect(capacity?.supports_remediation).toBe(false);
+  });
+
+  it('registers swarm tuning runbooks with correct risk flags', async () => {
+    const runbooks = await listRunbooks();
+    const summary = runbooks.find((entry) => entry.id === 'swarm_tuning_profile_summary');
+    const apply = runbooks.find((entry) => entry.id === 'swarm_tuning_profile_apply');
+    expect(summary).toBeTruthy();
+    expect(summary?.safe).toBe(true);
+    expect(summary?.supports_remediation).toBe(false);
+    expect(apply).toBeTruthy();
+    expect(apply?.safe).toBe(false);
+    expect(apply?.supports_remediation).toBe(true);
+  });
+
+  it('parses node resource stats from docker inspect output', () => {
+    expect(__testing.parseNodeResourceStats('{"NanoCPUs":4000000000,"MemoryBytes":8589934592}')).toEqual({
+      nano_cpus: 4000000000,
+      memory_bytes: 8589934592,
+      cpu_cores: 4,
+      memory_gb: 8,
+    });
+    expect(__testing.parseNodeResourceStats('invalid-json')).toEqual({
+      nano_cpus: null,
+      memory_bytes: null,
+      cpu_cores: null,
+      memory_gb: null,
+    });
+  });
+
+  it('detects capacity placement error signals', () => {
+    expect(__testing.hasCapacityPlacementSignal('no suitable node (insufficient resources on 2 nodes)')).toBe(true);
+    expect(__testing.hasCapacityPlacementSignal('insufficient memory')).toBe(true);
+    expect(__testing.hasCapacityPlacementSignal('task failed due to app exit')).toBe(false);
+  });
+
+  it('normalizes profile_type values with tuning fallback', () => {
+    expect(__testing.normalizeProfileType('tuning')).toBe('tuning');
+    expect(__testing.normalizeProfileType('capacity_change')).toBe('capacity_change');
+    expect(__testing.normalizeProfileType('invalid')).toBe('tuning');
+    expect(__testing.normalizeProfileType(undefined)).toBe('tuning');
+  });
+
+  it('builds suggested apply input from planner payload', () => {
+    expect(__testing.buildSuggestedApplyInputFromPlanner({
+      tuning: {
+        recommended_profile: { id: 'recommended-1' },
+        incremental_profile: { id: 'incremental' },
+      },
+      capacity_change: {
+        recommended_profile: { id: 'cap-1', ready: true },
+      },
+    })).toEqual({ profile_type: 'tuning', profile_id: 'incremental', apply_now: true });
+
+    expect(__testing.buildSuggestedApplyInputFromPlanner({
+      tuning: {},
+      capacity_change: {
+        recommended_profile: { id: 'cap-1', ready: true },
+      },
+    })).toEqual({ profile_type: 'capacity_change', profile_id: 'cap-1', apply_now: false });
+
+    expect(__testing.buildSuggestedApplyInputFromPlanner({
+      tuning: {},
+      capacity_change: {
+        recommended_profile: { id: 'cap-2', ready: false },
+      },
+    })).toBeNull();
+
+    expect(__testing.buildSuggestedApplyInputFromPlanner({
+      tuning: {
+        recommended_profile: { id: 'recommended-only' },
+      },
+      capacity_change: {},
+    })).toEqual({ profile_type: 'tuning', profile_id: 'recommended-only', apply_now: true });
+  });
+
   it('selects latest deployment state by timestamp', () => {
     const latest = __testing.pickLatestDeploymentState([
       { state: 'failed', deploymentId: 'a', atMs: 1000, atIso: '2024-01-01T00:00:01Z', record: {}, sourcePath: '/tmp/a.json' },

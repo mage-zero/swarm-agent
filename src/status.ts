@@ -134,6 +134,19 @@ type TuningApprovalRequest = {
   profile_type?: string;
 };
 
+export type TuningApprovalResponse =
+  | { status: 200; body: { approved_profile: Record<string, unknown>; active_profile_id: string } }
+  | { status: 404; body: { error: string } }
+  | {
+    status: 409;
+    body: {
+      error: string;
+      recommended_id?: string;
+      incremental_id?: string;
+      recommended_updated_at?: string;
+    };
+  };
+
 type InspectionHistoryEntry = {
   captured_at: string;
   inspection: PlannerInspectionPayload;
@@ -2752,6 +2765,10 @@ export async function handleTuningApprovalRequest(request: Request) {
     return { status: 400, body: { error: 'Missing profile_id' } } as const;
   }
   const profileType = typeof body?.profile_type === 'string' ? body.profile_type.trim() : 'tuning';
+  return approveTuningProfile(expectedId, profileType);
+}
+
+export function approveTuningProfile(expectedId: string, profileType = 'tuning'): TuningApprovalResponse {
   if (profileType === 'capacity_change') {
     return approveCapacityChangeProfile(expectedId);
   }
