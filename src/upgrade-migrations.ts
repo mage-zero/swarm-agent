@@ -475,11 +475,22 @@ registerMigration('sync-magento-apm-profiler-bootstrap', async (ctx) => {
     }
 
     const envLines = (inspect.stdout || '').split('\n');
-    const apmEnabledLine = envLines.find((line) => line.startsWith('MZ_APM_ENABLED='));
-    const apmEnabledValue = apmEnabledLine ? apmEnabledLine.slice('MZ_APM_ENABLED='.length) : '';
+    const readEnvValue = (key: string): string => {
+      const line = envLines.find((item) => item.startsWith(`${key}=`));
+      return line ? line.slice(key.length + 1) : '';
+    };
+    const apmEnabledValue = readEnvValue('MZ_APM_ENABLED');
     const profilerValue = resolveMageProfilerEnv(
       explicitProfilerValue,
       isEnabledFlag(apmEnabledValue, true) ? '1' : '0',
+      {
+        serverUrl: readEnvValue('MZ_APM_SERVER_URL'),
+        serviceName: readEnvValue('MZ_APM_SERVICE_NAME'),
+        environment: readEnvValue('MZ_APM_ENVIRONMENT'),
+        transactionSampleRate: readEnvValue('MZ_APM_SAMPLE_RATE'),
+        stackTraceLimit: readEnvValue('MZ_APM_STACK_TRACE_LIMIT'),
+        timeout: readEnvValue('MZ_APM_TIMEOUT'),
+      },
     );
 
     const args = profilerValue !== ''

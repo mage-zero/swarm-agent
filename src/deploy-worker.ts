@@ -4383,7 +4383,20 @@ async function processDeployment(recordPath: string) {
     ? envHostname.replace(/^https?:\/\//, '').split('/')[0]?.replace(/\/+$/, '') || ''
     : '';
   const apmEnabledValue = process.env.MZ_APM_ENABLED || '1';
-  const mageProfilerValue = resolveMageProfilerEnv(process.env.MAGE_PROFILER, apmEnabledValue);
+  const apmServerUrlValue = process.env.MZ_APM_SERVER_URL || 'http://mz-monitoring_otel-collector:4318/v1/traces';
+  const apmSampleRateValue = process.env.MZ_APM_SAMPLE_RATE || '1.0';
+  const apmServiceNameValue = process.env.MZ_APM_SERVICE_NAME || `mz-env-${environmentId}`;
+  const apmEnvironmentValue = envTypeRaw || process.env.MZ_APM_ENVIRONMENT || 'production';
+  const apmStackTraceLimitValue = process.env.MZ_APM_STACK_TRACE_LIMIT || '1000';
+  const apmTimeoutValue = process.env.MZ_APM_TIMEOUT || '10';
+  const mageProfilerValue = resolveMageProfilerEnv(process.env.MAGE_PROFILER, apmEnabledValue, {
+    serverUrl: apmServerUrlValue,
+    serviceName: apmServiceNameValue,
+    environment: apmEnvironmentValue,
+    transactionSampleRate: apmSampleRateValue,
+    stackTraceLimit: apmStackTraceLimitValue,
+    timeout: apmTimeoutValue,
+  });
   const mailCatcherEnabled = ['non-production', 'development', 'staging', 'performance'].includes(envTypeRaw);
   const envEligible = envTypeRaw === ''
     ? true
@@ -4470,15 +4483,15 @@ async function processDeployment(recordPath: string) {
     // APM + Magento observability module config (rendered into app/etc/config.php).
     // The profiler now emits OTLP traces to collector HTTP (/v1/traces).
     MZ_APM_ENABLED: apmEnabledValue,
-    MZ_APM_SERVER_URL: process.env.MZ_APM_SERVER_URL || `http://mz-monitoring_otel-collector:4318/v1/traces`,
-    MZ_APM_SAMPLE_RATE: process.env.MZ_APM_SAMPLE_RATE || '1.0',
-    MZ_APM_SERVICE_NAME: `mz-env-${environmentId}`,
-    MZ_APM_ENVIRONMENT: envTypeRaw || 'production',
+    MZ_APM_SERVER_URL: apmServerUrlValue,
+    MZ_APM_SAMPLE_RATE: apmSampleRateValue,
+    MZ_APM_SERVICE_NAME: apmServiceNameValue,
+    MZ_APM_ENVIRONMENT: apmEnvironmentValue,
     MZ_APM_SECRET_TOKEN: process.env.MZ_APM_SECRET_TOKEN || '',
     MZ_APM_SECRET_TOKEN_FILE: process.env.MZ_APM_SECRET_TOKEN_FILE || '',
     MZ_APM_DB_PROFILER_ENABLED: process.env.MZ_APM_DB_PROFILER_ENABLED || '1',
-    MZ_APM_STACK_TRACE_LIMIT: process.env.MZ_APM_STACK_TRACE_LIMIT || '1000',
-    MZ_APM_TIMEOUT: process.env.MZ_APM_TIMEOUT || '10',
+    MZ_APM_STACK_TRACE_LIMIT: apmStackTraceLimitValue,
+    MZ_APM_TIMEOUT: apmTimeoutValue,
     // Magento profiler bootstrap toggle. Required for request-level APM traces.
     MAGE_PROFILER: mageProfilerValue,
     MZ_LOG_STREAM_ENABLED: process.env.MZ_LOG_STREAM_ENABLED || '1',

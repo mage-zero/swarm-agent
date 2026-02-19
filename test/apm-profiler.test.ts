@@ -26,6 +26,50 @@ describe('apm-profiler env helpers', () => {
     expect(resolveMageProfilerEnv(undefined, undefined)).toBe(DEFAULT_MAGE_PROFILER_CONFIG);
   });
 
+  it('includes a full driver config in the default profiler payload', () => {
+    const parsed = JSON.parse(resolveMageProfilerEnv(undefined, '1'));
+    expect(parsed).toEqual({
+      drivers: [
+        {
+          type: 'MageZero\\OpensearchObservability\\Profiler\\Driver',
+          enabled: true,
+          serverUrl: 'http://mz-monitoring_otel-collector:4318/v1/traces',
+          serviceName: 'magento',
+          environment: 'production',
+          transactionSampleRate: 1,
+          stackTraceLimit: 1000,
+          timeout: 10,
+        },
+      ],
+    });
+  });
+
+  it('builds profiler payload from provided APM defaults', () => {
+    const parsed = JSON.parse(resolveMageProfilerEnv(undefined, '1', {
+      serverUrl: 'http://collector:4318/v1/traces',
+      serviceName: 'mz-env-5',
+      environment: 'performance',
+      transactionSampleRate: '0.75',
+      stackTraceLimit: '500',
+      timeout: '15',
+    }));
+
+    expect(parsed).toEqual({
+      drivers: [
+        {
+          type: 'MageZero\\OpensearchObservability\\Profiler\\Driver',
+          enabled: true,
+          serverUrl: 'http://collector:4318/v1/traces',
+          serviceName: 'mz-env-5',
+          environment: 'performance',
+          transactionSampleRate: 0.75,
+          stackTraceLimit: 500,
+          timeout: 15,
+        },
+      ],
+    });
+  });
+
   it('returns empty profiler payload when apm is disabled and profiler is unset', () => {
     expect(resolveMageProfilerEnv(undefined, 'false')).toBe('');
   });
