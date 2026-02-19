@@ -1,22 +1,15 @@
 {
-  "version": "0.4.38",
+  "version": "0.4.39",
   "date": "2026-02-19",
-  "summary": "Wire frontend runtime/deadlock change IDs to real upgrade migrations and auto-recover placement-paused frontend updates",
+  "summary": "Run deploy-time Magento CLI setup/config commands with unlimited PHP memory to prevent OOM failures on tuned stacks",
   "requires": {
     "cloud-swarm": ">=1.0.7",
     "mz-control": ">=1.0.9"
   },
   "changes": [
     {
-      "id": "frontend-runtime-policy-reconcile",
-      "description": "Upgrade now executes frontend runtime policy reconciliation to rebalance HA replicas and normalize runtime policy across varnish/nginx/php-fpm.",
-      "phase": "post_migrate",
-      "downtimeMinutes": 0,
-      "scope": "environment"
-    },
-    {
-      "id": "frontend-placement-deadlock-recovery",
-      "description": "Upgrade now detects placement-paused frontend updates and forces a stop-first recovery rollout so pending nginx/php-fpm updates can converge.",
+      "id": "deploy-magento-cli-memory-limit",
+      "description": "Deploy worker now runs setup:db:status, setup:upgrade, app:config:status/import, cache:flush, and fallback maintenance commands as php -d memory_limit=-1 bin/magento ... to avoid OOM failures when php memory_limit is tuned low.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"

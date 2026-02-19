@@ -3290,6 +3290,21 @@ async function runMagentoCommandWithStatus(
   return await runCommandCaptureWithStatus('docker', ['exec', ...envArgs, containerId, 'sh', '-c', command]);
 }
 
+function buildMagentoCliCommand(args: string): string {
+  return `php -d memory_limit=-1 bin/magento ${args}`.trim();
+}
+
+function buildSetupDbStatusCommand(timeoutSeconds: number): string {
+  const dbStatusCommand = buildMagentoCliCommand('setup:db:status');
+  return [
+    'if command -v timeout >/dev/null 2>&1; then',
+    `timeout ${timeoutSeconds} ${dbStatusCommand};`,
+    'else',
+    `${dbStatusCommand};`,
+    'fi',
+  ].join(' ');
+}
+
 type HttpProbeResult = {
   url: string;
   status: number;
@@ -4213,7 +4228,7 @@ async function runSetupUpgradeWithRetry(
       const result = await runMagentoCommandWithStatus(
         adminContainerId,
         stackName,
-        'php bin/magento setup:upgrade --keep-generated',
+        buildMagentoCliCommand('setup:upgrade --keep-generated'),
       );
       if (result.code === 0) {
         return { warning: false };
@@ -4330,7 +4345,7 @@ async function setMagentoMaintenanceMode(
       const result = await runMagentoCommandWithStatus(
         currentId,
         stackName,
-        `php bin/magento maintenance:${mode} --no-interaction`,
+        buildMagentoCliCommand(`maintenance:${mode} --no-interaction`),
       );
       if (result.code === 0) {
         log(`maintenance:${mode} ok`);
@@ -4383,13 +4398,7 @@ async function runSetupDbStatus(
   stackName: string,
   log: (message: string) => void,
 ): Promise<{ needed: boolean; exitCode: number; output: string; containerId: string }> {
-  const setupDbStatusCommand = [
-    'if command -v timeout >/dev/null 2>&1; then',
-    `timeout ${SETUP_DB_STATUS_TIMEOUT_SECONDS} php bin/magento setup:db:status;`,
-    'else',
-    'php bin/magento setup:db:status;',
-    'fi',
-  ].join(' ');
+  const setupDbStatusCommand = buildSetupDbStatusCommand(SETUP_DB_STATUS_TIMEOUT_SECONDS);
   let currentId = containerId;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     currentId = await ensureMagentoEnvWrapperWithRetry(currentId, stackName, log);
@@ -4466,7 +4475,11 @@ async function runAppConfigStatus(
   let currentId = containerId;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     currentId = await ensureMagentoEnvWrapperWithRetry(currentId, stackName, log);
-    const result = await runMagentoCommandWithStatus(currentId, stackName, 'php bin/magento app:config:status');
+    const result = await runMagentoCommandWithStatus(
+      currentId,
+      stackName,
+      buildMagentoCliCommand('app:config:status')
+    );
     const output = (result.stderr || result.stdout || '').trim();
     const outputLower = output.toLowerCase();
     const exitCode = result.code;
@@ -4514,7 +4527,7 @@ async function runAppConfigImport(
     const result = await runMagentoCommandWithStatus(
       currentId,
       stackName,
-      'php bin/magento app:config:import --no-interaction'
+      buildMagentoCliCommand('app:config:import --no-interaction')
     );
     if (result.code === 0) {
       log('app:config:import ok');
@@ -4552,7 +4565,11 @@ async function flushMagentoCache(
   let currentId = containerId;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     currentId = await ensureMagentoEnvWrapperWithRetry(currentId, stackName, log);
-    const result = await runMagentoCommandWithStatus(currentId, stackName, 'php bin/magento cache:flush');
+    const result = await runMagentoCommandWithStatus(
+      currentId,
+      stackName,
+      buildMagentoCliCommand('cache:flush')
+    );
     if (result.code === 0) {
       log('cache:flush ok');
       return currentId;
@@ -5877,6 +5894,8 @@ export const __testing = {
   resolveSearchEngine,
   buildSearchEngineEnvOverride,
   buildSearchSystemConfigSql,
+  buildMagentoCliCommand,
+  buildSetupDbStatusCommand,
   resolveMageProfilerEnv,
   resolveAppHaReplicaPolicy,
   resolveFrontendRuntimePolicy,
