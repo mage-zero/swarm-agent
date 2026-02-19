@@ -4,6 +4,7 @@ import { runCommand } from './exec.js';
 import { buildNodeHeaders } from './node-hmac.js';
 import { bootstrapMonitoringDashboards } from './monitoring-dashboards.js';
 import { isEnabledFlag, resolveMageProfilerEnv } from './lib/apm-profiler.js';
+import { buildCapacityPayload } from './status.js';
 
 export type MigrationContext = {
   environmentId?: number;
@@ -34,6 +35,42 @@ const DEFAULT_MONITORING_ENV: Record<string, string> = {
   MZ_MONITORING_OPENSEARCH_RESERVE_MEMORY: '512M',
 };
 const MONITORING_DASHBOARDS_REQUIRED = (process.env.MZ_MONITORING_DASHBOARDS_REQUIRED || '0') === '1';
+const APP_HA_MIN_READY_NODES = Math.max(1, Number(process.env.MZ_APP_HA_MIN_READY_NODES || 2));
+const APP_HA_MAX_REPLICAS = Math.max(1, Number(process.env.MZ_APP_HA_MAX_REPLICAS || 2));
+const APP_HA_CPU_EPSILON = 0.01;
+
+type AppHaReplicaPolicyInput = {
+  ready_node_count: number;
+  free_cpu_cores: number;
+  free_memory_bytes: number;
+  nginx_reserve_cpu_cores: number;
+  nginx_reserve_memory_bytes: number;
+  php_fpm_reserve_cpu_cores: number;
+  php_fpm_reserve_memory_bytes: number;
+  min_ready_nodes: number;
+  max_replicas: number;
+};
+
+type AppHaReplicaPolicyDecision = {
+  replicas: number;
+  reason: 'single_node' | 'insufficient_headroom' | 'ha_enabled';
+  required_cpu_cores: number;
+  required_memory_bytes: number;
+  shortfall_cpu_cores: number;
+  shortfall_memory_bytes: number;
+};
+
+type ServiceReplicaConfig = {
+  replicas: number;
+  max_replicas_per_node: number;
+  reserve_cpu_cores: number;
+  reserve_memory_bytes: number;
+};
+
+type ServiceReplicaApplyResult = {
+  status: 'updated' | 'skipped' | 'failed';
+  detail: string;
+};
 
 function isMonitoringEligibleStackType(stackType: string): boolean {
   const value = String(stackType || '').trim().toLowerCase();
@@ -80,6 +117,213 @@ async function resolveRegistryPullHost(candidate: string): Promise<string> {
     return wgIp;
   }
   return trimmed;
+}
+
+function toCpuCores(nanoCpus: unknown): number {
+  const numeric = Number(nanoCpus || 0);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return 0;
+  }
+  return numeric / 1_000_000_000;
+}
+
+function resolveAppHaReplicaPolicy(input: AppHaReplicaPolicyInput): AppHaReplicaPolicyDecision {
+  const readyNodeCount = Math.max(0, Math.floor(Number(input.ready_node_count) || 0));
+  const minReadyNodes = Math.max(1, Math.floor(Number(input.min_ready_nodes) || 1));
+  const maxReplicas = Math.max(1, Math.floor(Number(input.max_replicas) || 1));
+  if (readyNodeCount < minReadyNodes || maxReplicas <= 1) {
+    return {
+      replicas: 1,
+      reason: 'single_node',
+      required_cpu_cores: 0,
+      required_memory_bytes: 0,
+      shortfall_cpu_cores: 0,
+      shortfall_memory_bytes: 0,
+    };
+  }
+
+  const targetReplicas = Math.max(1, Math.min(maxReplicas, readyNodeCount));
+  if (targetReplicas <= 1) {
+    return {
+      replicas: 1,
+      reason: 'single_node',
+      required_cpu_cores: 0,
+      required_memory_bytes: 0,
+      shortfall_cpu_cores: 0,
+      shortfall_memory_bytes: 0,
+    };
+  }
+
+  const extraReplicas = targetReplicas - 1;
+  const nginxReserveCpu = Math.max(0, Number(input.nginx_reserve_cpu_cores) || 0);
+  const phpFpmReserveCpu = Math.max(0, Number(input.php_fpm_reserve_cpu_cores) || 0);
+  const nginxReserveMem = Math.max(0, Math.round(Number(input.nginx_reserve_memory_bytes) || 0));
+  const phpFpmReserveMem = Math.max(0, Math.round(Number(input.php_fpm_reserve_memory_bytes) || 0));
+  const requiredCpu = extraReplicas * (nginxReserveCpu + phpFpmReserveCpu);
+  const requiredMem = extraReplicas * (nginxReserveMem + phpFpmReserveMem);
+  const freeCpu = Math.max(0, Number(input.free_cpu_cores) || 0);
+  const freeMem = Math.max(0, Math.round(Number(input.free_memory_bytes) || 0));
+  const shortfallCpu = requiredCpu > (freeCpu + APP_HA_CPU_EPSILON)
+    ? Number((requiredCpu - freeCpu).toFixed(2))
+    : 0;
+  const shortfallMem = requiredMem > freeMem ? requiredMem - freeMem : 0;
+
+  if (shortfallCpu > 0 || shortfallMem > 0) {
+    return {
+      replicas: 1,
+      reason: 'insufficient_headroom',
+      required_cpu_cores: Number(requiredCpu.toFixed(2)),
+      required_memory_bytes: requiredMem,
+      shortfall_cpu_cores: shortfallCpu,
+      shortfall_memory_bytes: shortfallMem,
+    };
+  }
+
+  return {
+    replicas: targetReplicas,
+    reason: 'ha_enabled',
+    required_cpu_cores: Number(requiredCpu.toFixed(2)),
+    required_memory_bytes: requiredMem,
+    shortfall_cpu_cores: 0,
+    shortfall_memory_bytes: 0,
+  };
+}
+
+function isNoSuchServiceOutput(text: string): boolean {
+  const lower = text.toLowerCase();
+  return lower.includes('no such service') || lower.includes('service not found');
+}
+
+function isNoopServiceUpdateOutput(text: string): boolean {
+  const lower = text.toLowerCase();
+  return lower.includes('nothing to update') || lower.includes('no changes detected');
+}
+
+function envServiceName(environmentId: number, service: string): string {
+  return `mz-env-${environmentId}_${service}`;
+}
+
+async function inspectServiceReplicaConfig(serviceName: string): Promise<ServiceReplicaConfig | null> {
+  const inspect = await runCommand(
+    'docker',
+    ['service', 'inspect', serviceName, '--format', '{{json .Spec}}'],
+    30_000,
+  );
+  if (inspect.code !== 0) {
+    const output = `${inspect.stdout || ''}\n${inspect.stderr || ''}`;
+    if (isNoSuchServiceOutput(output)) {
+      return null;
+    }
+    throw new Error(`Failed to inspect ${serviceName}: ${inspect.stderr || inspect.stdout || `exit ${inspect.code}`}`);
+  }
+
+  const raw = String(inspect.stdout || '').trim();
+  if (!raw) {
+    throw new Error(`Empty service spec for ${serviceName}`);
+  }
+
+  let spec: Record<string, unknown>;
+  try {
+    spec = JSON.parse(raw) as Record<string, unknown>;
+  } catch (error) {
+    throw new Error(
+      `Invalid JSON service spec for ${serviceName}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+
+  const mode = spec.Mode as Record<string, unknown> | undefined;
+  const replicated = mode?.Replicated as Record<string, unknown> | undefined;
+  const replicasRaw = replicated?.Replicas;
+  const replicasParsed = Number(replicasRaw ?? 0);
+  const replicas = Number.isFinite(replicasParsed) ? Math.max(0, Math.round(replicasParsed)) : 0;
+
+  const taskTemplate = spec.TaskTemplate as Record<string, unknown> | undefined;
+  const placement = taskTemplate?.Placement as Record<string, unknown> | undefined;
+  const maxReplicasRaw = placement?.MaxReplicas;
+  const maxReplicasParsed = Number(maxReplicasRaw ?? 0);
+  const maxReplicasPerNode = Number.isFinite(maxReplicasParsed)
+    ? Math.max(0, Math.round(maxReplicasParsed))
+    : 0;
+
+  const resources = taskTemplate?.Resources as Record<string, unknown> | undefined;
+  const reservations = resources?.Reservations as Record<string, unknown> | undefined;
+  const reserveCpu = toCpuCores(reservations?.NanoCPUs);
+  const reserveMemoryRaw = Number(reservations?.MemoryBytes || 0);
+  const reserveMemory = Number.isFinite(reserveMemoryRaw) ? Math.max(0, Math.round(reserveMemoryRaw)) : 0;
+
+  return {
+    replicas,
+    max_replicas_per_node: maxReplicasPerNode,
+    reserve_cpu_cores: reserveCpu,
+    reserve_memory_bytes: reserveMemory,
+  };
+}
+
+async function applyServiceReplicaPolicy(
+  serviceName: string,
+  targetReplicas: number,
+  maxReplicasPerNode: number,
+): Promise<ServiceReplicaApplyResult> {
+  let current: ServiceReplicaConfig | null;
+  try {
+    current = await inspectServiceReplicaConfig(serviceName);
+  } catch (error) {
+    return {
+      status: 'failed',
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  if (!current) {
+    return { status: 'skipped', detail: 'service not found' };
+  }
+
+  const desiredReplicas = Math.max(0, Math.round(targetReplicas));
+  const desiredMaxPerNode = Math.max(0, Math.round(maxReplicasPerNode));
+  if (current.replicas === desiredReplicas && current.max_replicas_per_node === desiredMaxPerNode) {
+    return { status: 'skipped', detail: 'already aligned' };
+  }
+
+  let update = await runCommand(
+    'docker',
+    [
+      'service',
+      'update',
+      '--replicas',
+      String(desiredReplicas),
+      '--replicas-max-per-node',
+      String(desiredMaxPerNode),
+      serviceName,
+    ],
+    120_000,
+  );
+  if (update.code !== 0) {
+    const combined = `${update.stdout || ''}\n${update.stderr || ''}`;
+    const lower = combined.toLowerCase();
+    if (lower.includes('unknown flag') && lower.includes('replicas-max-per-node')) {
+      update = await runCommand(
+        'docker',
+        ['service', 'update', '--replicas', String(desiredReplicas), serviceName],
+        120_000,
+      );
+    }
+  }
+
+  if (update.code !== 0) {
+    const combined = `${update.stdout || ''}\n${update.stderr || ''}`;
+    if (isNoSuchServiceOutput(combined)) {
+      return { status: 'skipped', detail: 'service not found during update' };
+    }
+    if (isNoopServiceUpdateOutput(combined)) {
+      return { status: 'skipped', detail: 'nothing to update' };
+    }
+    return {
+      status: 'failed',
+      detail: combined.trim() || `docker service update failed (exit ${update.code})`,
+    };
+  }
+
+  return { status: 'updated', detail: `replicas=${desiredReplicas} max_per_node=${desiredMaxPerNode}` };
 }
 
 async function fetchStackSnapshot(ctx: MigrationContext): Promise<StackSnapshot> {
@@ -450,6 +694,102 @@ registerMigration('refresh-monitoring-host-metadata', async (ctx) => {
 
 registerMigration('refresh-monitoring-host-metadata-v2', async (ctx) => {
   await executeMigration('refresh-monitoring-host-metadata', ctx);
+});
+
+registerMigration('rebalance-frontend-ha-replicas', async (ctx) => {
+  const environmentId = Number(ctx.environmentId || 0);
+  if (!Number.isFinite(environmentId) || environmentId <= 0) {
+    console.warn('upgrade.migration.rebalance_frontend_ha_replicas: missing environmentId; skipping');
+    return;
+  }
+
+  let readyNodeCount = 0;
+  let freeCpuCores = 0;
+  let freeMemoryBytes = 0;
+  try {
+    const capacity = await buildCapacityPayload();
+    const readyNodes = (capacity.nodes || []).filter(
+      (node) => node.status === 'ready' && node.availability === 'active',
+    );
+    readyNodeCount = readyNodes.length;
+    freeCpuCores = Number(capacity.totals.free_cpu_cores || 0);
+    freeMemoryBytes = Number(capacity.totals.free_memory_bytes || 0);
+  } catch (error) {
+    console.warn(
+      `upgrade.migration.rebalance_frontend_ha_replicas: failed to read capacity (${error instanceof Error ? error.message : String(error)})`
+    );
+    return;
+  }
+
+  if (readyNodeCount <= 0) {
+    console.warn(`upgrade.migration.rebalance_frontend_ha_replicas: env=${environmentId} no ready nodes; skipping`);
+    return;
+  }
+
+  const nginxService = envServiceName(environmentId, 'nginx');
+  const phpFpmService = envServiceName(environmentId, 'php-fpm');
+  const varnishService = envServiceName(environmentId, 'varnish');
+
+  let nginxSpec: ServiceReplicaConfig | null = null;
+  let phpFpmSpec: ServiceReplicaConfig | null = null;
+  try {
+    nginxSpec = await inspectServiceReplicaConfig(nginxService);
+    phpFpmSpec = await inspectServiceReplicaConfig(phpFpmService);
+  } catch (error) {
+    console.warn(
+      `upgrade.migration.rebalance_frontend_ha_replicas: env=${environmentId} service inspect failed (${error instanceof Error ? error.message : String(error)})`
+    );
+    return;
+  }
+
+  if (!nginxSpec || !phpFpmSpec) {
+    console.warn(
+      `upgrade.migration.rebalance_frontend_ha_replicas: env=${environmentId} missing nginx/php-fpm service; skipping`
+    );
+    return;
+  }
+
+  const decision = resolveAppHaReplicaPolicy({
+    ready_node_count: readyNodeCount,
+    free_cpu_cores: freeCpuCores,
+    free_memory_bytes: freeMemoryBytes,
+    nginx_reserve_cpu_cores: nginxSpec.reserve_cpu_cores,
+    nginx_reserve_memory_bytes: nginxSpec.reserve_memory_bytes,
+    php_fpm_reserve_cpu_cores: phpFpmSpec.reserve_cpu_cores,
+    php_fpm_reserve_memory_bytes: phpFpmSpec.reserve_memory_bytes,
+    min_ready_nodes: APP_HA_MIN_READY_NODES,
+    max_replicas: APP_HA_MAX_REPLICAS,
+  });
+
+  if (decision.reason === 'ha_enabled') {
+    console.log(
+      `upgrade.migration.rebalance_frontend_ha_replicas: env=${environmentId} target=${decision.replicas} `
+      + `(ready_nodes=${readyNodeCount}, extra_reserve_cpu=${decision.required_cpu_cores}, `
+      + `extra_reserve_memory_bytes=${decision.required_memory_bytes})`
+    );
+  } else if (decision.reason === 'insufficient_headroom') {
+    console.log(
+      `upgrade.migration.rebalance_frontend_ha_replicas: env=${environmentId} keeping single replica `
+      + `(cpu_shortfall=${decision.shortfall_cpu_cores}, memory_shortfall_bytes=${decision.shortfall_memory_bytes})`
+    );
+  } else {
+    console.log(
+      `upgrade.migration.rebalance_frontend_ha_replicas: env=${environmentId} single-node policy `
+      + `(ready_nodes=${readyNodeCount}, min_ready_nodes=${APP_HA_MIN_READY_NODES})`
+    );
+  }
+
+  const targetReplicas = decision.replicas;
+  const maxReplicasPerNode = 1;
+  const services = [varnishService, nginxService, phpFpmService];
+  for (const serviceName of services) {
+    const result = await applyServiceReplicaPolicy(serviceName, targetReplicas, maxReplicasPerNode);
+    if (result.status === 'failed') {
+      console.warn(`upgrade.migration.rebalance_frontend_ha_replicas: env=${environmentId} ${serviceName} failed (${result.detail})`);
+      continue;
+    }
+    console.log(`upgrade.migration.rebalance_frontend_ha_replicas: env=${environmentId} ${serviceName} ${result.status} (${result.detail})`);
+  }
 });
 
 registerMigration('sync-magento-apm-profiler-bootstrap', async (ctx) => {

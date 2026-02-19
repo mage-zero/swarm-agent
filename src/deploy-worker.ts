@@ -180,6 +180,92 @@ const DEPLOY_INTERVAL_MS = Number(process.env.MZ_DEPLOY_WORKER_INTERVAL_MS || 50
 const FETCH_TIMEOUT_MS = Number(process.env.MZ_FETCH_TIMEOUT_MS || 30000);
 const MIB = 1024 * 1024;
 const GIB = 1024 * 1024 * 1024;
+const APP_HA_MIN_READY_NODES = Math.max(1, Number(process.env.MZ_APP_HA_MIN_READY_NODES || 2));
+const APP_HA_MAX_REPLICAS = Math.max(1, Number(process.env.MZ_APP_HA_MAX_REPLICAS || 2));
+const APP_HA_CPU_EPSILON = 0.01;
+
+type AppHaReplicaPolicyInput = {
+  ready_node_count: number;
+  free_cpu_cores: number;
+  free_memory_bytes: number;
+  nginx_reserve_cpu_cores: number;
+  nginx_reserve_memory_bytes: number;
+  php_fpm_reserve_cpu_cores: number;
+  php_fpm_reserve_memory_bytes: number;
+  min_ready_nodes: number;
+  max_replicas: number;
+};
+
+type AppHaReplicaPolicyDecision = {
+  replicas: number;
+  reason: 'single_node' | 'insufficient_headroom' | 'ha_enabled';
+  required_cpu_cores: number;
+  required_memory_bytes: number;
+  shortfall_cpu_cores: number;
+  shortfall_memory_bytes: number;
+};
+
+function resolveAppHaReplicaPolicy(input: AppHaReplicaPolicyInput): AppHaReplicaPolicyDecision {
+  const readyNodeCount = Math.max(0, Math.floor(Number(input.ready_node_count) || 0));
+  const minReadyNodes = Math.max(1, Math.floor(Number(input.min_ready_nodes) || 1));
+  const maxReplicas = Math.max(1, Math.floor(Number(input.max_replicas) || 1));
+  if (readyNodeCount < minReadyNodes || maxReplicas <= 1) {
+    return {
+      replicas: 1,
+      reason: 'single_node',
+      required_cpu_cores: 0,
+      required_memory_bytes: 0,
+      shortfall_cpu_cores: 0,
+      shortfall_memory_bytes: 0,
+    };
+  }
+
+  const targetReplicas = Math.max(1, Math.min(maxReplicas, readyNodeCount));
+  if (targetReplicas <= 1) {
+    return {
+      replicas: 1,
+      reason: 'single_node',
+      required_cpu_cores: 0,
+      required_memory_bytes: 0,
+      shortfall_cpu_cores: 0,
+      shortfall_memory_bytes: 0,
+    };
+  }
+
+  const extraReplicas = targetReplicas - 1;
+  const nginxReserveCpu = Math.max(0, Number(input.nginx_reserve_cpu_cores) || 0);
+  const phpFpmReserveCpu = Math.max(0, Number(input.php_fpm_reserve_cpu_cores) || 0);
+  const nginxReserveMem = Math.max(0, Math.round(Number(input.nginx_reserve_memory_bytes) || 0));
+  const phpFpmReserveMem = Math.max(0, Math.round(Number(input.php_fpm_reserve_memory_bytes) || 0));
+  const requiredCpu = extraReplicas * (nginxReserveCpu + phpFpmReserveCpu);
+  const requiredMem = extraReplicas * (nginxReserveMem + phpFpmReserveMem);
+  const freeCpu = Math.max(0, Number(input.free_cpu_cores) || 0);
+  const freeMem = Math.max(0, Math.round(Number(input.free_memory_bytes) || 0));
+  const shortfallCpu = requiredCpu > (freeCpu + APP_HA_CPU_EPSILON)
+    ? Number((requiredCpu - freeCpu).toFixed(2))
+    : 0;
+  const shortfallMem = requiredMem > freeMem ? requiredMem - freeMem : 0;
+
+  if (shortfallCpu > 0 || shortfallMem > 0) {
+    return {
+      replicas: 1,
+      reason: 'insufficient_headroom',
+      required_cpu_cores: Number(requiredCpu.toFixed(2)),
+      required_memory_bytes: requiredMem,
+      shortfall_cpu_cores: shortfallCpu,
+      shortfall_memory_bytes: shortfallMem,
+    };
+  }
+
+  return {
+    replicas: targetReplicas,
+    reason: 'ha_enabled',
+    required_cpu_cores: Number(requiredCpu.toFixed(2)),
+    required_memory_bytes: requiredMem,
+    shortfall_cpu_cores: 0,
+    shortfall_memory_bytes: 0,
+  };
+}
 
 function isLoopbackHost(host: string) {
   const value = String(host || '').trim().toLowerCase();
@@ -4367,7 +4453,7 @@ async function processDeployment(recordPath: string) {
   if (versions.rabbitmqVersion) overrideVersions.RABBITMQ_VERSION = versions.rabbitmqVersion;
 
   const planner = await buildPlannerPayload();
-  const plannerResources = planner?.resources?.services;
+  const plannerResources = planner?.resources?.services as PlannerResources | undefined;
   if (!plannerResources) {
     throw new Error('Planner did not provide resource sizing');
   }
@@ -4381,6 +4467,17 @@ async function processDeployment(recordPath: string) {
   const replicaUser = 'replica';
   let replicaServiceName: 'database' | 'database-replica' = 'database';
   let replicaEnabled = false;
+  let appHaPolicy = resolveAppHaReplicaPolicy({
+    ready_node_count: 0,
+    free_cpu_cores: 0,
+    free_memory_bytes: 0,
+    nginx_reserve_cpu_cores: plannerResources.nginx?.reservations?.cpu_cores || 0,
+    nginx_reserve_memory_bytes: plannerResources.nginx?.reservations?.memory_bytes || 0,
+    php_fpm_reserve_cpu_cores: plannerResources['php-fpm']?.reservations?.cpu_cores || 0,
+    php_fpm_reserve_memory_bytes: plannerResources['php-fpm']?.reservations?.memory_bytes || 0,
+    min_ready_nodes: APP_HA_MIN_READY_NODES,
+    max_replicas: APP_HA_MAX_REPLICAS,
+  });
   const envTypeRaw = String(envRecord?.environment_type || '').trim().toLowerCase();
   const envHostname = String(envRecord?.environment_hostname || envRecord?.hostname || '').trim();
   const envHostnameOnly = envHostname
@@ -4415,9 +4512,37 @@ async function processDeployment(recordPath: string) {
     if (replicaEnabled) {
       replicaServiceName = 'database-replica';
     }
+    appHaPolicy = resolveAppHaReplicaPolicy({
+      ready_node_count: readyNodes.length,
+      free_cpu_cores: capacity.totals.free_cpu_cores || 0,
+      free_memory_bytes: capacity.totals.free_memory_bytes || 0,
+      nginx_reserve_cpu_cores: plannerResources.nginx?.reservations?.cpu_cores || 0,
+      nginx_reserve_memory_bytes: plannerResources.nginx?.reservations?.memory_bytes || 0,
+      php_fpm_reserve_cpu_cores: plannerResources['php-fpm']?.reservations?.cpu_cores || 0,
+      php_fpm_reserve_memory_bytes: plannerResources['php-fpm']?.reservations?.memory_bytes || 0,
+      min_ready_nodes: APP_HA_MIN_READY_NODES,
+      max_replicas: APP_HA_MAX_REPLICAS,
+    });
+    if (appHaPolicy.reason === 'ha_enabled') {
+      log(
+        `app-ha policy enabled: replicas=${appHaPolicy.replicas} ` +
+        `(ready_nodes=${readyNodes.length}, extra_reserve_cpu=${appHaPolicy.required_cpu_cores}, ` +
+        `extra_reserve_memory=${Math.round(appHaPolicy.required_memory_bytes / MIB)}MiB)`
+      );
+    } else if (appHaPolicy.reason === 'insufficient_headroom') {
+      log(
+        `app-ha policy skipped: insufficient headroom ` +
+        `(cpu_shortfall=${appHaPolicy.shortfall_cpu_cores}, ` +
+        `memory_shortfall=${Math.round(appHaPolicy.shortfall_memory_bytes / MIB)}MiB, ` +
+        `ready_nodes=${readyNodes.length})`
+      );
+    } else {
+      log(`app-ha policy disabled: ready_nodes=${readyNodes.length}, min_ready_nodes=${APP_HA_MIN_READY_NODES}`);
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     log(`capacity unavailable; defaulting replica host to database (${message})`);
+    log('app-ha policy fallback: capacity unavailable, using single-replica frontend');
   }
 
   // Swarm service tasks must pull images from an address reachable by every node.
@@ -4464,6 +4589,12 @@ async function processDeployment(recordPath: string) {
     MZ_MARIADB_MASTER_HOST: stackService('database'),
     MZ_REPLICATION_USER: replicaUser,
     MZ_DATABASE_REPLICA_REPLICAS: replicaEnabled ? '1' : '0',
+    MZ_VARNISH_REPLICAS: String(appHaPolicy.replicas),
+    MZ_NGINX_REPLICAS: String(appHaPolicy.replicas),
+    MZ_PHP_FPM_REPLICAS: String(appHaPolicy.replicas),
+    MZ_VARNISH_MAX_REPLICAS_PER_NODE: '1',
+    MZ_NGINX_MAX_REPLICAS_PER_NODE: '1',
+    MZ_PHP_FPM_MAX_REPLICAS_PER_NODE: '1',
     MZ_RABBITMQ_HOST: stackService('rabbitmq'),
     MZ_REDIS_CACHE_HOST: stackService('redis-cache'),
     MZ_REDIS_SESSION_HOST: stackService('redis-session'),
@@ -5425,4 +5556,5 @@ export const __testing = {
   buildSearchEngineEnvOverride,
   buildSearchSystemConfigSql,
   resolveMageProfilerEnv,
+  resolveAppHaReplicaPolicy,
 };

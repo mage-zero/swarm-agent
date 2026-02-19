@@ -1,32 +1,18 @@
 {
-  "version": "0.4.34",
+  "version": "0.4.35",
   "date": "2026-02-19",
-  "summary": "Prevent non-capacity tuning rollouts for app-health incidents and gate support remediation proposals by actual capacity pressure",
+  "summary": "Enable uptime-first frontend HA rebalancing during agent upgrades and preserve the same headroom-aware policy in deploy sizing",
   "requires": {
     "cloud-swarm": ">=1.0.7",
     "mz-control": ">=1.0.9"
   },
   "changes": [
     {
-      "id": "guard-live-tuning-apply-on-capacity-pressure",
-      "description": "Require capacity pressure before applying live tuning profile resource updates by default; allow explicit override via force_apply=true.",
-      "phase": "pre_migrate",
-      "downtimeMinutes": 0,
-      "scope": "stack"
-    },
-    {
-      "id": "gate-support-tuning-remediation-suggestions",
-      "description": "Only suggest swarm_tuning_profile_apply from support diagnostics when swarm capacity signals indicate real resource pressure.",
-      "phase": "pre_migrate",
-      "downtimeMinutes": 0,
-      "scope": "stack"
-    },
-    {
-      "id": "add-healthcheck-safe-php-fpm-runtime-probe",
-      "description": "Update cloud-swarm php-fpm image health checks to use an internal FastCGI probe so app-level Magento 500s no longer trigger container restart loops.",
+      "id": "rebalance-frontend-ha-replicas",
+      "description": "After upgrade, evaluate ready-node capacity and automatically align varnish/nginx/php-fpm replicas and spread policy for uptime-first frontend HA.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
-      "scope": "stack"
+      "scope": "environment"
     }
   ]
 }

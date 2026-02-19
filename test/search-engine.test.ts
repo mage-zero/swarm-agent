@@ -3,7 +3,14 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { __testing } from '../src/deploy-worker.js';
 
-const { parseDetectedEngine, defaultSearchEngine, resolveSearchEngine, buildSearchEngineEnvOverride, buildSearchSystemConfigSql } = __testing;
+const {
+  parseDetectedEngine,
+  defaultSearchEngine,
+  resolveSearchEngine,
+  buildSearchEngineEnvOverride,
+  buildSearchSystemConfigSql,
+  resolveAppHaReplicaPolicy,
+} = __testing;
 
 // ---------------------------------------------------------------------------
 // parseDetectedEngine – parses mariadb stdout into a known engine or null
@@ -133,6 +140,87 @@ describe('buildSearchEngineEnvOverride', () => {
     const withoutOverride = { ...base, ...buildSearchEngineEnvOverride('') };
     expect(withoutOverride).toEqual({ MZ_OPENSEARCH_HOST: 'search', OTHER: 'val' });
     expect(withoutOverride).not.toHaveProperty('MZ_SEARCH_ENGINE');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveAppHaReplicaPolicy – frontend HA replica policy
+// ---------------------------------------------------------------------------
+describe('resolveAppHaReplicaPolicy', () => {
+  it('keeps single-replica mode when the stack has fewer ready nodes than required', () => {
+    const decision = resolveAppHaReplicaPolicy({
+      ready_node_count: 1,
+      free_cpu_cores: 8,
+      free_memory_bytes: 16 * 1024 * 1024 * 1024,
+      nginx_reserve_cpu_cores: 0.2,
+      nginx_reserve_memory_bytes: 256 * 1024 * 1024,
+      php_fpm_reserve_cpu_cores: 1,
+      php_fpm_reserve_memory_bytes: 1024 * 1024 * 1024,
+      min_ready_nodes: 2,
+      max_replicas: 2,
+    });
+    expect(decision).toEqual({
+      replicas: 1,
+      reason: 'single_node',
+      required_cpu_cores: 0,
+      required_memory_bytes: 0,
+      shortfall_cpu_cores: 0,
+      shortfall_memory_bytes: 0,
+    });
+  });
+
+  it('enables HA replicas when enough nodes and headroom are available', () => {
+    const decision = resolveAppHaReplicaPolicy({
+      ready_node_count: 2,
+      free_cpu_cores: 2,
+      free_memory_bytes: 2 * 1024 * 1024 * 1024,
+      nginx_reserve_cpu_cores: 0.2,
+      nginx_reserve_memory_bytes: 256 * 1024 * 1024,
+      php_fpm_reserve_cpu_cores: 1,
+      php_fpm_reserve_memory_bytes: 1024 * 1024 * 1024,
+      min_ready_nodes: 2,
+      max_replicas: 2,
+    });
+    expect(decision.replicas).toBe(2);
+    expect(decision.reason).toBe('ha_enabled');
+    expect(decision.required_cpu_cores).toBe(1.2);
+    expect(decision.required_memory_bytes).toBe(1280 * 1024 * 1024);
+    expect(decision.shortfall_cpu_cores).toBe(0);
+    expect(decision.shortfall_memory_bytes).toBe(0);
+  });
+
+  it('caps target replicas by max_replicas when more nodes are available', () => {
+    const decision = resolveAppHaReplicaPolicy({
+      ready_node_count: 4,
+      free_cpu_cores: 8,
+      free_memory_bytes: 32 * 1024 * 1024 * 1024,
+      nginx_reserve_cpu_cores: 0.2,
+      nginx_reserve_memory_bytes: 256 * 1024 * 1024,
+      php_fpm_reserve_cpu_cores: 1,
+      php_fpm_reserve_memory_bytes: 1024 * 1024 * 1024,
+      min_ready_nodes: 2,
+      max_replicas: 2,
+    });
+    expect(decision.replicas).toBe(2);
+    expect(decision.reason).toBe('ha_enabled');
+  });
+
+  it('falls back to single-replica when HA headroom is insufficient', () => {
+    const decision = resolveAppHaReplicaPolicy({
+      ready_node_count: 2,
+      free_cpu_cores: 0.5,
+      free_memory_bytes: 500 * 1024 * 1024,
+      nginx_reserve_cpu_cores: 0.2,
+      nginx_reserve_memory_bytes: 256 * 1024 * 1024,
+      php_fpm_reserve_cpu_cores: 1,
+      php_fpm_reserve_memory_bytes: 1024 * 1024 * 1024,
+      min_ready_nodes: 2,
+      max_replicas: 2,
+    });
+    expect(decision.replicas).toBe(1);
+    expect(decision.reason).toBe('insufficient_headroom');
+    expect(decision.shortfall_cpu_cores).toBeGreaterThan(0);
+    expect(decision.shortfall_memory_bytes).toBeGreaterThan(0);
   });
 });
 
