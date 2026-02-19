@@ -3,6 +3,7 @@ import path from 'path';
 import { runCommand } from './exec.js';
 import { buildNodeHeaders } from './node-hmac.js';
 import { bootstrapMonitoringDashboards } from './monitoring-dashboards.js';
+import { isEnabledFlag, resolveMageProfilerEnv } from './lib/apm-profiler.js';
 
 export type MigrationContext = {
   environmentId?: number;
@@ -443,4 +444,60 @@ registerMigration('refresh-monitoring-host-metadata', async (ctx) => {
 
 registerMigration('refresh-monitoring-host-metadata-v2', async (ctx) => {
   await executeMigration('refresh-monitoring-host-metadata', ctx);
+});
+
+registerMigration('sync-magento-apm-profiler-bootstrap', async (ctx) => {
+  if (!ctx.environmentId) {
+    console.warn('upgrade.migration.sync_magento_apm_profiler_bootstrap: missing environmentId; skipping');
+    return;
+  }
+
+  const explicitProfilerValue = process.env.MAGE_PROFILER;
+  const serviceSuffixes = ['php-fpm', 'php-fpm-admin', 'cron'];
+
+  for (const suffix of serviceSuffixes) {
+    const serviceName = `mz-env-${ctx.environmentId}_${suffix}`;
+    const inspect = await runCommand(
+      'docker',
+      ['service', 'inspect', serviceName, '--format', '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}'],
+      30_000,
+    );
+    if (inspect.code !== 0) {
+      const inspectOutput = `${inspect.stdout}\n${inspect.stderr}`.toLowerCase();
+      if (inspectOutput.includes('no such service')) {
+        console.warn(`upgrade.migration.sync_magento_apm_profiler_bootstrap: ${serviceName} not found; skipping`);
+        continue;
+      }
+      throw new Error(
+        `Failed to inspect ${serviceName}: ${inspect.stderr || inspect.stdout || `exit ${inspect.code}`}`
+      );
+    }
+
+    const envLines = (inspect.stdout || '').split('\n');
+    const apmEnabledLine = envLines.find((line) => line.startsWith('MZ_APM_ENABLED='));
+    const apmEnabledValue = apmEnabledLine ? apmEnabledLine.slice('MZ_APM_ENABLED='.length) : '';
+    const profilerValue = resolveMageProfilerEnv(
+      explicitProfilerValue,
+      isEnabledFlag(apmEnabledValue, true) ? '1' : '0',
+    );
+
+    const args = profilerValue !== ''
+      ? ['service', 'update', '--env-add', `MAGE_PROFILER=${profilerValue}`, serviceName]
+      : ['service', 'update', '--env-rm', 'MAGE_PROFILER', serviceName];
+    const result = await runCommand('docker', args, 120_000);
+    if (result.code === 0) {
+      continue;
+    }
+    const output = `${result.stdout}\n${result.stderr}`.toLowerCase();
+    if (output.includes('no such service')) {
+      console.warn(`upgrade.migration.sync_magento_apm_profiler_bootstrap: ${serviceName} not found; skipping`);
+      continue;
+    }
+    if (output.includes('nothing to update')) {
+      continue;
+    }
+    throw new Error(
+      `Failed to sync MAGE_PROFILER on ${serviceName}: ${result.stderr || result.stdout || `exit ${result.code}`}`
+    );
+  }
 });

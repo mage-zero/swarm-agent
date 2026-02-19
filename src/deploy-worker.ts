@@ -10,6 +10,7 @@ import { parseListObjectsV2Xml } from './r2-list.js';
 import { getDbBackupZstdLevel } from './backup-utils.js';
 import { buildJobName, envServiceName, inspectServiceSpec, listServiceTasks, runSwarmJob } from './swarm.js';
 import { bootstrapMonitoringDashboards } from './monitoring-dashboards.js';
+import { resolveMageProfilerEnv } from './lib/apm-profiler.js';
 
 type DeployPayload = {
   artifact?: string;
@@ -4380,6 +4381,8 @@ async function processDeployment(recordPath: string) {
   const envHostnameOnly = envHostname
     ? envHostname.replace(/^https?:\/\//, '').split('/')[0]?.replace(/\/+$/, '') || ''
     : '';
+  const apmEnabledValue = process.env.MZ_APM_ENABLED || '1';
+  const mageProfilerValue = resolveMageProfilerEnv(process.env.MAGE_PROFILER, apmEnabledValue);
   const mailCatcherEnabled = ['non-production', 'development', 'staging', 'performance'].includes(envTypeRaw);
   const envEligible = envTypeRaw === ''
     ? true
@@ -4464,7 +4467,7 @@ async function processDeployment(recordPath: string) {
     SMTP_FROM_ADDRESS: process.env.SMTP_FROM_ADDRESS || (envHostnameOnly ? `no-reply@${envHostnameOnly}` : ''),
     SMTP_FROM_HOSTNAME: process.env.SMTP_FROM_HOSTNAME || envHostnameOnly,
     // APM + Magento observability module config (rendered into app/etc/config.php).
-    MZ_APM_ENABLED: process.env.MZ_APM_ENABLED || '1',
+    MZ_APM_ENABLED: apmEnabledValue,
     MZ_APM_SERVER_URL: process.env.MZ_APM_SERVER_URL || `http://mz-monitoring_apm-server:8200`,
     MZ_APM_SAMPLE_RATE: process.env.MZ_APM_SAMPLE_RATE || '1.0',
     MZ_APM_SERVICE_NAME: `mz-env-${environmentId}`,
@@ -4474,6 +4477,8 @@ async function processDeployment(recordPath: string) {
     MZ_APM_DB_PROFILER_ENABLED: process.env.MZ_APM_DB_PROFILER_ENABLED || '1',
     MZ_APM_STACK_TRACE_LIMIT: process.env.MZ_APM_STACK_TRACE_LIMIT || '1000',
     MZ_APM_TIMEOUT: process.env.MZ_APM_TIMEOUT || '10',
+    // Magento profiler bootstrap toggle. Required for request-level APM traces.
+    MAGE_PROFILER: mageProfilerValue,
     MZ_LOG_STREAM_ENABLED: process.env.MZ_LOG_STREAM_ENABLED || '1',
     MZ_LOG_STREAM_MIN_LEVEL: process.env.MZ_LOG_STREAM_MIN_LEVEL || 'warning',
     MZ_LOG_STREAM_TRANSPORT: process.env.MZ_LOG_STREAM_TRANSPORT || 'stderr',
@@ -5400,4 +5405,5 @@ export const __testing = {
   resolveSearchEngine,
   buildSearchEngineEnvOverride,
   buildSearchSystemConfigSql,
+  resolveMageProfilerEnv,
 };
