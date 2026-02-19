@@ -1,18 +1,18 @@
 {
-  "version": "0.4.28",
+  "version": "0.4.29",
   "date": "2026-02-19",
-  "summary": "Enable Magento APM profiler bootstrap automatically during deploys and migrate existing environments to MAGE_PROFILER-based activation",
+  "summary": "Fix VPS root usage trend chart to render for any server group hostname",
   "requires": {
     "cloud-swarm": ">=1.0.5",
     "mz-control": ">=1.0.7"
   },
   "changes": [
     {
-      "id": "sync-magento-apm-profiler-bootstrap",
-      "description": "Set MAGE_PROFILER for existing environment php services (php-fpm/php-fpm-admin/cron) so request-level APM tracing is active without manual SSH commands. Requires Magento images that include mage-zero/magento2-opensearch-observability >= 1.0.3.",
+      "id": "fix-vps-root-trend-host-color-domain",
+      "description": "Remove hardcoded host color domain/range from the VPS root usage trend Vega spec so data appears for stacks whose VPS hostnames differ from the original seed hosts.",
       "phase": "pre_migrate",
       "downtimeMinutes": 0,
-      "scope": "environment"
+      "scope": "stack"
     }
   ]
 }
