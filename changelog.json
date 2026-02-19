@@ -1,18 +1,25 @@
 {
-  "version": "0.4.29",
+  "version": "0.4.30",
   "date": "2026-02-19",
-  "summary": "Fix VPS root usage trend chart to render for any server group hostname",
+  "summary": "Migrate monitoring traces to OpenTelemetry collector + Data Prepper and default Magento profiling to OTLP",
   "requires": {
-    "cloud-swarm": ">=1.0.5",
+    "cloud-swarm": ">=1.0.6",
     "mz-control": ">=1.0.7"
   },
   "changes": [
     {
-      "id": "fix-vps-root-trend-host-color-domain",
-      "description": "Remove hardcoded host color domain/range from the VPS root usage trend Vega spec so data appears for stacks whose VPS hostnames differ from the original seed hosts.",
+      "id": "refresh-monitoring-host-metadata-v2",
+      "description": "Rebuild and redeploy the monitoring stack so OpenSearch trace ingestion uses OTLP collector and Data Prepper pipelines.",
       "phase": "pre_migrate",
       "downtimeMinutes": 0,
       "scope": "stack"
+    },
+    {
+      "id": "sync-magento-apm-profiler-bootstrap",
+      "description": "Ensure Magento PHP services keep profiler bootstrap wiring aligned with current observability runtime configuration.",
+      "phase": "pre_migrate",
+      "downtimeMinutes": 0,
+      "scope": "environment"
     }
   ]
 }

@@ -2290,7 +2290,7 @@ function aggregateInspectionHistory(
 }
 
 /**
- * Query the monitoring stack's OpenSearch for recent Metricbeat and APM aggregated metrics.
+ * Query the monitoring stack's OpenSearch for recent Metricbeat and trace analytics aggregates.
  * Returns per-service metrics keyed by service short name (e.g. "database", "redis-cache").
  */
 async function collectMonitoringMetrics(): Promise<Record<string, Record<string, InspectionMetricValue>>> {
@@ -2309,25 +2309,34 @@ async function collectMonitoringMetrics(): Promise<Record<string, Record<string,
     }
     const containerId = osContainer.Id;
 
-    // Query APM for average transaction duration per service (last 30 min)
+    // Query trace analytics (OTel raw spans) for root-span latency per service (last 30 min)
     const apmQuery = JSON.stringify({
       size: 0,
-      query: { range: { '@timestamp': { gte: 'now-30m' } } },
+      query: {
+        bool: {
+          must: [
+            { range: { startTime: { gte: 'now-30m' } } },
+          ],
+          must_not: [
+            { exists: { field: 'parentSpanId' } },
+          ],
+        },
+      },
       aggs: {
         by_service: {
-          terms: { field: 'context.service.name', size: 50 },
+          terms: { field: 'serviceName', size: 50 },
           aggs: {
-            avg_duration: { avg: { field: 'transaction.duration.us' } },
-            p95_duration: { percentiles: { field: 'transaction.duration.us', percents: [95] } },
+            avg_duration: { avg: { field: 'durationInNanos' } },
+            p95_duration: { percentiles: { field: 'durationInNanos', percents: [95] } },
             error_rate: {
-              filter: { term: { 'transaction.result': 'HTTP 5xx' } },
+              filter: { term: { 'status.code': 2 } },
             },
-            total: { value_count: { field: 'transaction.duration.us' } },
+            total: { value_count: { field: 'durationInNanos' } },
           },
         },
       },
     });
-    const apmCmd = ['sh', '-c', `curl -sf 'http://localhost:9200/apm-*/_search' -H 'Content-Type: application/json' -d '${apmQuery.replace(/'/g, "'\\''")}'`];
+    const apmCmd = ['sh', '-c', `curl -sf 'http://localhost:9200/otel-v1-apm-span-*/_search' -H 'Content-Type: application/json' -d '${apmQuery.replace(/'/g, "'\\''")}'`];
     try {
       const apmResult = await execContainerCommand(containerId, apmCmd, 10000);
       if (apmResult.exitCode === 0 && apmResult.stdout) {
@@ -2336,10 +2345,12 @@ async function collectMonitoringMetrics(): Promise<Record<string, Record<string,
         for (const bucket of buckets) {
           const serviceName = String(bucket.key ?? '');
           if (!serviceName) continue;
-          // APM service names are like "mz-env-5", map to the env
+          // Service names are like "mz-env-5", map to the env
           if (!result[serviceName]) result[serviceName] = {};
-          result[serviceName]['apm_avg_duration_us'] = bucket.avg_duration?.value ?? null;
-          result[serviceName]['apm_p95_duration_us'] = bucket.p95_duration?.values?.['95.0'] ?? null;
+          const avgDurationNs = bucket.avg_duration?.value;
+          const p95DurationNs = bucket.p95_duration?.values?.['95.0'];
+          result[serviceName]['apm_avg_duration_us'] = Number.isFinite(avgDurationNs) ? avgDurationNs / 1000 : null;
+          result[serviceName]['apm_p95_duration_us'] = Number.isFinite(p95DurationNs) ? p95DurationNs / 1000 : null;
           result[serviceName]['apm_request_count'] = bucket.total?.value ?? null;
           result[serviceName]['apm_error_count'] = bucket.error_rate?.doc_count ?? null;
         }

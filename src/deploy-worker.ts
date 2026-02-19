@@ -2109,7 +2109,8 @@ async function ensureCloudSwarmRepo() {
 const MONITORING_RUNTIME_SERVICES = [
   'mz-monitoring_opensearch',
   'mz-monitoring_opensearch-dashboards',
-  'mz-monitoring_apm-server',
+  'mz-monitoring_otel-collector',
+  'mz-monitoring_data-prepper',
   'mz-monitoring_metricbeat',
   'mz-monitoring_filebeat',
 ] as const;
@@ -4467,8 +4468,9 @@ async function processDeployment(recordPath: string) {
     SMTP_FROM_ADDRESS: process.env.SMTP_FROM_ADDRESS || (envHostnameOnly ? `no-reply@${envHostnameOnly}` : ''),
     SMTP_FROM_HOSTNAME: process.env.SMTP_FROM_HOSTNAME || envHostnameOnly,
     // APM + Magento observability module config (rendered into app/etc/config.php).
+    // The profiler now emits OTLP traces to collector HTTP (/v1/traces).
     MZ_APM_ENABLED: apmEnabledValue,
-    MZ_APM_SERVER_URL: process.env.MZ_APM_SERVER_URL || `http://mz-monitoring_apm-server:8200`,
+    MZ_APM_SERVER_URL: process.env.MZ_APM_SERVER_URL || `http://mz-monitoring_otel-collector:4318/v1/traces`,
     MZ_APM_SAMPLE_RATE: process.env.MZ_APM_SAMPLE_RATE || '1.0',
     MZ_APM_SERVICE_NAME: `mz-env-${environmentId}`,
     MZ_APM_ENVIRONMENT: envTypeRaw || 'production',

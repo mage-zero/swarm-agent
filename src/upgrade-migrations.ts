@@ -25,7 +25,8 @@ const CLOUD_SWARM_REPO = process.env.MZ_CLOUD_SWARM_REPO || 'git@github.com:mage
 const CLOUD_SWARM_KEY_PATH = process.env.MZ_CLOUD_SWARM_KEY_PATH || '/opt/mage-zero/keys/cloud-swarm-deploy';
 const DEFAULT_MONITORING_ENV: Record<string, string> = {
   OPENSEARCH_VERSION: '2.12.0',
-  APM_SERVER_VERSION: '7.12.1',
+  OTEL_COLLECTOR_VERSION: '0.146.0',
+  DATA_PREPPER_VERSION: '2.12.0',
   FILEBEAT_VERSION: '7.12.1',
   METRICBEAT_VERSION: '7.12.1',
   MZ_MONITORING_OPENSEARCH_JAVA_OPTS: '-Xms512m -Xmx512m',
