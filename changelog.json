@@ -1,15 +1,22 @@
 {
-  "version": "0.4.35",
+  "version": "0.4.36",
   "date": "2026-02-19",
-  "summary": "Enable uptime-first frontend HA rebalancing during agent upgrades and preserve the same headroom-aware policy in deploy sizing",
+  "summary": "Fix deploy queue ingestion for state-directory layouts and make aggressive Docker prune history-aware to preserve deploy cache safety",
   "requires": {
     "cloud-swarm": ">=1.0.7",
     "mz-control": ">=1.0.9"
   },
   "changes": [
     {
-      "id": "rebalance-frontend-ha-replicas",
-      "description": "After upgrade, evaluate ready-node capacity and automatically align varnish/nginx/php-fpm replicas and spread policy for uptime-first frontend HA.",
+      "id": "deploy-queue-state-dir-compat",
+      "description": "Deploy worker now consumes queued records from /deployments/queued with fallback to legacy root files, preventing stuck queues when state directories are used.",
+      "phase": "post_migrate",
+      "downtimeMinutes": 0,
+      "scope": "stack"
+    },
+    {
+      "id": "history-aware-aggressive-prune",
+      "description": "Aggressive Docker prune now only targets objects older than the previous successful deploy timestamp minus a configurable lookback window.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"

@@ -99,12 +99,15 @@ type DeployHistoryEntry = {
   failedArtifacts?: string[];
   failedImageTags?: string[];
   updated_at?: string;
+  last_success_at?: string;
+  last_failure_at?: string;
 };
 
 type DeployHistory = Record<string, DeployHistoryEntry>;
 
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/deployments';
+const DEPLOY_QUEUED_DIR = process.env.MZ_DEPLOY_QUEUED_DIR || path.join(DEPLOY_QUEUE_DIR, 'queued');
 const DEPLOY_WORK_DIR = process.env.MZ_DEPLOY_WORK_DIR || '/opt/mage-zero/deployments/work';
 const DEPLOY_HISTORY_FILE = process.env.MZ_DEPLOY_HISTORY_FILE || path.join(DEPLOY_QUEUE_DIR, 'meta', 'history.json');
 const LEGACY_DEPLOY_HISTORY_FILE = path.join(DEPLOY_QUEUE_DIR, 'history.json');
@@ -153,6 +156,10 @@ const DEPLOY_MIN_FREE_GB = Number(process.env.MZ_DEPLOY_MIN_FREE_GB || 15);
 const DEPLOY_AGGRESSIVE_PRUNE_ENABLED = (process.env.MZ_DEPLOY_AGGRESSIVE_PRUNE_ENABLED || '1') !== '0';
 const DEPLOY_AGGRESSIVE_PRUNE_MIN_FREE_GB = Number(
   process.env.MZ_DEPLOY_AGGRESSIVE_PRUNE_MIN_FREE_GB || DEPLOY_MIN_FREE_GB
+);
+const DEPLOY_AGGRESSIVE_PRUNE_SUCCESS_LOOKBACK_HOURS = Math.max(
+  1,
+  Number(process.env.MZ_DEPLOY_AGGRESSIVE_PRUNE_SUCCESS_LOOKBACK_HOURS || 24)
 );
 const DEPLOY_ABORT_MIN_FREE_GB = Number(process.env.MZ_DEPLOY_ABORT_MIN_FREE_GB || 5);
 const DEPLOY_BUILD_RETRIES = Math.max(0, Number(process.env.MZ_DEPLOY_BUILD_RETRIES || 1));
@@ -528,6 +535,18 @@ function getProcessingDir() {
   return path.join(DEPLOY_QUEUE_DIR, 'processing');
 }
 
+function getQueueSourceDirs(
+  queuedDir = DEPLOY_QUEUED_DIR,
+  queueDir = DEPLOY_QUEUE_DIR
+): string[] {
+  const primary = path.resolve(queuedDir);
+  const legacy = path.resolve(queueDir);
+  if (primary === legacy) {
+    return [primary];
+  }
+  return [primary, legacy];
+}
+
 function readNodeFile(name: string): string {
   try {
     return fs.readFileSync(path.join(NODE_DIR, name), 'utf8').trim();
@@ -624,14 +643,55 @@ function normalizeHistoryList(values: unknown): string[] {
   return output;
 }
 
-function getDeploymentHistoryEntry(history: DeployHistory, key: string): Required<Pick<DeployHistoryEntry, 'artifacts' | 'imageTags' | 'failedArtifacts' | 'failedImageTags'>> {
+function getDeploymentHistoryEntry(
+  history: DeployHistory,
+  key: string
+): Required<Pick<DeployHistoryEntry, 'artifacts' | 'imageTags' | 'failedArtifacts' | 'failedImageTags'>> & { last_success_at?: string } {
   const entry = history[key] || {};
+  const lastSuccessAt = String((entry as DeployHistoryEntry).last_success_at || '').trim();
   return {
     artifacts: normalizeHistoryList((entry as DeployHistoryEntry).artifacts),
     imageTags: normalizeHistoryList((entry as DeployHistoryEntry).imageTags),
     failedArtifacts: normalizeHistoryList((entry as DeployHistoryEntry).failedArtifacts),
     failedImageTags: normalizeHistoryList((entry as DeployHistoryEntry).failedImageTags),
+    last_success_at: lastSuccessAt || undefined,
   };
+}
+
+function parseIsoTimestampMs(value: string | null | undefined): number | null {
+  const normalized = String(value || '').trim();
+  if (!normalized) return null;
+  const parsed = Date.parse(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function getHistoryLastSuccessfulDeployAt(history: DeployHistory, key: string): string | null {
+  const raw = String((history[key] as DeployHistoryEntry | undefined)?.last_success_at || '').trim();
+  if (!raw) {
+    return null;
+  }
+  return parseIsoTimestampMs(raw) === null ? null : raw;
+}
+
+function resolveAggressivePruneCutoffSeconds(
+  previousSuccessAt: string | null,
+  nowMs = Date.now(),
+  lookbackHours = DEPLOY_AGGRESSIVE_PRUNE_SUCCESS_LOOKBACK_HOURS
+): number | null {
+  const successMs = parseIsoTimestampMs(previousSuccessAt);
+  if (successMs === null) {
+    return null;
+  }
+  const hours = Math.max(1, Number(lookbackHours) || 24);
+  const cutoffMs = successMs - (hours * 60 * 60 * 1000);
+  if (!Number.isFinite(cutoffMs) || cutoffMs <= 0) {
+    return null;
+  }
+  // Clock skew or bad timestamps: never ask docker to prune "future" objects.
+  if (cutoffMs >= nowMs) {
+    return null;
+  }
+  return Math.floor(cutoffMs / 1000);
 }
 
 function updateDeploymentHistory(
@@ -653,12 +713,14 @@ function updateDeploymentHistory(
   // A successful deploy supersedes failed retries: purge failed retention immediately.
   const removedFailedArtifacts = [...existing.failedArtifacts];
   const removedFailedImageTags = [...existing.failedImageTags];
+  const nowIso = new Date().toISOString();
   history[key] = {
     artifacts: keepArtifacts,
     imageTags: keepImageTags,
     failedArtifacts: [],
     failedImageTags: [],
-    updated_at: new Date().toISOString(),
+    updated_at: nowIso,
+    last_success_at: nowIso,
   };
   return {
     keepArtifacts,
@@ -692,12 +754,15 @@ function updateFailedDeploymentHistory(
   const removedFailedArtifacts = failedArtifacts.slice(DEPLOY_FAILED_ARTIFACT_RETAIN_COUNT);
   const removedFailedImageTags = failedImageTags.slice(DEPLOY_FAILED_IMAGE_RETAIN_COUNT);
 
+  const nowIso = new Date().toISOString();
   history[key] = {
     artifacts: existing.artifacts,
     imageTags: existing.imageTags,
     failedArtifacts: keepFailedArtifacts,
     failedImageTags: keepFailedImageTags,
-    updated_at: new Date().toISOString(),
+    updated_at: nowIso,
+    last_success_at: existing.last_success_at,
+    last_failure_at: nowIso,
   };
 
   return {
@@ -1240,7 +1305,7 @@ async function runRegistryGc() {
   }
 }
 
-async function maybeAggressivePrune(stage: string) {
+async function maybeAggressivePrune(stage: string, previousSuccessAt: string | null = null) {
   if (!DEPLOY_AGGRESSIVE_PRUNE_ENABLED || DEPLOY_AGGRESSIVE_PRUNE_MIN_FREE_GB <= 0) {
     return;
   }
@@ -1253,17 +1318,33 @@ async function maybeAggressivePrune(stage: string) {
     return;
   }
 
+  const cutoffSeconds = resolveAggressivePruneCutoffSeconds(previousSuccessAt);
+  if (cutoffSeconds === null) {
+    console.warn(`cleanup: ${stage}: no valid previous successful deploy timestamp; skipping aggressive prune`);
+    return;
+  }
+  const cutoffIso = new Date(cutoffSeconds * 1000).toISOString();
+
   console.warn(
-    `cleanup: ${stage}: free space ${freeGb}GB < ${DEPLOY_AGGRESSIVE_PRUNE_MIN_FREE_GB}GB; running docker prune`
+    `cleanup: ${stage}: free space ${freeGb}GB < ${DEPLOY_AGGRESSIVE_PRUNE_MIN_FREE_GB}GB; ` +
+    `running docker prune until ${cutoffIso} (previous-success minus ${DEPLOY_AGGRESSIVE_PRUNE_SUCCESS_LOOKBACK_HOURS}h)`
   );
   try {
-    await runCommand('docker', ['system', 'prune', '-a', '--volumes', '-f']);
+    await runCommand('docker', [
+      'system',
+      'prune',
+      '-a',
+      '--volumes',
+      '--filter',
+      `until=${cutoffSeconds}`,
+      '-f',
+    ]);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`cleanup: docker system prune failed: ${message}`);
   }
   try {
-    await runCommand('docker', ['builder', 'prune', '-a', '-f']);
+    await runCommand('docker', ['builder', 'prune', '-a', '--filter', `until=${cutoffSeconds}`, '-f']);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`cleanup: docker builder prune failed: ${message}`);
@@ -1282,6 +1363,7 @@ async function cleanupDeploymentResources(params: {
   mageVersion: string;
   stackName: string;
   r2: R2PresignContext;
+  previousSuccessAt: string | null;
 }) {
   const history = readDeploymentHistory();
   const normalizedArtifactKey = params.artifactKey.replace(/^\/+/, '');
@@ -1346,17 +1428,24 @@ async function cleanupDeploymentResources(params: {
     await runRegistryGc();
   }
 
-  await maybeAggressivePrune('post-deploy');
+  await maybeAggressivePrune('post-deploy', params.previousSuccessAt);
 }
 
 function listQueueFiles(): string[] {
-  if (!fs.existsSync(DEPLOY_QUEUE_DIR)) {
-    return [];
+  const queueDirs = getQueueSourceDirs();
+  for (const dirPath of queueDirs) {
+    if (!fs.existsSync(dirPath)) {
+      continue;
+    }
+    const files = fs.readdirSync(dirPath, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && DEPLOY_RECORD_FILENAME.test(entry.name))
+      .map((entry) => path.join(dirPath, entry.name))
+      .sort((a, b) => a.localeCompare(b));
+    if (files.length) {
+      return files;
+    }
   }
-  return fs.readdirSync(DEPLOY_QUEUE_DIR, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && DEPLOY_RECORD_FILENAME.test(entry.name))
-    .map((entry) => path.join(DEPLOY_QUEUE_DIR, entry.name))
-    .sort((a, b) => a.localeCompare(b));
+  return [];
 }
 
 function claimNextDeployment(): string | null {
@@ -1384,12 +1473,13 @@ function recoverProcessingQueue() {
   if (!fs.existsSync(processingDir)) {
     return;
   }
+  ensureDir(DEPLOY_QUEUED_DIR);
   const entries = fs.readdirSync(processingDir, { withFileTypes: true })
     .filter((entry) => entry.isFile() && DEPLOY_RECORD_FILENAME.test(entry.name))
     .map((entry) => entry.name);
   for (const entry of entries) {
     const source = path.join(processingDir, entry);
-    const target = path.join(DEPLOY_QUEUE_DIR, entry);
+    const target = path.join(DEPLOY_QUEUED_DIR, entry);
     try {
       fs.renameSync(source, target);
       console.warn(`requeued deployment ${entry} after restart`);
@@ -1405,7 +1495,8 @@ function requeueCurrentDeployment() {
     return;
   }
   try {
-    const target = path.join(DEPLOY_QUEUE_DIR, path.basename(currentDeploymentPath));
+    ensureDir(DEPLOY_QUEUED_DIR);
+    const target = path.join(DEPLOY_QUEUED_DIR, path.basename(currentDeploymentPath));
     if (fs.existsSync(currentDeploymentPath)) {
       fs.renameSync(currentDeploymentPath, target);
     }
@@ -3774,8 +3865,8 @@ function writeJsonFileBestEffort(filePath: string, payload: unknown) {
 }
 
 function enqueueDeploymentRecord(payload: DeployPayload, deploymentId: string) {
-  ensureDir(DEPLOY_QUEUE_DIR);
-  const target = path.join(DEPLOY_QUEUE_DIR, `${deploymentId}.json`);
+  ensureDir(DEPLOY_QUEUED_DIR);
+  const target = path.join(DEPLOY_QUEUED_DIR, `${deploymentId}.json`);
   writeJsonFileBestEffort(target, { id: deploymentId, queued_at: new Date().toISOString(), payload });
 }
 
@@ -4350,6 +4441,8 @@ async function processDeployment(recordPath: string) {
   const stackId = Number(payload.stack_id ?? 0);
   const environmentId = Number(payload.environment_id ?? 0);
   const repository = String(payload.repository || '').trim() || inferRepositoryFromArtifactKey(artifactKey);
+  const deploymentHistoryKey = `env:${environmentId}:${repository || 'unknown'}`;
+  const prunePreviousSuccessAt = getHistoryLastSuccessfulDeployAt(readDeploymentHistory(), deploymentHistoryKey);
   const ref = String(payload.ref || '').trim();
   const logPrefix = `[deploy ${deploymentId}]`;
   const log = (message: string) => {
@@ -4378,7 +4471,7 @@ async function processDeployment(recordPath: string) {
   });
   log('reported deploying status');
 
-  await maybeAggressivePrune('pre-deploy');
+  await maybeAggressivePrune('pre-deploy', prunePreviousSuccessAt);
   await ensureMinimumFreeSpace('pre-deploy');
 
   await ensureCloudSwarmRepo();
@@ -4724,7 +4817,7 @@ async function processDeployment(recordPath: string) {
         retries: DEPLOY_BUILD_RETRIES,
         log,
         onRetry: async () => {
-          await maybeAggressivePrune('build-services-retry');
+          await maybeAggressivePrune('build-services-retry', prunePreviousSuccessAt);
           await ensureMinimumFreeSpace('build-services-retry');
         },
       }
@@ -4749,7 +4842,7 @@ async function processDeployment(recordPath: string) {
         retries: DEPLOY_BUILD_RETRIES,
         log,
         onRetry: async () => {
-          await maybeAggressivePrune('build-magento-retry');
+          await maybeAggressivePrune('build-magento-retry', prunePreviousSuccessAt);
           await ensureMinimumFreeSpace('build-magento-retry');
           if (rebuiltServiceImagesForManifestRecovery) {
             return;
@@ -4769,7 +4862,7 @@ async function processDeployment(recordPath: string) {
               retries: DEPLOY_BUILD_RETRIES,
               log,
               onRetry: async () => {
-                await maybeAggressivePrune('build-services-recovery-retry');
+                await maybeAggressivePrune('build-services-recovery-retry', prunePreviousSuccessAt);
                 await ensureMinimumFreeSpace('build-services-recovery-retry');
               },
             }
@@ -5340,6 +5433,7 @@ async function processDeployment(recordPath: string) {
       mageVersion,
       stackName,
       r2,
+      previousSuccessAt: prunePreviousSuccessAt,
     });
     log('cleanup complete');
   } catch (error) {
@@ -5368,6 +5462,7 @@ async function cleanupFailedArtifact(record: Record<string, any>) {
     const repository = String(payload.repository || '').trim() || inferRepositoryFromArtifactKey(normalizedArtifactKey) || 'unknown';
     const history = readDeploymentHistory();
     const key = `env:${environmentId}:${repository}`;
+    const prunePreviousSuccessAt = getHistoryLastSuccessfulDeployAt(history, key);
     const deploymentId = String(record?.id || '').trim();
     const ref = String(payload.ref || '').trim();
     const imageTag = resolveImageTag(normalizedArtifactKey, ref, deploymentId);
@@ -5453,7 +5548,7 @@ async function cleanupFailedArtifact(record: Record<string, any>) {
       await runRegistryGc();
     }
 
-    await maybeAggressivePrune('post-failed-deploy');
+    await maybeAggressivePrune('post-failed-deploy', prunePreviousSuccessAt);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`cleanup failed artifact error: ${message}`);
@@ -5544,6 +5639,7 @@ export function startDeploymentWorker() {
     return;
   }
   ensureDir(DEPLOY_QUEUE_DIR);
+  ensureDir(DEPLOY_QUEUED_DIR);
   ensureDir(DEPLOY_WORK_DIR);
   recoverProcessingQueue();
   process.on('SIGTERM', () => {
@@ -5566,4 +5662,7 @@ export const __testing = {
   buildSearchSystemConfigSql,
   resolveMageProfilerEnv,
   resolveAppHaReplicaPolicy,
+  getQueueSourceDirs,
+  resolveAggressivePruneCutoffSeconds,
+  getHistoryLastSuccessfulDeployAt,
 };

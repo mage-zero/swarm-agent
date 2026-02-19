@@ -26,6 +26,7 @@ import {
 
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/deployments';
+const DEPLOY_QUEUED_DIR = process.env.MZ_DEPLOY_QUEUED_DIR || path.join(DEPLOY_QUEUE_DIR, 'queued');
 const DEPLOY_FAILED_DIR = path.join(DEPLOY_QUEUE_DIR, 'failed');
 const DEPLOY_PROCESSING_DIR = path.join(DEPLOY_QUEUE_DIR, 'processing');
 const DEPLOY_WORK_DIR = path.join(DEPLOY_QUEUE_DIR, 'work');
@@ -4278,8 +4279,8 @@ function ensureDir(target: string) {
 }
 
 function enqueueDeploymentRecord(payload: Record<string, unknown>, deploymentId: string) {
-  ensureDir(DEPLOY_QUEUE_DIR);
-  const target = path.join(DEPLOY_QUEUE_DIR, `${deploymentId}.json`);
+  ensureDir(DEPLOY_QUEUED_DIR);
+  const target = path.join(DEPLOY_QUEUED_DIR, `${deploymentId}.json`);
   fs.writeFileSync(
     target,
     JSON.stringify({ id: deploymentId, queued_at: new Date().toISOString(), payload }, null, 2),
@@ -4400,12 +4401,23 @@ async function runDeployRetryLatest(environmentId: number): Promise<RunbookResul
     timestampFields: ['updated_at', 'queued_at'],
   });
   const queued = collectDeploymentStateRecords({
-    dirPath: DEPLOY_QUEUE_DIR,
+    dirPath: DEPLOY_QUEUED_DIR,
     state: 'queued',
     environmentId,
     filenamePattern: DEPLOY_RECORD_FILENAME,
     timestampFields: ['queued_at', 'updated_at'],
   });
+  const queuedLegacy = path.resolve(DEPLOY_QUEUED_DIR) === path.resolve(DEPLOY_QUEUE_DIR)
+    ? []
+    : collectDeploymentStateRecords({
+      dirPath: DEPLOY_QUEUE_DIR,
+      state: 'queued',
+      environmentId,
+      filenamePattern: DEPLOY_RECORD_FILENAME,
+      timestampFields: ['queued_at', 'updated_at'],
+    });
+  const queuedCombined = [...queued, ...queuedLegacy]
+    .sort((a, b) => b.atMs - a.atMs || b.deploymentId.localeCompare(a.deploymentId));
   const failed = collectDeploymentStateRecords({
     dirPath: DEPLOY_FAILED_DIR,
     state: 'failed',
@@ -4414,7 +4426,7 @@ async function runDeployRetryLatest(environmentId: number): Promise<RunbookResul
     timestampFields: ['failed_at', 'updated_at', 'queued_at'],
   });
 
-  const latest = pickLatestDeploymentState([...processing, ...queued, ...failed]);
+  const latest = pickLatestDeploymentState([...processing, ...queuedCombined, ...failed]);
   if (!latest) {
     return {
       runbook_id: 'deploy_retry_latest',

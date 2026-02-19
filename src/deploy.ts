@@ -5,6 +5,7 @@ import { isSwarmManager, readConfig } from './status.js';
 
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/deployments';
+const DEPLOY_QUEUED_DIR = process.env.MZ_DEPLOY_QUEUED_DIR || `${DEPLOY_QUEUE_DIR}/queued`;
 const ADDON_QUEUE_DIR = process.env.MZ_ADDON_QUEUE_DIR || '/opt/mage-zero/addons';
 const DEPLOY_SCRIPT = process.env.MZ_DEPLOY_SCRIPT || '';
 const CLOUD_SWARM_KEY_PATH = process.env.MZ_CLOUD_SWARM_KEY_PATH || '/opt/mage-zero/keys/cloud-swarm-deploy';
@@ -80,8 +81,8 @@ function timingSafeEquals(a: string, b: string) {
 }
 
 function ensureQueueDir() {
-  if (!fs.existsSync(DEPLOY_QUEUE_DIR)) {
-    fs.mkdirSync(DEPLOY_QUEUE_DIR, { recursive: true });
+  if (!fs.existsSync(DEPLOY_QUEUED_DIR)) {
+    fs.mkdirSync(DEPLOY_QUEUED_DIR, { recursive: true });
   }
 }
 
@@ -93,7 +94,7 @@ function ensureAddonQueueDir() {
 
 function enqueueDeployment(payload: DeployPayload, deploymentId: string) {
   ensureQueueDir();
-  const target = `${DEPLOY_QUEUE_DIR}/${deploymentId}.json`;
+  const target = `${DEPLOY_QUEUED_DIR}/${deploymentId}.json`;
   fs.writeFileSync(target, JSON.stringify({ id: deploymentId, queued_at: new Date().toISOString(), payload }, null, 2));
 }
 
