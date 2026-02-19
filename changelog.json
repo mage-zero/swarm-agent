@@ -1,15 +1,15 @@
 {
-  "version": "0.4.39",
+  "version": "0.4.40",
   "date": "2026-02-19",
-  "summary": "Run deploy-time Magento CLI setup/config commands with unlimited PHP memory to prevent OOM failures on tuned stacks",
+  "summary": "Reconcile ProxySQL query rules during deploy so Magento search temporary table queries stay on writer and storefront search does not fail",
   "requires": {
     "cloud-swarm": ">=1.0.7",
     "mz-control": ">=1.0.9"
   },
   "changes": [
     {
-      "id": "deploy-magento-cli-memory-limit",
-      "description": "Deploy worker now runs setup:db:status, setup:upgrade, app:config:status/import, cache:flush, and fallback maintenance commands as php -d memory_limit=-1 bin/magento ... to avoid OOM failures when php memory_limit is tuned low.",
+      "id": "deploy-proxysql-search-tmp-routing-reconcile",
+      "description": "Deploy worker now enforces managed ProxySQL query rules before app rollout, including routing search_tmp_ queries to writer hostgroup and keeping generic SELECT on reader hostgroup. This backfills environments where proxysql runtime rules drifted from template defaults.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"

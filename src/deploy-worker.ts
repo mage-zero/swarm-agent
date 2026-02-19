@@ -191,6 +191,67 @@ const APP_HA_MIN_READY_NODES = Math.max(1, Number(process.env.MZ_APP_HA_MIN_READ
 const APP_HA_MAX_REPLICAS = Math.max(1, Number(process.env.MZ_APP_HA_MAX_REPLICAS || 2));
 const APP_HA_CPU_EPSILON = 0.01;
 
+type ProxySqlQueryRuleSpec = {
+  rule_id: number;
+  active: number;
+  match_pattern: string;
+  destination_hostgroup: number;
+  apply: number;
+  flagIN?: number | null;
+  flagOUT?: number | null;
+  re_modifiers?: string | null;
+};
+
+const PROXYSQL_MANAGED_QUERY_RULES: ProxySqlQueryRuleSpec[] = [
+  {
+    rule_id: 1,
+    active: 1,
+    match_pattern: '^(BEGIN|START TRANSACTION|SET\\s+AUTOCOMMIT\\s*=\\s*0)',
+    destination_hostgroup: 10,
+    apply: 1,
+    flagIN: 0,
+    flagOUT: 1,
+    re_modifiers: 'CASELESS',
+  },
+  {
+    rule_id: 2,
+    active: 1,
+    match_pattern: '^(COMMIT|ROLLBACK)',
+    destination_hostgroup: 10,
+    apply: 1,
+    flagIN: 0,
+    flagOUT: 0,
+    re_modifiers: 'CASELESS',
+  },
+  {
+    rule_id: 3,
+    active: 1,
+    match_pattern: '^SELECT.*FOR UPDATE',
+    destination_hostgroup: 10,
+    apply: 1,
+    flagIN: 0,
+    re_modifiers: 'CASELESS',
+  },
+  {
+    rule_id: 4,
+    active: 1,
+    match_pattern: 'search_tmp_',
+    destination_hostgroup: 10,
+    apply: 1,
+    flagIN: 0,
+    re_modifiers: 'CASELESS',
+  },
+  {
+    rule_id: 5,
+    active: 1,
+    match_pattern: '^SELECT',
+    destination_hostgroup: 20,
+    apply: 1,
+    flagIN: 0,
+    re_modifiers: 'CASELESS',
+  },
+];
+
 type AppHaReplicaPolicyInput = {
   ready_node_count: number;
   free_cpu_cores: number;
@@ -2971,6 +3032,113 @@ async function configureReplicaViaSwarmJob(params: {
   }
 }
 
+function buildProxySqlQueryRulesSql(rules: ProxySqlQueryRuleSpec[] = PROXYSQL_MANAGED_QUERY_RULES): string {
+  const managedRuleIds = rules
+    .map((rule) => Math.floor(Number(rule.rule_id)))
+    .filter((ruleId) => Number.isFinite(ruleId) && ruleId > 0);
+  if (!managedRuleIds.length) {
+    throw new Error('ProxySQL managed rules are empty');
+  }
+
+  const statements: string[] = [
+    `DELETE FROM mysql_query_rules WHERE rule_id IN (${managedRuleIds.join(', ')})`,
+  ];
+
+  for (const rule of rules) {
+    const ruleId = Math.floor(Number(rule.rule_id));
+    if (!Number.isFinite(ruleId) || ruleId <= 0) {
+      throw new Error(`Invalid ProxySQL rule id: ${rule.rule_id}`);
+    }
+
+    const pattern = String(rule.match_pattern || '').trim();
+    if (!pattern) {
+      throw new Error(`ProxySQL rule ${ruleId} has empty match_pattern`);
+    }
+
+    const destinationHostgroup = Math.max(0, Math.floor(Number(rule.destination_hostgroup) || 0));
+    const active = Number(rule.active) === 0 ? 0 : 1;
+    const apply = Number(rule.apply) === 0 ? 0 : 1;
+    const flagIn = Number.isFinite(Number(rule.flagIN)) ? String(Math.floor(Number(rule.flagIN))) : '0';
+    const flagOut = Number.isFinite(Number(rule.flagOUT)) ? String(Math.floor(Number(rule.flagOUT))) : 'NULL';
+    const reModifiersRaw = String(rule.re_modifiers || '').trim();
+    const reModifiers = reModifiersRaw ? `'${escapeSqlValue(reModifiersRaw)}'` : 'NULL';
+
+    statements.push(
+      'INSERT INTO mysql_query_rules '
+      + '(rule_id, active, match_pattern, destination_hostgroup, apply, flagIN, flagOUT, re_modifiers) '
+      + `VALUES (${ruleId}, ${active}, '${escapeSqlValue(pattern)}', ${destinationHostgroup}, ${apply}, ${flagIn}, ${flagOut}, ${reModifiers})`
+    );
+  }
+
+  statements.push('LOAD MYSQL QUERY RULES TO RUNTIME');
+  statements.push('SAVE MYSQL QUERY RULES TO DISK');
+  return `${statements.map((statement) => `${statement};`).join('\n')}\n`;
+}
+
+function buildProxySqlRuleReconcileScript(proxysqlServiceFullName: string): string {
+  const sql = buildProxySqlQueryRulesSql(PROXYSQL_MANAGED_QUERY_RULES).trimEnd();
+  return [
+    'set -eu',
+    `PROXYSQL_HOST="${proxysqlServiceFullName}"`,
+    'SQL_FILE="$(mktemp)"',
+    'cleanup() { rm -f "$SQL_FILE"; }',
+    'trap cleanup EXIT',
+    "cat > \"$SQL_FILE\" <<'SQL'",
+    sql,
+    'SQL',
+    'CLIENT=""',
+    'if command -v mariadb >/dev/null 2>&1; then CLIENT="mariadb"; elif command -v mysql >/dev/null 2>&1; then CLIENT="mysql"; fi',
+    'if [ -z "$CLIENT" ]; then echo "missing mariadb/mysql client" >&2; exit 2; fi',
+    'i=0; until $CLIENT -h "$PROXYSQL_HOST" -P 6032 -u admin -padmin -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 60 ]; then echo "proxysql admin not ready" >&2; exit 1; fi; sleep 1; done',
+    '$CLIENT -h "$PROXYSQL_HOST" -P 6032 -u admin -padmin < "$SQL_FILE"',
+  ].join('\n');
+}
+
+async function enforceProxySqlQueryRules(params: {
+  environmentId: number;
+  log: (message: string) => void;
+}): Promise<void> {
+  const proxysqlServiceFullName = envServiceName(params.environmentId, 'proxysql');
+  const proxysqlSpec = await inspectServiceSpec(proxysqlServiceFullName);
+  if (!proxysqlSpec) {
+    throw new Error(`proxysql query rules: missing service ${proxysqlServiceFullName}`);
+  }
+
+  const networks = Array.from(new Set(proxysqlSpec.networks.map((net) => net.name).filter(Boolean)));
+  if (!networks.length) networks.push('mz-backend');
+
+  const tasks = await listServiceTasks(proxysqlServiceFullName);
+  const runningTask = tasks.find((task) => task.current_state.startsWith('Running') && task.node)
+    || tasks.find((task) => Boolean(task.node));
+  const constraints = runningTask?.node ? [`node.hostname==${runningTask.node}`] : [];
+  const script = buildProxySqlRuleReconcileScript(proxysqlServiceFullName);
+
+  let lastError: Error | null = null;
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const job = await runSwarmJob({
+      name: buildJobName('deploy-proxysql-rules', params.environmentId),
+      image: proxysqlSpec.image,
+      networks,
+      constraints,
+      command: ['sh', '-lc', script],
+      timeout_ms: 120_000,
+    });
+
+    if (job.ok) {
+      params.log('proxysql query rules: reconciled (search_tmp_ -> writer, SELECT -> reader)');
+      return;
+    }
+
+    const detail = (job.logs || job.error || '').trim();
+    lastError = new Error(detail || `swarm job failed (${job.state})`);
+    params.log(`proxysql query rules attempt ${attempt}/${maxAttempts} failed: ${lastError.message}`);
+    await delay(2000);
+  }
+
+  throw lastError || new Error('proxysql query rules reconciliation failed');
+}
+
 async function runDatabaseCommandWithRetry(
   stackName: string,
   containerId: string,
@@ -5173,6 +5341,12 @@ async function processDeployment(recordPath: string) {
   }
   envVars.MZ_SEARCH_ENGINE = searchEngine;
 
+  progress.detail('deploy_stack', 'Reconciling ProxySQL query routing rules');
+  await enforceProxySqlQueryRules({
+    environmentId,
+    log,
+  });
+
   progress.detail('deploy_stack', `Deploying application (search engine: ${searchEngine})`);
   await runCommandLogged('docker', [
     'stack',
@@ -5899,6 +6073,7 @@ export const __testing = {
   resolveMageProfilerEnv,
   resolveAppHaReplicaPolicy,
   resolveFrontendRuntimePolicy,
+  buildProxySqlQueryRulesSql,
   getQueueSourceDirs,
   resolveAggressivePruneCutoffSeconds,
   getHistoryLastSuccessfulDeployAt,
