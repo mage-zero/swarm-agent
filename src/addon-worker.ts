@@ -414,7 +414,7 @@ async function deployAddon(record: DeploymentRecord, deploymentId: string) {
       '--replicas',
       '1',
       '--restart-condition',
-      'on-failure',
+      'any',
       '--update-order',
       'start-first',
       '--update-failure-action',

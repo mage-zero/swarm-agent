@@ -65,6 +65,8 @@ type ServiceReplicaConfig = {
   max_replicas_per_node: number;
   reserve_cpu_cores: number;
   reserve_memory_bytes: number;
+  restart_condition: string;
+  update_order: string;
 };
 
 type ServiceReplicaApplyResult = {
@@ -250,12 +252,18 @@ async function inspectServiceReplicaConfig(serviceName: string): Promise<Service
   const reserveCpu = toCpuCores(reservations?.NanoCPUs);
   const reserveMemoryRaw = Number(reservations?.MemoryBytes || 0);
   const reserveMemory = Number.isFinite(reserveMemoryRaw) ? Math.max(0, Math.round(reserveMemoryRaw)) : 0;
+  const restartPolicy = taskTemplate?.RestartPolicy as Record<string, unknown> | undefined;
+  const restartCondition = String(restartPolicy?.Condition || '').trim().toLowerCase();
+  const updateConfig = spec.UpdateConfig as Record<string, unknown> | undefined;
+  const updateOrder = String(updateConfig?.Order || '').trim().toLowerCase();
 
   return {
     replicas,
     max_replicas_per_node: maxReplicasPerNode,
     reserve_cpu_cores: reserveCpu,
     reserve_memory_bytes: reserveMemory,
+    restart_condition: restartCondition,
+    update_order: updateOrder,
   };
 }
 
@@ -324,6 +332,65 @@ async function applyServiceReplicaPolicy(
   }
 
   return { status: 'updated', detail: `replicas=${desiredReplicas} max_per_node=${desiredMaxPerNode}` };
+}
+
+async function applyServiceRuntimePolicy(
+  serviceName: string,
+  policy: {
+    restart_condition?: 'none' | 'on-failure' | 'any';
+    update_order?: 'start-first' | 'stop-first';
+    force?: boolean;
+  },
+): Promise<ServiceReplicaApplyResult> {
+  let current: ServiceReplicaConfig | null;
+  try {
+    current = await inspectServiceReplicaConfig(serviceName);
+  } catch (error) {
+    return {
+      status: 'failed',
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  if (!current) {
+    return { status: 'skipped', detail: 'service not found' };
+  }
+
+  const args: string[] = ['service', 'update'];
+  const details: string[] = [];
+  if (policy.restart_condition && current.restart_condition !== policy.restart_condition) {
+    args.push('--restart-condition', policy.restart_condition);
+    details.push(`restart=${policy.restart_condition}`);
+  }
+  if (policy.update_order && current.update_order !== policy.update_order) {
+    args.push('--update-order', policy.update_order, '--rollback-order', policy.update_order);
+    details.push(`order=${policy.update_order}`);
+  }
+  if (policy.force) {
+    args.push('--force');
+    details.push('force=true');
+  }
+  if (!details.length) {
+    return { status: 'skipped', detail: 'already aligned' };
+  }
+  args.push(serviceName);
+
+  const update = await runCommand('docker', args, 120_000);
+  if (update.code !== 0) {
+    const combined = `${update.stdout || ''}\n${update.stderr || ''}`;
+    if (isNoSuchServiceOutput(combined)) {
+      return { status: 'skipped', detail: 'service not found during update' };
+    }
+    if (isNoopServiceUpdateOutput(combined)) {
+      return { status: 'skipped', detail: 'nothing to update' };
+    }
+    return {
+      status: 'failed',
+      detail: combined.trim() || `docker service update failed (exit ${update.code})`,
+    };
+  }
+
+  return { status: 'updated', detail: details.join(' ') };
 }
 
 async function fetchStackSnapshot(ctx: MigrationContext): Promise<StackSnapshot> {
@@ -780,15 +847,116 @@ registerMigration('rebalance-frontend-ha-replicas', async (ctx) => {
   }
 
   const targetReplicas = decision.replicas;
-  const maxReplicasPerNode = 1;
+  const maxReplicasPerNode = targetReplicas > 1 ? 1 : 0;
+  const updateOrder: 'start-first' | 'stop-first' = targetReplicas > 1 ? 'stop-first' : 'start-first';
   const services = [varnishService, nginxService, phpFpmService];
   for (const serviceName of services) {
-    const result = await applyServiceReplicaPolicy(serviceName, targetReplicas, maxReplicasPerNode);
-    if (result.status === 'failed') {
-      console.warn(`upgrade.migration.rebalance_frontend_ha_replicas: env=${environmentId} ${serviceName} failed (${result.detail})`);
+    const replicaResult = await applyServiceReplicaPolicy(serviceName, targetReplicas, maxReplicasPerNode);
+    if (replicaResult.status === 'failed') {
+      console.warn(`upgrade.migration.rebalance_frontend_ha_replicas: env=${environmentId} ${serviceName} failed (${replicaResult.detail})`);
       continue;
     }
-    console.log(`upgrade.migration.rebalance_frontend_ha_replicas: env=${environmentId} ${serviceName} ${result.status} (${result.detail})`);
+    console.log(
+      `upgrade.migration.rebalance_frontend_ha_replicas: env=${environmentId} ${serviceName} `
+      + `${replicaResult.status} (${replicaResult.detail})`
+    );
+
+    const runtimeResult = await applyServiceRuntimePolicy(serviceName, {
+      restart_condition: 'any',
+      update_order: updateOrder,
+      // Refresh Varnish workers so backend DNS/IP bindings are rebuilt after
+      // frontend topology changes (nginx/vip movement).
+      force: serviceName === varnishService,
+    });
+    if (runtimeResult.status === 'failed') {
+      console.warn(`upgrade.migration.rebalance_frontend_ha_replicas: env=${environmentId} ${serviceName} runtime failed (${runtimeResult.detail})`);
+      continue;
+    }
+    console.log(
+      `upgrade.migration.rebalance_frontend_ha_replicas: env=${environmentId} ${serviceName} `
+      + `runtime ${runtimeResult.status} (${runtimeResult.detail})`
+    );
+  }
+});
+
+registerMigration('normalize-env-runtime-policies', async (ctx) => {
+  const environmentId = Number(ctx.environmentId || 0);
+  if (!Number.isFinite(environmentId) || environmentId <= 0) {
+    console.warn('upgrade.migration.normalize_env_runtime_policies: missing environmentId; skipping');
+    return;
+  }
+
+  const frontendServices = [
+    envServiceName(environmentId, 'varnish'),
+    envServiceName(environmentId, 'nginx'),
+    envServiceName(environmentId, 'php-fpm'),
+  ];
+  for (const serviceName of frontendServices) {
+    const current = await inspectServiceReplicaConfig(serviceName);
+    if (!current) {
+      console.log(`upgrade.migration.normalize_env_runtime_policies: env=${environmentId} ${serviceName} skipped (missing)`);
+      continue;
+    }
+    const desiredMaxPerNode = current.replicas > 1 ? 1 : 0;
+    const desiredOrder: 'start-first' | 'stop-first' = current.replicas > 1 ? 'stop-first' : 'start-first';
+
+    const replicaResult = await applyServiceReplicaPolicy(serviceName, current.replicas, desiredMaxPerNode);
+    if (replicaResult.status === 'failed') {
+      console.warn(
+        `upgrade.migration.normalize_env_runtime_policies: env=${environmentId} ${serviceName} `
+        + `replica failed (${replicaResult.detail})`
+      );
+      continue;
+    }
+    console.log(
+      `upgrade.migration.normalize_env_runtime_policies: env=${environmentId} ${serviceName} `
+      + `replica ${replicaResult.status} (${replicaResult.detail})`
+    );
+
+    const runtimeResult = await applyServiceRuntimePolicy(serviceName, {
+      restart_condition: 'any',
+      update_order: desiredOrder,
+      force: serviceName.endsWith('_varnish'),
+    });
+    if (runtimeResult.status === 'failed') {
+      console.warn(
+        `upgrade.migration.normalize_env_runtime_policies: env=${environmentId} ${serviceName} `
+        + `runtime failed (${runtimeResult.detail})`
+      );
+      continue;
+    }
+    console.log(
+      `upgrade.migration.normalize_env_runtime_policies: env=${environmentId} ${serviceName} `
+      + `runtime ${runtimeResult.status} (${runtimeResult.detail})`
+    );
+  }
+
+  const serviceSuffixes = [
+    'php-fpm-admin',
+    'cron',
+    'database',
+    'database-replica',
+    'proxysql',
+    'opensearch',
+    'redis-cache',
+    'redis-session',
+    'rabbitmq',
+    'mailhog',
+  ];
+  for (const suffix of serviceSuffixes) {
+    const serviceName = envServiceName(environmentId, suffix);
+    const result = await applyServiceRuntimePolicy(serviceName, { restart_condition: 'any' });
+    if (result.status === 'failed') {
+      console.warn(
+        `upgrade.migration.normalize_env_runtime_policies: env=${environmentId} ${serviceName} `
+        + `failed (${result.detail})`
+      );
+      continue;
+    }
+    console.log(
+      `upgrade.migration.normalize_env_runtime_policies: env=${environmentId} ${serviceName} `
+      + `${result.status} (${result.detail})`
+    );
   }
 });
 

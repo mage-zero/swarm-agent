@@ -208,8 +208,8 @@ describe('rebalance-frontend-ha-replicas migration', () => {
       cloudSwarmDir: '/tmp/cloud-swarm',
     });
 
-    expectReplicaUpdate(updates, 'mz-env-22_varnish', 1);
-    expectReplicaUpdate(updates, 'mz-env-22_nginx', 1);
-    expectReplicaUpdate(updates, 'mz-env-22_php-fpm', 1);
+    expectReplicaUpdate(updates, 'mz-env-22_varnish', 1, 0);
+    expectReplicaUpdate(updates, 'mz-env-22_nginx', 1, 0);
+    expectReplicaUpdate(updates, 'mz-env-22_php-fpm', 1, 0);
   });
 });

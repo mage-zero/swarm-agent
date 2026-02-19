@@ -4559,6 +4559,12 @@ async function processDeployment(recordPath: string) {
   const registryPort = process.env.REGISTRY_PORT || '5000';
   const registryCachePort = process.env.REGISTRY_CACHE_PORT || registryPort;
   const buildxNetwork = process.env.BUILDX_NETWORK || 'host';
+  const frontendReplicaCount = Math.max(1, appHaPolicy.replicas);
+  // With strict one-per-node spread, start-first updates can deadlock when
+  // replicas already occupy all ready nodes. Use stop-first for HA (>1) and
+  // remove the hard cap for single-replica so start-first remains viable.
+  const frontendMaxReplicasPerNode = frontendReplicaCount > 1 ? '1' : '0';
+  const frontendUpdateOrder = frontendReplicaCount > 1 ? 'stop-first' : 'start-first';
 
   const envVars: NodeJS.ProcessEnv = {
     ...process.env,
@@ -4589,12 +4595,15 @@ async function processDeployment(recordPath: string) {
     MZ_MARIADB_MASTER_HOST: stackService('database'),
     MZ_REPLICATION_USER: replicaUser,
     MZ_DATABASE_REPLICA_REPLICAS: replicaEnabled ? '1' : '0',
-    MZ_VARNISH_REPLICAS: String(appHaPolicy.replicas),
-    MZ_NGINX_REPLICAS: String(appHaPolicy.replicas),
-    MZ_PHP_FPM_REPLICAS: String(appHaPolicy.replicas),
-    MZ_VARNISH_MAX_REPLICAS_PER_NODE: '1',
-    MZ_NGINX_MAX_REPLICAS_PER_NODE: '1',
-    MZ_PHP_FPM_MAX_REPLICAS_PER_NODE: '1',
+    MZ_VARNISH_REPLICAS: String(frontendReplicaCount),
+    MZ_NGINX_REPLICAS: String(frontendReplicaCount),
+    MZ_PHP_FPM_REPLICAS: String(frontendReplicaCount),
+    MZ_VARNISH_MAX_REPLICAS_PER_NODE: frontendMaxReplicasPerNode,
+    MZ_NGINX_MAX_REPLICAS_PER_NODE: frontendMaxReplicasPerNode,
+    MZ_PHP_FPM_MAX_REPLICAS_PER_NODE: frontendMaxReplicasPerNode,
+    MZ_VARNISH_UPDATE_ORDER: frontendUpdateOrder,
+    MZ_NGINX_UPDATE_ORDER: frontendUpdateOrder,
+    MZ_PHP_FPM_UPDATE_ORDER: frontendUpdateOrder,
     MZ_RABBITMQ_HOST: stackService('rabbitmq'),
     MZ_REDIS_CACHE_HOST: stackService('redis-cache'),
     MZ_REDIS_SESSION_HOST: stackService('redis-session'),
