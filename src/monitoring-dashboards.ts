@@ -1368,3 +1368,10 @@ export async function handleMonitoringDashboardsBootstrap(
     };
   }
 }
+
+export const __testing = {
+  parseDashboardsApiOutput,
+  isDashboardsReady,
+  isReadOnlyAllowDeleteBlockError,
+  buildSavedObjects,
+};

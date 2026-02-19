@@ -208,7 +208,12 @@ export async function ensureCloudSwarmRepo(cloudSwarmDir: string): Promise<void>
     return;
   }
 
-  const fetch = await runCommand('git', ['-C', cloudSwarmDir, 'fetch', '--prune'], 120_000, { env: gitEnv });
+  const fetch = await runCommand(
+    'git',
+    ['-C', cloudSwarmDir, 'fetch', '--prune', CLOUD_SWARM_REPO, '+refs/heads/main:refs/remotes/origin/main'],
+    120_000,
+    { env: gitEnv },
+  );
   if (fetch.code !== 0) {
     throw new Error(`cloud-swarm fetch failed: ${fetch.stderr || fetch.stdout}`.trim());
   }

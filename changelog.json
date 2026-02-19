@@ -1,18 +1,25 @@
 {
-  "version": "0.4.31",
+  "version": "0.4.32",
   "date": "2026-02-19",
-  "summary": "Ensure Magento profiler bootstrap emits full OTLP driver config so request traces are reliably exported",
+  "summary": "Harden cloud-swarm SSH refresh paths and expand regression coverage for monitoring dashboards and APM profiler defaults",
   "requires": {
     "cloud-swarm": ">=1.0.6",
     "mz-control": ">=1.0.7"
   },
   "changes": [
     {
-      "id": "sync-magento-apm-profiler-bootstrap",
-      "description": "Re-sync Magento PHP services so MAGE_PROFILER includes explicit OTLP driver options (server URL, service, environment, sampling, timeout).",
+      "id": "harden-cloud-swarm-refresh-fetch",
+      "description": "Force cloud-swarm refresh fetches to use the configured SSH repo URL and main refspec so origin drift cannot break update/deploy sync.",
       "phase": "pre_migrate",
       "downtimeMinutes": 0,
-      "scope": "environment"
+      "scope": "stack"
+    },
+    {
+      "id": "expand-monitoring-and-apm-regression-tests",
+      "description": "Add regression tests for VPS root trend dashboard host mapping behavior and APM profiler default normalization edge cases.",
+      "phase": "post_migrate",
+      "downtimeMinutes": 0,
+      "scope": "stack"
     }
   ]
 }

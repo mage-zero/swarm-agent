@@ -2100,7 +2100,11 @@ async function ensureCloudSwarmRepo() {
     return;
   }
 
-  await runCommand('git', ['-C', CLOUD_SWARM_DIR, 'fetch', '--prune'], { env: gitEnv });
+  await runCommand(
+    'git',
+    ['-C', CLOUD_SWARM_DIR, 'fetch', '--prune', CLOUD_SWARM_REPO, '+refs/heads/main:refs/remotes/origin/main'],
+    { env: gitEnv },
+  );
   // Treat the cloud-swarm checkout as an ephemeral build toolchain:
   // always force it to match `origin/main` so local modifications can't break deploys.
   await runCommand('git', ['-C', CLOUD_SWARM_DIR, 'checkout', '-B', 'main', 'origin/main', '--force'], { env: gitEnv });

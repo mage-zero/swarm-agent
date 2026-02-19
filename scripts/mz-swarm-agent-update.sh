@@ -157,7 +157,7 @@ refresh_cloud_swarm_repo() {
     return 0
   fi
 
-  if ! GIT_SSH_COMMAND="${git_ssh_cmd}" git -C "${CLOUD_SWARM_DIR}" fetch --prune >/dev/null 2>&1; then
+  if ! GIT_SSH_COMMAND="${git_ssh_cmd}" git -C "${CLOUD_SWARM_DIR}" fetch --prune "${CLOUD_SWARM_REPO}" "+refs/heads/main:refs/remotes/origin/main" >/dev/null 2>&1; then
     log "cloud-swarm refresh failed: fetch"
     return 0
   fi
