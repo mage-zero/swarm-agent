@@ -173,6 +173,36 @@ describe('support-runbooks helpers', () => {
     expect(__testing.normalizeProfileType(undefined)).toBe('tuning');
   });
 
+  it('skips live tuning apply when no capacity pressure unless force_apply is set', () => {
+    expect(__testing.shouldSkipLiveTuningApply({
+      profileType: 'tuning',
+      applyNow: true,
+      forceApply: false,
+      capacityIssueCount: 0,
+    })).toBe(true);
+
+    expect(__testing.shouldSkipLiveTuningApply({
+      profileType: 'tuning',
+      applyNow: true,
+      forceApply: false,
+      capacityIssueCount: 2,
+    })).toBe(false);
+
+    expect(__testing.shouldSkipLiveTuningApply({
+      profileType: 'tuning',
+      applyNow: true,
+      forceApply: true,
+      capacityIssueCount: 0,
+    })).toBe(false);
+
+    expect(__testing.shouldSkipLiveTuningApply({
+      profileType: 'capacity_change',
+      applyNow: true,
+      forceApply: false,
+      capacityIssueCount: 0,
+    })).toBe(false);
+  });
+
   it('builds suggested apply input from planner payload', () => {
     expect(__testing.buildSuggestedApplyInputFromPlanner({
       tuning: {

@@ -2771,6 +2771,18 @@ function parseBooleanInput(value: unknown, fallback: boolean): boolean {
   return fallback;
 }
 
+function shouldSkipLiveTuningApply(params: {
+  profileType: TuningProfileType;
+  applyNow: boolean;
+  forceApply: boolean;
+  capacityIssueCount: number;
+}): boolean {
+  if (!params.applyNow) return false;
+  if (params.profileType !== 'tuning') return false;
+  if (params.forceApply) return false;
+  return params.capacityIssueCount <= 0;
+}
+
 function formatCpuCoresForServiceUpdate(value: number): string {
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(`invalid_cpu_cores:${value}`);
@@ -3080,6 +3092,7 @@ async function runSwarmTuningProfileApply(environmentId: number, input: Record<s
 
   const applyNowDefault = profileType === 'tuning';
   const applyNow = parseBooleanInput(input.apply_now, applyNowDefault);
+  const forceApply = parseBooleanInput(input.force_apply, false);
   const approval = approveTuningProfile(profileId, profileType);
   if (approval.status !== 200) {
     const detail = JSON.stringify(approval.body || {});
@@ -3137,7 +3150,46 @@ async function runSwarmTuningProfileApply(environmentId: number, input: Record<s
         profile_type: profileType,
         profile_id: profileId,
         apply_now: false,
+        force_apply: forceApply,
         approval: approval.body,
+      },
+      remediation: {
+        attempted: true,
+        actions: [`Approved tuning profile ${profileId}`],
+      },
+    };
+  }
+
+  const capacitySummary = await runSwarmCapacitySummary(environmentId);
+  const capacityIssueCountRaw = Number((capacitySummary.data as Record<string, unknown> | undefined)?.capacity_issue_count || 0);
+  const capacityIssueCount = Number.isFinite(capacityIssueCountRaw) ? capacityIssueCountRaw : 0;
+  if (shouldSkipLiveTuningApply({
+    profileType,
+    applyNow,
+    forceApply,
+    capacityIssueCount,
+  })) {
+    return {
+      runbook_id: 'swarm_tuning_profile_apply',
+      status: 'warning',
+      summary: `Approved tuning profile ${profileId}, but skipped live apply (no capacity pressure detected).`,
+      observations: [
+        `Capacity issues detected: ${capacityIssueCount}`,
+        'force_apply=false: skipping live service updates to avoid unnecessary rollout churn.',
+      ],
+      data: {
+        environment_id: environmentId,
+        profile_type: profileType,
+        profile_id: profileId,
+        apply_now: false,
+        force_apply: false,
+        approval: approval.body,
+        capacity_precheck: {
+          status: capacitySummary.status,
+          summary: capacitySummary.summary,
+          capacity_issue_count: capacityIssueCount,
+        },
+        skipped_apply_reason: 'no_capacity_pressure',
       },
       remediation: {
         attempted: true,
@@ -3182,7 +3234,13 @@ async function runSwarmTuningProfileApply(environmentId: number, input: Record<s
       profile_type: profileType,
       profile_id: profileId,
       apply_now: true,
+      force_apply: forceApply,
       approval: approval.body,
+      capacity_precheck: {
+        status: capacitySummary.status,
+        summary: capacitySummary.summary,
+        capacity_issue_count: capacityIssueCount,
+      },
       apply_result: applyResult,
     },
     remediation: {
@@ -4953,6 +5011,7 @@ export const __testing = {
   parseNodeResourceStats,
   hasCapacityPlacementSignal,
   normalizeProfileType,
+  shouldSkipLiveTuningApply,
   buildSuggestedApplyInputFromPlanner,
   pickLatestDeploymentState,
 };

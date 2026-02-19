@@ -1,29 +1,29 @@
 {
-  "version": "0.4.33",
+  "version": "0.4.34",
   "date": "2026-02-19",
-  "summary": "Add Swarm capacity/tuning support runbooks with approval/apply flow and expand deterministic regression coverage",
+  "summary": "Prevent non-capacity tuning rollouts for app-health incidents and gate support remediation proposals by actual capacity pressure",
   "requires": {
-    "cloud-swarm": ">=1.0.6",
-    "mz-control": ">=1.0.8"
+    "cloud-swarm": ">=1.0.7",
+    "mz-control": ">=1.0.9"
   },
   "changes": [
     {
-      "id": "add-swarm-capacity-diagnostics-runbook",
-      "description": "Add swarm_capacity_summary to inspect node CPU/memory capacity, placement failures, and manager disk pressure for a target environment.",
+      "id": "guard-live-tuning-apply-on-capacity-pressure",
+      "description": "Require capacity pressure before applying live tuning profile resource updates by default; allow explicit override via force_apply=true.",
       "phase": "pre_migrate",
       "downtimeMinutes": 0,
       "scope": "stack"
     },
     {
-      "id": "add-swarm-tuning-proposal-and-apply-runbooks",
-      "description": "Add swarm_tuning_profile_summary and swarm_tuning_profile_apply to propose planner-backed tuning profiles, require approval, and optionally apply live service resource updates.",
+      "id": "gate-support-tuning-remediation-suggestions",
+      "description": "Only suggest swarm_tuning_profile_apply from support diagnostics when swarm capacity signals indicate real resource pressure.",
       "phase": "pre_migrate",
       "downtimeMinutes": 0,
       "scope": "stack"
     },
     {
-      "id": "expand-tuning-and-command-policy-regression-tests",
-      "description": "Expand tests for command policy modes, tuning profile blending/pruning, support-runbook helper logic, and tuning/capacity approval edge cases.",
+      "id": "add-healthcheck-safe-php-fpm-runtime-probe",
+      "description": "Update cloud-swarm php-fpm image health checks to use an internal FastCGI probe so app-level Magento 500s no longer trigger container restart loops.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "stack"
