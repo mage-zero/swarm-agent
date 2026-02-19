@@ -393,6 +393,135 @@ async function applyServiceRuntimePolicy(
   return { status: 'updated', detail: details.join(' ') };
 }
 
+type ServiceUpdateStatus = {
+  state: string;
+  message: string;
+};
+
+async function inspectServiceUpdateStatus(serviceName: string): Promise<ServiceUpdateStatus | null> {
+  const inspect = await runCommand(
+    'docker',
+    ['service', 'inspect', serviceName, '--format', '{{json .UpdateStatus}}'],
+    30_000,
+  );
+  if (inspect.code !== 0) {
+    const output = `${inspect.stdout || ''}\n${inspect.stderr || ''}`;
+    if (isNoSuchServiceOutput(output)) {
+      return null;
+    }
+    throw new Error(`Failed to inspect update status for ${serviceName}: ${inspect.stderr || inspect.stdout || `exit ${inspect.code}`}`);
+  }
+
+  const raw = String(inspect.stdout || '').trim();
+  if (!raw || raw === '<no value>' || raw === 'null') {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return {
+      state: String(parsed.State || '').trim(),
+      message: String(parsed.Message || '').trim(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isPlacementPausedStatus(status: ServiceUpdateStatus | null): boolean {
+  if (!status) return false;
+  const state = String(status.state || '').toLowerCase();
+  const message = String(status.message || '').toLowerCase();
+  if (!state.includes('pause')) {
+    return false;
+  }
+  return message.includes('max replicas per node') || message.includes('no suitable node');
+}
+
+async function recoverPlacementPausedFrontendService(
+  serviceName: string,
+  desiredOrder: 'start-first' | 'stop-first',
+): Promise<ServiceReplicaApplyResult> {
+  let status: ServiceUpdateStatus | null;
+  try {
+    status = await inspectServiceUpdateStatus(serviceName);
+  } catch (error) {
+    return {
+      status: 'failed',
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  if (!isPlacementPausedStatus(status)) {
+    return { status: 'skipped', detail: 'no placement-paused update' };
+  }
+
+  let resume = await runCommand(
+    'docker',
+    ['service', 'update', '--update-failure-action', 'continue', serviceName],
+    120_000,
+  );
+  if (resume.code !== 0) {
+    const output = `${resume.stdout || ''}\n${resume.stderr || ''}`;
+    if (isNoSuchServiceOutput(output)) {
+      return { status: 'skipped', detail: 'service not found during resume' };
+    }
+    if (!isNoopServiceUpdateOutput(output)) {
+      return {
+        status: 'failed',
+        detail: output.trim() || `docker service update resume failed (exit ${resume.code})`,
+      };
+    }
+  }
+
+  let recover = await runCommand(
+    'docker',
+    [
+      'service',
+      'update',
+      '--update-order',
+      desiredOrder,
+      '--rollback-order',
+      desiredOrder,
+      '--force',
+      serviceName,
+    ],
+    120_000,
+  );
+  if (recover.code !== 0) {
+    const output = `${recover.stdout || ''}\n${recover.stderr || ''}`;
+    if (isNoSuchServiceOutput(output)) {
+      return { status: 'skipped', detail: 'service not found during recovery update' };
+    }
+    if (!isNoopServiceUpdateOutput(output)) {
+      return {
+        status: 'failed',
+        detail: output.trim() || `docker service update recovery failed (exit ${recover.code})`,
+      };
+    }
+    // Some older daemons return "nothing to update" after resuming.
+    recover = await runCommand(
+      'docker',
+      ['service', 'update', '--force', serviceName],
+      120_000,
+    );
+    if (recover.code !== 0) {
+      const retryOutput = `${recover.stdout || ''}\n${recover.stderr || ''}`;
+      if (isNoSuchServiceOutput(retryOutput)) {
+        return { status: 'skipped', detail: 'service not found during force retry' };
+      }
+      if (!isNoopServiceUpdateOutput(retryOutput)) {
+        return {
+          status: 'failed',
+          detail: retryOutput.trim() || `docker service update force retry failed (exit ${recover.code})`,
+        };
+      }
+    }
+  }
+
+  return { status: 'updated', detail: `resumed paused update and forced rollout (order=${desiredOrder})` };
+}
+
 async function fetchStackSnapshot(ctx: MigrationContext): Promise<StackSnapshot> {
   const baseUrl = ctx.mzControlBaseUrl || '';
   const nodeId = ctx.nodeId || '';
@@ -955,6 +1084,52 @@ registerMigration('normalize-env-runtime-policies', async (ctx) => {
     }
     console.log(
       `upgrade.migration.normalize_env_runtime_policies: env=${environmentId} ${serviceName} `
+      + `${result.status} (${result.detail})`
+    );
+  }
+});
+
+registerMigration('frontend-runtime-policy-reconcile', async (ctx) => {
+  const environmentId = Number(ctx.environmentId || 0);
+  if (!Number.isFinite(environmentId) || environmentId <= 0) {
+    console.warn('upgrade.migration.frontend_runtime_policy_reconcile: missing environmentId; skipping');
+    return;
+  }
+  console.log(`upgrade.migration.frontend_runtime_policy_reconcile: env=${environmentId} running rebalance + runtime normalization`);
+  await executeMigration('rebalance-frontend-ha-replicas', ctx);
+  await executeMigration('normalize-env-runtime-policies', ctx);
+  console.log(`upgrade.migration.frontend_runtime_policy_reconcile: env=${environmentId} complete`);
+});
+
+registerMigration('frontend-placement-deadlock-recovery', async (ctx) => {
+  const environmentId = Number(ctx.environmentId || 0);
+  if (!Number.isFinite(environmentId) || environmentId <= 0) {
+    console.warn('upgrade.migration.frontend_placement_deadlock_recovery: missing environmentId; skipping');
+    return;
+  }
+
+  const services = [
+    envServiceName(environmentId, 'varnish'),
+    envServiceName(environmentId, 'nginx'),
+    envServiceName(environmentId, 'php-fpm'),
+  ];
+  for (const serviceName of services) {
+    const spec = await inspectServiceReplicaConfig(serviceName);
+    if (!spec) {
+      console.log(`upgrade.migration.frontend_placement_deadlock_recovery: env=${environmentId} ${serviceName} skipped (missing)`);
+      continue;
+    }
+    const desiredOrder: 'start-first' | 'stop-first' = spec.replicas > 1 ? 'stop-first' : 'start-first';
+    const result = await recoverPlacementPausedFrontendService(serviceName, desiredOrder);
+    if (result.status === 'failed') {
+      console.warn(
+        `upgrade.migration.frontend_placement_deadlock_recovery: env=${environmentId} ${serviceName} `
+        + `failed (${result.detail})`
+      );
+      continue;
+    }
+    console.log(
+      `upgrade.migration.frontend_placement_deadlock_recovery: env=${environmentId} ${serviceName} `
       + `${result.status} (${result.detail})`
     );
   }
