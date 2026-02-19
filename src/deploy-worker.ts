@@ -212,6 +212,20 @@ type AppHaReplicaPolicyDecision = {
   shortfall_memory_bytes: number;
 };
 
+type FrontendRuntimePolicy = {
+  replicas: number;
+  max_replicas_per_node: number;
+  update_order: 'start-first' | 'stop-first';
+  restart_condition: 'any';
+};
+
+type FrontendRuntimeSpec = {
+  replicas: number;
+  max_replicas_per_node: number;
+  update_order: string;
+  restart_condition: string;
+};
+
 function resolveAppHaReplicaPolicy(input: AppHaReplicaPolicyInput): AppHaReplicaPolicyDecision {
   const readyNodeCount = Math.max(0, Math.floor(Number(input.ready_node_count) || 0));
   const minReadyNodes = Math.max(1, Math.floor(Number(input.min_ready_nodes) || 1));
@@ -271,6 +285,18 @@ function resolveAppHaReplicaPolicy(input: AppHaReplicaPolicyInput): AppHaReplica
     required_memory_bytes: requiredMem,
     shortfall_cpu_cores: 0,
     shortfall_memory_bytes: 0,
+  };
+}
+
+function resolveFrontendRuntimePolicy(targetReplicas: number): FrontendRuntimePolicy {
+  const replicas = Math.max(1, Math.round(Number(targetReplicas) || 1));
+  return {
+    replicas,
+    // Keep single replica unconstrained so start-first can overlap briefly.
+    max_replicas_per_node: replicas > 1 ? 1 : 0,
+    // With one-per-node spread, start-first can deadlock when all nodes are occupied.
+    update_order: replicas > 1 ? 'stop-first' : 'start-first',
+    restart_condition: 'any',
   };
 }
 
@@ -3434,6 +3460,195 @@ async function inspectServiceUpdateStatus(serviceName: string): Promise<ServiceU
   }
 }
 
+function hasUnknownReplicasMaxPerNodeFlag(output: string): boolean {
+  const lower = output.toLowerCase();
+  return lower.includes('unknown flag') && lower.includes('replicas-max-per-node');
+}
+
+function isNoSuchServiceOutput(output: string): boolean {
+  return output.toLowerCase().includes('no such service');
+}
+
+function isNoopServiceUpdateOutput(output: string): boolean {
+  const lower = output.toLowerCase();
+  return lower.includes('only updates to') || lower.includes('nothing to update');
+}
+
+async function inspectFrontendRuntimeSpec(serviceName: string): Promise<FrontendRuntimeSpec | null> {
+  const inspect = await runCommandCaptureWithStatus('docker', [
+    'service',
+    'inspect',
+    serviceName,
+    '--format',
+    '{{json .Spec}}',
+  ]);
+  if (inspect.code !== 0) {
+    return null;
+  }
+
+  const raw = String(inspect.stdout || '').trim();
+  if (!raw || raw === '<no value>' || raw === 'null') {
+    return null;
+  }
+
+  let spec: Record<string, unknown>;
+  try {
+    spec = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+
+  const mode = spec.Mode as Record<string, unknown> | undefined;
+  const replicated = mode?.Replicated as Record<string, unknown> | undefined;
+  const replicasRaw = replicated?.Replicas;
+  const replicasParsed = Number(replicasRaw ?? 0);
+  const replicas = Number.isFinite(replicasParsed) ? Math.max(0, Math.round(replicasParsed)) : 0;
+
+  const taskTemplate = spec.TaskTemplate as Record<string, unknown> | undefined;
+  const placement = taskTemplate?.Placement as Record<string, unknown> | undefined;
+  const maxReplicasRaw = placement?.MaxReplicas;
+  const maxReplicasParsed = Number(maxReplicasRaw ?? 0);
+  const maxReplicasPerNode = Number.isFinite(maxReplicasParsed)
+    ? Math.max(0, Math.round(maxReplicasParsed))
+    : 0;
+  const restartPolicy = taskTemplate?.RestartPolicy as Record<string, unknown> | undefined;
+  const restartCondition = String(restartPolicy?.Condition || '').trim().toLowerCase();
+  const updateConfig = spec.UpdateConfig as Record<string, unknown> | undefined;
+  const updateOrder = String(updateConfig?.Order || '').trim().toLowerCase();
+
+  return {
+    replicas,
+    max_replicas_per_node: maxReplicasPerNode,
+    restart_condition: restartCondition,
+    update_order: updateOrder,
+  };
+}
+
+async function enforceFrontendRuntimePolicyForService(
+  serviceName: string,
+  policy: FrontendRuntimePolicy,
+  log: (message: string) => void,
+) {
+  const current = await inspectFrontendRuntimeSpec(serviceName);
+  if (!current) {
+    log(`frontend runtime policy: ${serviceName} skipped (service missing)`);
+    return;
+  }
+
+  const args: string[] = ['service', 'update'];
+  const details: string[] = [];
+  let includesMaxPerNodeFlag = false;
+
+  if (current.replicas !== policy.replicas) {
+    args.push('--replicas', String(policy.replicas));
+    details.push(`replicas=${policy.replicas}`);
+  }
+  if (current.max_replicas_per_node !== policy.max_replicas_per_node) {
+    args.push('--replicas-max-per-node', String(policy.max_replicas_per_node));
+    includesMaxPerNodeFlag = true;
+    details.push(`max_per_node=${policy.max_replicas_per_node}`);
+  }
+  if (current.update_order !== policy.update_order) {
+    args.push('--update-order', policy.update_order, '--rollback-order', policy.update_order);
+    details.push(`order=${policy.update_order}`);
+  }
+  if (current.restart_condition !== policy.restart_condition) {
+    args.push('--restart-condition', policy.restart_condition);
+    details.push(`restart=${policy.restart_condition}`);
+  }
+
+  if (details.length > 0) {
+    args.push(serviceName);
+    let update = await runCommandCaptureWithStatus('docker', args);
+    if (update.code !== 0 && includesMaxPerNodeFlag) {
+      const combined = `${update.stdout || ''}\n${update.stderr || ''}`;
+      if (hasUnknownReplicasMaxPerNodeFlag(combined)) {
+        const fallbackArgs: string[] = [];
+        for (let i = 0; i < args.length; i += 1) {
+          const arg = args[i] || '';
+          if (arg === '--replicas-max-per-node') {
+            i += 1; // skip flag value as well
+            continue;
+          }
+          fallbackArgs.push(arg);
+        }
+        update = await runCommandCaptureWithStatus('docker', fallbackArgs);
+      }
+    }
+
+    if (update.code !== 0) {
+      const combined = `${update.stdout || ''}\n${update.stderr || ''}`.trim();
+      if (isNoSuchServiceOutput(combined)) {
+        log(`frontend runtime policy: ${serviceName} skipped (service missing during update)`);
+        return;
+      }
+      if (isNoopServiceUpdateOutput(combined)) {
+        log(`frontend runtime policy: ${serviceName} already aligned`);
+      } else {
+        log(`frontend runtime policy: ${serviceName} update failed (${combined || `exit ${update.code}`})`);
+      }
+    } else {
+      log(`frontend runtime policy: ${serviceName} aligned (${details.join(' ')})`);
+    }
+  }
+
+  const updateStatus = await inspectServiceUpdateStatus(serviceName);
+  const state = String(updateStatus?.state || '').toLowerCase();
+  const message = String(updateStatus?.message || '').toLowerCase();
+  const pausedByPlacement = state.includes('pause')
+    && (message.includes('max replicas per node') || message.includes('no suitable node'));
+  if (!pausedByPlacement || policy.update_order !== 'stop-first') {
+    return;
+  }
+
+  log(`frontend runtime policy: ${serviceName} paused by placement limits; forcing stop-first rollout`);
+  let recover = await runCommandCaptureWithStatus('docker', [
+    'service',
+    'update',
+    '--update-order',
+    policy.update_order,
+    '--rollback-order',
+    policy.update_order,
+    '--force',
+    serviceName,
+  ]);
+  if (recover.code !== 0) {
+    const combined = `${recover.stdout || ''}\n${recover.stderr || ''}`.toLowerCase();
+    if (combined.includes('update paused') || combined.includes('paused')) {
+      await resumePausedServiceUpdate(serviceName, log);
+      recover = await runCommandCaptureWithStatus('docker', [
+        'service',
+        'update',
+        '--update-order',
+        policy.update_order,
+        '--rollback-order',
+        policy.update_order,
+        '--force',
+        serviceName,
+      ]);
+    }
+  }
+
+  const recoverOutput = (recover.stderr || recover.stdout || '').trim();
+  if (recover.code === 0) {
+    log(`frontend runtime policy: ${serviceName} recovered`);
+  } else {
+    log(`frontend runtime policy: ${serviceName} recovery failed (exit ${recover.code}) ${recoverOutput}`);
+  }
+}
+
+async function enforceFrontendRuntimePolicy(
+  stackName: string,
+  policy: FrontendRuntimePolicy,
+  log: (message: string) => void,
+) {
+  const services = ['varnish', 'nginx', 'php-fpm']
+    .map((service) => `${stackName}_${service}`);
+  for (const serviceName of services) {
+    await enforceFrontendRuntimePolicyForService(serviceName, policy, log);
+  }
+}
+
 async function resumePausedServiceUpdate(serviceName: string, log: (message: string) => void): Promise<boolean> {
   const updateStatus = await inspectServiceUpdateStatus(serviceName);
   const state = (updateStatus?.state || '').toLowerCase();
@@ -4652,12 +4867,8 @@ async function processDeployment(recordPath: string) {
   const registryPort = process.env.REGISTRY_PORT || '5000';
   const registryCachePort = process.env.REGISTRY_CACHE_PORT || registryPort;
   const buildxNetwork = process.env.BUILDX_NETWORK || 'host';
-  const frontendReplicaCount = Math.max(1, appHaPolicy.replicas);
-  // With strict one-per-node spread, start-first updates can deadlock when
-  // replicas already occupy all ready nodes. Use stop-first for HA (>1) and
-  // remove the hard cap for single-replica so start-first remains viable.
-  const frontendMaxReplicasPerNode = frontendReplicaCount > 1 ? '1' : '0';
-  const frontendUpdateOrder = frontendReplicaCount > 1 ? 'stop-first' : 'start-first';
+  const frontendRuntimePolicy = resolveFrontendRuntimePolicy(appHaPolicy.replicas);
+  const frontendReplicaCount = frontendRuntimePolicy.replicas;
 
   const envVars: NodeJS.ProcessEnv = {
     ...process.env,
@@ -4691,12 +4902,12 @@ async function processDeployment(recordPath: string) {
     MZ_VARNISH_REPLICAS: String(frontendReplicaCount),
     MZ_NGINX_REPLICAS: String(frontendReplicaCount),
     MZ_PHP_FPM_REPLICAS: String(frontendReplicaCount),
-    MZ_VARNISH_MAX_REPLICAS_PER_NODE: frontendMaxReplicasPerNode,
-    MZ_NGINX_MAX_REPLICAS_PER_NODE: frontendMaxReplicasPerNode,
-    MZ_PHP_FPM_MAX_REPLICAS_PER_NODE: frontendMaxReplicasPerNode,
-    MZ_VARNISH_UPDATE_ORDER: frontendUpdateOrder,
-    MZ_NGINX_UPDATE_ORDER: frontendUpdateOrder,
-    MZ_PHP_FPM_UPDATE_ORDER: frontendUpdateOrder,
+    MZ_VARNISH_MAX_REPLICAS_PER_NODE: String(frontendRuntimePolicy.max_replicas_per_node),
+    MZ_NGINX_MAX_REPLICAS_PER_NODE: String(frontendRuntimePolicy.max_replicas_per_node),
+    MZ_PHP_FPM_MAX_REPLICAS_PER_NODE: String(frontendRuntimePolicy.max_replicas_per_node),
+    MZ_VARNISH_UPDATE_ORDER: frontendRuntimePolicy.update_order,
+    MZ_NGINX_UPDATE_ORDER: frontendRuntimePolicy.update_order,
+    MZ_PHP_FPM_UPDATE_ORDER: frontendRuntimePolicy.update_order,
     MZ_RABBITMQ_HOST: stackService('rabbitmq'),
     MZ_REDIS_CACHE_HOST: stackService('redis-cache'),
     MZ_REDIS_SESSION_HOST: stackService('redis-session'),
@@ -4955,6 +5166,12 @@ async function processDeployment(recordPath: string) {
     stackName,
   ], { env: envVars, logDir, label: 'stack-deploy-app' });
   log('app stack deployed');
+  progress.detail(
+    'deploy_stack',
+    `Reconciling frontend runtime policy (replicas=${frontendRuntimePolicy.replicas}, ` +
+    `max_per_node=${frontendRuntimePolicy.max_replicas_per_node}, order=${frontendRuntimePolicy.update_order})`
+  );
+  await enforceFrontendRuntimePolicy(stackName, frontendRuntimePolicy, log);
 
   if (RELEASE_COHORT_GATE_ENABLED) {
     progress.detail('deploy_stack', 'Waiting for services to be ready');
@@ -5662,6 +5879,7 @@ export const __testing = {
   buildSearchSystemConfigSql,
   resolveMageProfilerEnv,
   resolveAppHaReplicaPolicy,
+  resolveFrontendRuntimePolicy,
   getQueueSourceDirs,
   resolveAggressivePruneCutoffSeconds,
   getHistoryLastSuccessfulDeployAt,

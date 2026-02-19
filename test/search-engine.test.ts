@@ -10,6 +10,7 @@ const {
   buildSearchEngineEnvOverride,
   buildSearchSystemConfigSql,
   resolveAppHaReplicaPolicy,
+  resolveFrontendRuntimePolicy,
 } = __testing;
 
 // ---------------------------------------------------------------------------
@@ -221,6 +222,50 @@ describe('resolveAppHaReplicaPolicy', () => {
     expect(decision.reason).toBe('insufficient_headroom');
     expect(decision.shortfall_cpu_cores).toBeGreaterThan(0);
     expect(decision.shortfall_memory_bytes).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveFrontendRuntimePolicy – rollout-safe frontend runtime settings
+// ---------------------------------------------------------------------------
+describe('resolveFrontendRuntimePolicy', () => {
+  it('uses start-first with no per-node cap for single replica', () => {
+    expect(resolveFrontendRuntimePolicy(1)).toEqual({
+      replicas: 1,
+      max_replicas_per_node: 0,
+      update_order: 'start-first',
+      restart_condition: 'any',
+    });
+  });
+
+  it('uses stop-first with one-per-node spread for HA replicas', () => {
+    expect(resolveFrontendRuntimePolicy(2)).toEqual({
+      replicas: 2,
+      max_replicas_per_node: 1,
+      update_order: 'stop-first',
+      restart_condition: 'any',
+    });
+    expect(resolveFrontendRuntimePolicy(4)).toEqual({
+      replicas: 4,
+      max_replicas_per_node: 1,
+      update_order: 'stop-first',
+      restart_condition: 'any',
+    });
+  });
+
+  it('normalizes invalid replica counts to safe single-replica defaults', () => {
+    expect(resolveFrontendRuntimePolicy(0)).toEqual({
+      replicas: 1,
+      max_replicas_per_node: 0,
+      update_order: 'start-first',
+      restart_condition: 'any',
+    });
+    expect(resolveFrontendRuntimePolicy(-7)).toEqual({
+      replicas: 1,
+      max_replicas_per_node: 0,
+      update_order: 'start-first',
+      restart_condition: 'any',
+    });
   });
 });
 

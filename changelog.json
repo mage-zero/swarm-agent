@@ -1,22 +1,22 @@
 {
-  "version": "0.4.36",
+  "version": "0.4.37",
   "date": "2026-02-19",
-  "summary": "Fix deploy queue ingestion for state-directory layouts and make aggressive Docker prune history-aware to preserve deploy cache safety",
+  "summary": "Prevent frontend service rollout deadlocks by enforcing HA-safe Swarm runtime policy after app deploys",
   "requires": {
     "cloud-swarm": ">=1.0.7",
     "mz-control": ">=1.0.9"
   },
   "changes": [
     {
-      "id": "deploy-queue-state-dir-compat",
-      "description": "Deploy worker now consumes queued records from /deployments/queued with fallback to legacy root files, preventing stuck queues when state directories are used.",
+      "id": "frontend-runtime-policy-reconcile",
+      "description": "Deploy worker now reconciles frontend runtime policy after app stack deploy so nginx/php-fpm/varnish replicas, max_replicas_per_node, update order, and restart condition remain aligned with HA policy.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
-      "scope": "stack"
+      "scope": "environment"
     },
     {
-      "id": "history-aware-aggressive-prune",
-      "description": "Aggressive Docker prune now only targets objects older than the previous successful deploy timestamp minus a configurable lookback window.",
+      "id": "frontend-placement-deadlock-recovery",
+      "description": "When a frontend service update is paused with placement errors (for example max replicas per node exceeded), deploy worker now forces a stop-first recovery rollout to unblock deployment convergence.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
