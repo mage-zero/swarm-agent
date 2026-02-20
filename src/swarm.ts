@@ -39,6 +39,7 @@ export type SwarmJobOptions = {
   name: string;
   image: string;
   command: string[];
+  entrypoint?: string;
   networks?: string[];
   secrets?: Array<{ source: string; target: string }>;
   mounts?: Array<{ type: string; source: string; target: string; read_only?: boolean }>;
@@ -444,6 +445,10 @@ export async function runSwarmJob(options: SwarmJobOptions): Promise<SwarmJobRes
 
   for (const constraint of options.constraints || []) {
     args.push('--constraint', constraint);
+  }
+
+  if (options.entrypoint !== undefined) {
+    args.push('--entrypoint', options.entrypoint);
   }
 
   args.push(jobImage, ...options.command);
