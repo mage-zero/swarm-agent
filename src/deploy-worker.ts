@@ -366,6 +366,10 @@ function isLoopbackHost(host: string) {
   return value === '127.0.0.1' || value === 'localhost' || value === '::1';
 }
 
+function isRegistryAliasHost(host: string) {
+  return String(host || '').trim().toLowerCase() === 'registry';
+}
+
 async function detectWireGuardIpV4(): Promise<string | null> {
   // Prefer wg0: we use WireGuard for swarm control + private registry access.
   const result = await runCommandCaptureWithStatus('ip', ['-4', 'addr', 'show', 'dev', 'wg0']);
@@ -391,18 +395,26 @@ async function resolveRegistryPullHost(candidate: string, log: (message: string)
     return '127.0.0.1';
   }
 
-  // In a multi-node Swarm, 127.0.0.1/localhost will break pulls on worker nodes.
-  if (!isLoopbackHost(trimmed)) {
-    return trimmed;
-  }
-
-  if (!(await swarmHasMultipleNodes())) {
+  const multiNode = await swarmHasMultipleNodes();
+  if (!multiNode) {
     return trimmed;
   }
 
   const wgIp = await detectWireGuardIpV4();
-  if (wgIp) {
-    log(`registry pull host is loopback in multi-node swarm; using WireGuard IP ${wgIp}`);
+
+  // In a multi-node Swarm, 127.0.0.1/localhost will break pulls on worker nodes.
+  if (isLoopbackHost(trimmed)) {
+    if (wgIp) {
+      log(`registry pull host is loopback in multi-node swarm; using WireGuard IP ${wgIp}`);
+      return wgIp;
+    }
+    return trimmed;
+  }
+
+  // `registry` commonly resolves to node-local/public addresses that workers
+  // cannot always route back to; prefer the private WireGuard address.
+  if (isRegistryAliasHost(trimmed) && wgIp) {
+    log(`registry pull host '${trimmed}' is alias-based in multi-node swarm; using WireGuard IP ${wgIp}`);
     return wgIp;
   }
 

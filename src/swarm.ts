@@ -82,6 +82,31 @@ type RunbookServiceEntry = {
   replicas: string;
 };
 
+export function stripDigestFromImageRef(image: string): string {
+  const raw = String(image || '').trim();
+  if (!raw) return raw;
+
+  const at = raw.indexOf('@');
+  if (at <= 0) return raw;
+
+  const nameWithTag = raw.slice(0, at);
+  const digest = raw.slice(at + 1).trim();
+  if (!/^sha256:[a-f0-9]{64}$/i.test(digest)) {
+    return raw;
+  }
+
+  const slash = nameWithTag.lastIndexOf('/');
+  const colon = nameWithTag.lastIndexOf(':');
+  const hasExplicitTag = colon > slash;
+
+  // Keep digest-only refs (repo@sha256:...) unchanged to avoid implicitly using :latest.
+  if (!hasExplicitTag) {
+    return raw;
+  }
+
+  return nameWithTag;
+}
+
 function parseDockerJsonLines(raw: string): Array<Record<string, unknown>> {
   const out: Array<Record<string, unknown>> = [];
   for (const line of raw.split('\n')) {
@@ -384,6 +409,7 @@ export async function waitForServiceNotRunning(serviceFullName: string, timeoutM
 
 export async function runSwarmJob(options: SwarmJobOptions): Promise<SwarmJobResult> {
   const timeoutMs = options.timeout_ms ?? 5 * 60_000;
+  const jobImage = stripDigestFromImageRef(options.image) || options.image;
   const args: string[] = [
     'service',
     'create',
@@ -396,6 +422,7 @@ export async function runSwarmJob(options: SwarmJobOptions): Promise<SwarmJobRes
     'replicated-job',
     '--replicas',
     '1',
+    '--no-resolve-image',
   ];
 
   for (const network of options.networks || []) {
@@ -419,7 +446,7 @@ export async function runSwarmJob(options: SwarmJobOptions): Promise<SwarmJobRes
     args.push('--constraint', constraint);
   }
 
-  args.push(options.image, ...options.command);
+  args.push(jobImage, ...options.command);
 
   const created = await runCommand('docker', args, 30_000);
   if (created.code !== 0) {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildJobName, envServiceName, pickNetworkName, pickSecretName, summarizeServiceTasks } from '../src/swarm.js';
+import { buildJobName, envServiceName, pickNetworkName, pickSecretName, stripDigestFromImageRef, summarizeServiceTasks } from '../src/swarm.js';
 
 describe('swarm helpers', () => {
   it('builds stack-qualified service names', () => {
@@ -74,5 +74,17 @@ describe('swarm helpers', () => {
     expect(name.startsWith('mz-rb-promote-db-replica-5-')).toBe(true);
     expect(name).toMatch(/^[a-z0-9-]+$/);
     expect(name.length).toBeLessThanOrEqual(63);
+  });
+
+  it('strips sha256 digest from tagged image refs', () => {
+    expect(
+      stripDigestFromImageRef('10.100.0.10:5000/mz-proxysql:2.5.5@sha256:9c56786f48c3a1adcca9e210456c24e399de167d52085d3706050bf4f04e4cdb')
+    ).toBe('10.100.0.10:5000/mz-proxysql:2.5.5');
+  });
+
+  it('keeps digest-only refs unchanged', () => {
+    expect(
+      stripDigestFromImageRef('registry:5000/mz-proxysql@sha256:9c56786f48c3a1adcca9e210456c24e399de167d52085d3706050bf4f04e4cdb')
+    ).toBe('registry:5000/mz-proxysql@sha256:9c56786f48c3a1adcca9e210456c24e399de167d52085d3706050bf4f04e4cdb');
   });
 });
