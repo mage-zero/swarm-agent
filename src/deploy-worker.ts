@@ -11,6 +11,16 @@ import { getDbBackupZstdLevel } from './backup-utils.js';
 import { buildJobName, envServiceName, inspectServiceSpec, listServiceTasks, runSwarmJob } from './swarm.js';
 import { bootstrapMonitoringDashboards } from './monitoring-dashboards.js';
 import { resolveDatadogTraceEnv } from './lib/apm-tracing.js';
+import {
+  classifyDeployError,
+  resolveRetryPolicy,
+  buildRetryRecord,
+  shouldDeduplicateDeploy,
+  resolveAutoHealConfig,
+  resolveAutoHealTargets,
+  enrichCommandError,
+  type RetryRecord,
+} from './deploy-reliability.js';
 
 type DeployPayload = {
   artifact?: string;
@@ -117,9 +127,11 @@ const DEPLOY_FAILED_ARTIFACT_RETAIN_COUNT = Math.max(0, Number(process.env.MZ_DE
 const DEPLOY_FAILED_IMAGE_RETAIN_COUNT = Math.max(0, Number(process.env.MZ_DEPLOY_FAILED_IMAGE_RETAIN_COUNT || 1));
 const DEPLOY_FAILED_RETAIN_COUNT = Math.max(0, Number(process.env.MZ_DEPLOY_FAILED_RETAIN_COUNT || 1));
 const DEPLOY_CLEANUP_ENABLED = (process.env.MZ_DEPLOY_CLEANUP_ENABLED || '1') !== '0';
-const DEPLOY_SMOKE_AUTO_HEAL_ENABLED = (process.env.MZ_DEPLOY_SMOKE_AUTO_HEAL_ENABLED || '1') !== '0';
-const DEPLOY_SMOKE_AUTO_HEAL_ROUNDS = Math.max(0, Number(process.env.MZ_DEPLOY_SMOKE_AUTO_HEAL_ROUNDS || 1));
-const DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED = (process.env.MZ_DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED || '0') === '1';
+const AUTO_HEAL_CFG = resolveAutoHealConfig(process.env);
+const DEPLOY_SMOKE_AUTO_HEAL_ENABLED = AUTO_HEAL_CFG.enabled;
+const DEPLOY_SMOKE_AUTO_HEAL_ROUNDS = AUTO_HEAL_CFG.rounds;
+const DEPLOY_SMOKE_AUTO_HEAL_DELAY_MS = AUTO_HEAL_CFG.delayMs;
+const DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED = AUTO_HEAL_CFG.autoRollback;
 const RELEASE_COHORT_GATE_ENABLED = (process.env.MZ_RELEASE_COHORT_GATE_ENABLED || '1') !== '0';
 // Rolling back a cohort to an unknown state can make things worse (e.g. rolling back to a tag that was never
 // a successful deploy). Default to "fail-fast + stop crash-looping services" instead.
@@ -163,6 +175,9 @@ const DEPLOY_AGGRESSIVE_PRUNE_SUCCESS_LOOKBACK_HOURS = Math.max(
 );
 const DEPLOY_ABORT_MIN_FREE_GB = Number(process.env.MZ_DEPLOY_ABORT_MIN_FREE_GB || 5);
 const DEPLOY_BUILD_RETRIES = Math.max(0, Number(process.env.MZ_DEPLOY_BUILD_RETRIES || 1));
+const DEPLOY_MAX_RETRIES = Math.max(0, Number(process.env.MZ_DEPLOY_MAX_RETRIES || 2));
+const DEPLOY_DEDUP_WINDOW_MS = Math.max(60_000, Number(process.env.MZ_DEPLOY_DEDUP_WINDOW_MS || 30 * 60 * 1000));
+const DEPLOY_RETRY_RECORDS_FILE = path.join(DEPLOY_QUEUE_DIR, 'meta', 'retry-records.json');
 const DEPLOY_SKIP_SERVICE_BUILD_IF_PRESENT = (process.env.MZ_DEPLOY_SKIP_SERVICE_BUILD_IF_PRESENT || '1') !== '0';
 const DEPLOY_SKIP_APP_BUILD_IF_PRESENT = (process.env.MZ_DEPLOY_SKIP_APP_BUILD_IF_PRESENT || '1') !== '0';
 const setupDbStatusTimeoutParsed = Number(process.env.MZ_SETUP_DB_STATUS_TIMEOUT_SECONDS || 120);
@@ -4308,15 +4323,11 @@ async function autoHealPostDeploySmokeFailure(params: {
     rounds: [] as Array<Record<string, unknown>>,
   };
 
-  const failingNames = new Set(params.initial.results.filter((r) => !r.ok).map((r) => r.name));
-  const shouldRestartNginx = Array.from(failingNames).some((name) => name.startsWith('nginx.'));
-  const shouldRestartVarnish = Array.from(failingNames).some((name) => name.startsWith('varnish.'));
-  const shouldRestartPhpFpm = failingNames.has('nginx.health_check.php');
-
-  const restartTargets = new Set<string>();
-  if (shouldRestartNginx || failingNames.size === 0) restartTargets.add(`${params.stackName}_nginx`);
-  if (shouldRestartVarnish || failingNames.size === 0) restartTargets.add(`${params.stackName}_varnish`);
-  if (shouldRestartPhpFpm) restartTargets.add(`${params.stackName}_php-fpm`);
+  const failingNames = params.initial.results.filter((r) => !r.ok).map((r) => r.name);
+  const healTargetNames = resolveAutoHealTargets(failingNames);
+  const restartTargets = new Set<string>(
+    healTargetNames.map((name) => `${params.stackName}_${name}`),
+  );
 
   for (let round = 1; round <= DEPLOY_SMOKE_AUTO_HEAL_ROUNDS; round += 1) {
     params.log(`auto-heal: round ${round}/${DEPLOY_SMOKE_AUTO_HEAL_ROUNDS}`);
@@ -4327,7 +4338,7 @@ async function autoHealPostDeploySmokeFailure(params: {
       await delay(1000);
     }
 
-    await delay(5000);
+    await delay(DEPLOY_SMOKE_AUTO_HEAL_DELAY_MS);
 
     const verified = await runPostDeploySmokeChecks(params.stackName, params.envHostname, params.log);
     const psSummary: Record<string, unknown> = {};
@@ -5210,6 +5221,10 @@ async function processDeployment(recordPath: string) {
   await ensureDockerSecret(mageSecretName, secrets.crypt_key, workDir);
   log('docker secrets ready');
 
+  // Proactive pre-build disk check: prune before builds to prevent mid-build disk pressure
+  await maybeAggressivePrune('pre-build', prunePreviousSuccessAt);
+  await ensureMinimumFreeSpace('pre-build');
+
   progress.start('build_images');
   const missingServiceImages = DEPLOY_SKIP_SERVICE_BUILD_IF_PRESENT
     ? await collectMissingServiceImages(envVars)
@@ -5978,6 +5993,25 @@ async function cleanupFailedArtifact(record: Record<string, any>) {
   }
 }
 
+function readRetryRecords(): RetryRecord[] {
+  try {
+    if (!fs.existsSync(DEPLOY_RETRY_RECORDS_FILE)) return [];
+    const raw = JSON.parse(fs.readFileSync(DEPLOY_RETRY_RECORDS_FILE, 'utf8'));
+    return Array.isArray(raw) ? raw : [];
+  } catch {
+    return [];
+  }
+}
+
+function appendRetryRecord(record: RetryRecord) {
+  const records = readRetryRecords();
+  records.push(record);
+  // Keep only last 100 records to avoid unbounded growth
+  const trimmed = records.slice(-100);
+  ensureDir(path.dirname(DEPLOY_RETRY_RECORDS_FILE));
+  writeJsonFileBestEffort(DEPLOY_RETRY_RECORDS_FILE, trimmed);
+}
+
 async function handleDeploymentFile(recordPath: string) {
   const failedDir = path.join(DEPLOY_QUEUE_DIR, 'failed');
   ensureDir(failedDir);
@@ -5985,8 +6019,11 @@ async function handleDeploymentFile(recordPath: string) {
     await processDeployment(recordPath);
     fs.unlinkSync(recordPath);
   } catch (error) {
+    const rawError = error instanceof Error ? error.message : String(error);
+    const enrichedError = enrichCommandError(rawError, 'deploy');
     const failedRecord = {
-      error: error instanceof Error ? error.message : String(error),
+      error: enrichedError,
+      error_classification: classifyDeployError(rawError, 'deploy'),
       failed_at: new Date().toISOString(),
     };
     const failedPath = path.join(failedDir, path.basename(recordPath));
@@ -6026,6 +6063,31 @@ async function handleDeploymentFile(recordPath: string) {
     }
 
     console.error('deploy.worker.failed', failedRecord);
+
+    // --- Deploy-level retry with deduplication ---
+    const classification = failedRecord.error_classification;
+    const artifactKey = String(merged?.payload?.artifact || '').trim();
+    const deployId = String(merged?.id || path.basename(recordPath, '.json'));
+    const attempt = Number(merged?.retry_attempt || 1);
+
+    if (artifactKey && classification) {
+      const retryRecord = buildRetryRecord(deployId, artifactKey, attempt, rawError);
+      appendRetryRecord(retryRecord);
+
+      if (shouldDeduplicateDeploy(artifactKey, readRetryRecords(), DEPLOY_DEDUP_WINDOW_MS)) {
+        console.warn(`deploy.worker.retry.dedup: artifact ${artifactKey} has too many recent failures, skipping retry`);
+      } else {
+        const policy = resolveRetryPolicy(classification, attempt, DEPLOY_MAX_RETRIES);
+        if (policy.shouldRetry) {
+          console.log(`deploy.worker.retry: ${policy.reason}`);
+          await delay(policy.delayMs);
+          const retryDeploymentId = crypto.randomUUID();
+          const retryPayload = { ...merged?.payload, retry_attempt: attempt + 1 } as DeployPayload;
+          enqueueDeploymentRecord(retryPayload, retryDeploymentId);
+          console.log(`deploy.worker.retry.queued: ${retryDeploymentId} (attempt ${attempt + 1})`);
+        }
+      }
+    }
   }
 }
 

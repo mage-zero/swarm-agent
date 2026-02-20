@@ -1,25 +1,52 @@
 {
-  "version": "0.4.43",
+  "version": "0.4.44",
   "date": "2026-02-20",
-  "summary": "Fix ProxySQL query rules reconciliation job entrypoint and command policy compliance",
+  "summary": "Deploy reliability improvements: error classification, retry with deduplication, pre-build disk checks, enhanced auto-heal, and failure_action: pause",
   "requires": {
-    "cloud-swarm": ">=1.0.8",
-    "mz-control": ">=1.0.9"
+    "cloud-swarm": ">=1.0.11"
   },
   "changes": [
     {
-      "id": "proxysql-rules-entrypoint-override",
-      "description": "ProxySQL query rules reconciliation job now overrides the container entrypoint to `sh` so the reconcile script runs directly instead of triggering the ProxySQL service entrypoint (which requires the `db_password` secret and would exit immediately).",
+      "id": "deploy-error-classification",
+      "description": "New deploy-reliability module classifies errors as transient or permanent across 8 categories (disk_pressure, build_oom, build_manifest, magento_cli_lock, magento_cli_schema, config_error, network_timeout, container_startup) to decide retry eligibility.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
     },
     {
-      "id": "proxysql-rules-script-base64",
-      "description": "ProxySQL reconcile script is now base64-encoded before being passed as a command argument, eliminating newline characters from argv and resolving command policy `argv contains unsafe characters` violations.",
+      "id": "deploy-auto-retry",
+      "description": "Transient deploy errors are automatically retried up to 2 times (configurable via MZ_DEPLOY_MAX_RETRIES) with exponential backoff (30s base). Same-artifact deduplication prevents retry storms after 3+ failures within a 30-minute window.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
+    },
+    {
+      "id": "pre-build-disk-check",
+      "description": "Aggressive Docker prune and minimum free space check run before the build stage, preventing disk_pressure failures that previously accounted for 21% of deploy failures.",
+      "phase": "pre_migrate",
+      "downtimeMinutes": 0,
+      "scope": "environment"
+    },
+    {
+      "id": "enhanced-auto-heal",
+      "description": "Post-deploy smoke check auto-heal increased from 1 round to 3 (configurable via MZ_DEPLOY_SMOKE_AUTO_HEAL_ROUNDS), delay increased from 5s to 10s between rounds, and ProxySQL added to heal targets when PHP health check fails.",
+      "phase": "post_migrate",
+      "downtimeMinutes": 0,
+      "scope": "environment"
+    },
+    {
+      "id": "opaque-docker-error-enrichment",
+      "description": "Docker command errors that return only an opaque service ID are now enriched with context and suggested inspection commands.",
+      "phase": "post_migrate",
+      "downtimeMinutes": 0,
+      "scope": "environment"
+    },
+    {
+      "id": "failure-action-pause",
+      "description": "Stack templates changed from failure_action: rollback to failure_action: pause, preventing Docker Swarm from independently rolling back services while the deploy pipeline is still orchestrating. Requires cloud-swarm >= 1.0.11.",
+      "phase": "pre_migrate",
+      "downtimeMinutes": 0,
+      "scope": "stack"
     }
   ]
 }
