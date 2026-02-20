@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { buildConfigBaseline, buildConfigChanges } from '../src/config-advisor.js';
-import type { PlannerInspectionPayload, PlannerResources } from '../src/planner-types.js';
+import type { PlannerConfigChange, PlannerInspectionPayload, PlannerResources } from '../src/planner-types.js';
 
 const MIB = 1024 * 1024;
 const GIB = 1024 * MIB;
@@ -77,7 +77,7 @@ describe('config advisor', () => {
         },
       ],
     };
-    const fallback = [
+    const fallback: PlannerConfigChange[] = [
       {
         service: 'php-fpm',
         changes: {

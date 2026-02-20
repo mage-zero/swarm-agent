@@ -42,7 +42,8 @@ describe('node hmac helpers', () => {
     const now = new Date('2026-02-17T10:11:12.000Z');
     vi.useFakeTimers();
     vi.setSystemTime(now);
-    vi.spyOn(crypto, 'randomUUID').mockReturnValue('nonce-fixed');
+    const fixedUuid = '00000000-0000-0000-0000-000000000000';
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue(fixedUuid);
 
     const headers = buildNodeHeaders(
       'POST',
@@ -58,14 +59,14 @@ describe('node hmac helpers', () => {
       '/v1/deploy/status',
       'debug=1',
       expectedTimestamp,
-      'nonce-fixed',
+      fixedUuid,
       '{"id":"abc"}',
       'secret-key',
     );
 
     expect(headers['X-MZ-Node-Id']).toBe('node-123');
     expect(headers['X-MZ-Timestamp']).toBe(expectedTimestamp);
-    expect(headers['X-MZ-Nonce']).toBe('nonce-fixed');
+    expect(headers['X-MZ-Nonce']).toBe(fixedUuid);
     expect(headers['X-MZ-Signature']).toBe(expectedSignature);
   });
 });
