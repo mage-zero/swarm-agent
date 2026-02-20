@@ -1,52 +1,24 @@
 {
-  "version": "0.4.44",
+  "version": "0.4.45",
   "date": "2026-02-20",
-  "summary": "Deploy reliability improvements: error classification, retry with deduplication, pre-build disk checks, enhanced auto-heal, and failure_action: pause",
+  "summary": "Fix ProxySQL query rules reconciliation: use remote admin user (radmin) and make non-fatal to prevent unrelated deploy failures",
   "requires": {
-    "cloud-swarm": ">=1.0.11"
+    "cloud-swarm": ">=1.0.12"
   },
   "changes": [
     {
-      "id": "deploy-error-classification",
-      "description": "New deploy-reliability module classifies errors as transient or permanent across 8 categories (disk_pressure, build_oom, build_manifest, magento_cli_lock, magento_cli_schema, config_error, network_timeout, container_startup) to decide retry eligibility.",
+      "id": "proxysql-remote-admin",
+      "description": "ProxySQL query rules reconciliation now uses the remote admin user (radmin) instead of the localhost-only admin user, fixing 'proxysql admin not ready' failures that were the root cause of many deploy failures.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
     },
     {
-      "id": "deploy-auto-retry",
-      "description": "Transient deploy errors are automatically retried up to 2 times (configurable via MZ_DEPLOY_MAX_RETRIES) with exponential backoff (30s base). Same-artifact deduplication prevents retry storms after 3+ failures within a 30-minute window.",
+      "id": "proxysql-reconciliation-non-fatal",
+      "description": "ProxySQL query rules reconciliation failure is now non-fatal — logs a warning and continues the deploy instead of failing it. The rules are already baked into the ProxySQL config template.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
-    },
-    {
-      "id": "pre-build-disk-check",
-      "description": "Aggressive Docker prune and minimum free space check run before the build stage, preventing disk_pressure failures that previously accounted for 21% of deploy failures.",
-      "phase": "pre_migrate",
-      "downtimeMinutes": 0,
-      "scope": "environment"
-    },
-    {
-      "id": "enhanced-auto-heal",
-      "description": "Post-deploy smoke check auto-heal increased from 1 round to 3 (configurable via MZ_DEPLOY_SMOKE_AUTO_HEAL_ROUNDS), delay increased from 5s to 10s between rounds, and ProxySQL added to heal targets when PHP health check fails.",
-      "phase": "post_migrate",
-      "downtimeMinutes": 0,
-      "scope": "environment"
-    },
-    {
-      "id": "opaque-docker-error-enrichment",
-      "description": "Docker command errors that return only an opaque service ID are now enriched with context and suggested inspection commands.",
-      "phase": "post_migrate",
-      "downtimeMinutes": 0,
-      "scope": "environment"
-    },
-    {
-      "id": "failure-action-pause",
-      "description": "Stack templates changed from failure_action: rollback to failure_action: pause, preventing Docker Swarm from independently rolling back services while the deploy pipeline is still orchestrating. Requires cloud-swarm >= 1.0.11.",
-      "phase": "pre_migrate",
-      "downtimeMinutes": 0,
-      "scope": "stack"
     }
   ]
 }

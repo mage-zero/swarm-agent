@@ -3116,8 +3116,8 @@ function buildProxySqlRuleReconcileScript(proxysqlServiceFullName: string): stri
     'CLIENT=""',
     'if command -v mariadb >/dev/null 2>&1; then CLIENT="mariadb"; elif command -v mysql >/dev/null 2>&1; then CLIENT="mysql"; fi',
     'if [ -z "$CLIENT" ]; then echo "missing mariadb/mysql client" >&2; exit 2; fi',
-    'i=0; until $CLIENT -h "$PROXYSQL_HOST" -P 6032 -u admin -padmin -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 60 ]; then echo "proxysql admin not ready" >&2; exit 1; fi; sleep 1; done',
-    '$CLIENT -h "$PROXYSQL_HOST" -P 6032 -u admin -padmin < "$SQL_FILE"',
+    'i=0; until $CLIENT -h "$PROXYSQL_HOST" -P 6032 -u radmin -pradmin -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 60 ]; then echo "proxysql admin not ready" >&2; exit 1; fi; sleep 1; done',
+    '$CLIENT -h "$PROXYSQL_HOST" -P 6032 -u radmin -pradmin < "$SQL_FILE"',
   ].join('\n');
   // Base64-encode to avoid newlines in the command argv (which triggers the command policy check).
   const encoded = Buffer.from(script).toString('base64');
@@ -5372,10 +5372,15 @@ async function processDeployment(recordPath: string) {
   envVars.MZ_SEARCH_ENGINE = searchEngine;
 
   progress.detail('deploy_stack', 'Reconciling ProxySQL query routing rules');
-  await enforceProxySqlQueryRules({
-    environmentId,
-    log,
-  });
+  try {
+    await enforceProxySqlQueryRules({
+      environmentId,
+      log,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(`WARNING: ProxySQL query rules reconciliation failed (non-fatal): ${msg}`);
+  }
 
   progress.detail('deploy_stack', `Deploying application (search engine: ${searchEngine})`);
   await runCommandLogged('docker', [
