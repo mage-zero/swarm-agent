@@ -10,7 +10,7 @@ import { parseListObjectsV2Xml } from './r2-list.js';
 import { getDbBackupZstdLevel } from './backup-utils.js';
 import { buildJobName, envServiceName, inspectServiceSpec, listServiceTasks, runSwarmJob } from './swarm.js';
 import { bootstrapMonitoringDashboards } from './monitoring-dashboards.js';
-import { resolveMageProfilerEnv } from './lib/apm-profiler.js';
+import { resolveDatadogTraceEnv } from './lib/apm-tracing.js';
 
 type DeployPayload = {
   artifact?: string;
@@ -4977,19 +4977,18 @@ async function processDeployment(recordPath: string) {
     ? envHostname.replace(/^https?:\/\//, '').split('/')[0]?.replace(/\/+$/, '') || ''
     : '';
   const apmEnabledValue = process.env.MZ_APM_ENABLED || '1';
-  const apmServerUrlValue = process.env.MZ_APM_SERVER_URL || 'http://mz-monitoring_otel-collector:4318/v1/traces';
-  const apmSampleRateValue = process.env.MZ_APM_SAMPLE_RATE || '1.0';
-  const apmServiceNameValue = process.env.MZ_APM_SERVICE_NAME || `mz-env-${environmentId}`;
-  const apmEnvironmentValue = envTypeRaw || process.env.MZ_APM_ENVIRONMENT || 'production';
-  const apmStackTraceLimitValue = process.env.MZ_APM_STACK_TRACE_LIMIT || '1000';
-  const apmTimeoutValue = process.env.MZ_APM_TIMEOUT || '10';
-  const mageProfilerValue = resolveMageProfilerEnv(process.env.MAGE_PROFILER, apmEnabledValue, {
-    serverUrl: apmServerUrlValue,
-    serviceName: apmServiceNameValue,
-    environment: apmEnvironmentValue,
-    transactionSampleRate: apmSampleRateValue,
-    stackTraceLimit: apmStackTraceLimitValue,
-    timeout: apmTimeoutValue,
+  const apmSpanEventsEnabledValue = process.env.MZ_APM_SPAN_EVENTS_ENABLED || '1';
+  const apmSpanLayoutEnabledValue = process.env.MZ_APM_SPAN_LAYOUT_ENABLED || '1';
+  const apmSpanPluginsEnabledValue = process.env.MZ_APM_SPAN_PLUGINS_ENABLED || '0';
+  const apmSpanDiEnabledValue = process.env.MZ_APM_SPAN_DI_ENABLED || '0';
+  const datadogTraceEnv = resolveDatadogTraceEnv(apmEnabledValue, {
+    traceEnabled: process.env.DD_TRACE_ENABLED,
+    traceAgentUrl: process.env.DD_TRACE_AGENT_URL,
+    service: process.env.DD_SERVICE || `mz-env-${environmentId}`,
+    environment: envTypeRaw || process.env.DD_ENV || 'production',
+    sampleRate: process.env.DD_TRACE_SAMPLE_RATE,
+    traceAgentTimeout: process.env.DD_TRACE_AGENT_TIMEOUT,
+    traceAgentConnectTimeout: process.env.DD_TRACE_AGENT_CONNECT_TIMEOUT,
   });
   const mailCatcherEnabled = ['non-production', 'development', 'staging', 'performance'].includes(envTypeRaw);
   const envEligible = envTypeRaw === ''
@@ -5114,19 +5113,19 @@ async function processDeployment(recordPath: string) {
     SMTP_FROM_ADDRESS: process.env.SMTP_FROM_ADDRESS || (envHostnameOnly ? `no-reply@${envHostnameOnly}` : ''),
     SMTP_FROM_HOSTNAME: process.env.SMTP_FROM_HOSTNAME || envHostnameOnly,
     // APM + Magento observability module config (rendered into app/etc/config.php).
-    // The profiler now emits OTLP traces to collector HTTP (/v1/traces).
+    // Tracing transport is Datadog tracer intake to OTel collector (:8126).
     MZ_APM_ENABLED: apmEnabledValue,
-    MZ_APM_SERVER_URL: apmServerUrlValue,
-    MZ_APM_SAMPLE_RATE: apmSampleRateValue,
-    MZ_APM_SERVICE_NAME: apmServiceNameValue,
-    MZ_APM_ENVIRONMENT: apmEnvironmentValue,
-    MZ_APM_SECRET_TOKEN: process.env.MZ_APM_SECRET_TOKEN || '',
-    MZ_APM_SECRET_TOKEN_FILE: process.env.MZ_APM_SECRET_TOKEN_FILE || '',
-    MZ_APM_DB_PROFILER_ENABLED: process.env.MZ_APM_DB_PROFILER_ENABLED || '1',
-    MZ_APM_STACK_TRACE_LIMIT: apmStackTraceLimitValue,
-    MZ_APM_TIMEOUT: apmTimeoutValue,
-    // Magento profiler bootstrap toggle. Required for request-level APM traces.
-    MAGE_PROFILER: mageProfilerValue,
+    MZ_APM_SPAN_EVENTS_ENABLED: apmSpanEventsEnabledValue,
+    MZ_APM_SPAN_LAYOUT_ENABLED: apmSpanLayoutEnabledValue,
+    MZ_APM_SPAN_PLUGINS_ENABLED: apmSpanPluginsEnabledValue,
+    MZ_APM_SPAN_DI_ENABLED: apmSpanDiEnabledValue,
+    DD_TRACE_ENABLED: datadogTraceEnv.DD_TRACE_ENABLED,
+    DD_TRACE_AGENT_URL: datadogTraceEnv.DD_TRACE_AGENT_URL,
+    DD_SERVICE: datadogTraceEnv.DD_SERVICE,
+    DD_ENV: datadogTraceEnv.DD_ENV,
+    DD_TRACE_SAMPLE_RATE: datadogTraceEnv.DD_TRACE_SAMPLE_RATE,
+    DD_TRACE_AGENT_TIMEOUT: datadogTraceEnv.DD_TRACE_AGENT_TIMEOUT,
+    DD_TRACE_AGENT_CONNECT_TIMEOUT: datadogTraceEnv.DD_TRACE_AGENT_CONNECT_TIMEOUT,
     MZ_LOG_STREAM_ENABLED: process.env.MZ_LOG_STREAM_ENABLED || '1',
     MZ_LOG_STREAM_MIN_LEVEL: process.env.MZ_LOG_STREAM_MIN_LEVEL || 'warning',
     MZ_LOG_STREAM_TRANSPORT: process.env.MZ_LOG_STREAM_TRANSPORT || 'stderr',
@@ -6070,7 +6069,7 @@ export const __testing = {
   buildSearchSystemConfigSql,
   buildMagentoCliCommand,
   buildSetupDbStatusCommand,
-  resolveMageProfilerEnv,
+  resolveDatadogTraceEnv,
   resolveAppHaReplicaPolicy,
   resolveFrontendRuntimePolicy,
   buildProxySqlQueryRulesSql,

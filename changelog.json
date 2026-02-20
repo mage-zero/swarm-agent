@@ -1,15 +1,22 @@
 {
-  "version": "0.4.40",
+  "version": "0.4.41",
   "date": "2026-02-19",
-  "summary": "Reconcile ProxySQL query rules during deploy so Magento search temporary table queries stay on writer and storefront search does not fail",
+  "summary": "Cut Magento APM deploy defaults over to Datadog tracer envs and remove legacy profiler bootstrap env wiring",
   "requires": {
-    "cloud-swarm": ">=1.0.7",
+    "cloud-swarm": ">=1.0.9",
     "mz-control": ">=1.0.9"
   },
   "changes": [
     {
-      "id": "deploy-proxysql-search-tmp-routing-reconcile",
-      "description": "Deploy worker now enforces managed ProxySQL query rules before app rollout, including routing search_tmp_ queries to writer hostgroup and keeping generic SELECT on reader hostgroup. This backfills environments where proxysql runtime rules drifted from template defaults.",
+      "id": "deploy-magento-apm-datadog-cutover",
+      "description": "Deploy worker now emits Datadog tracer env defaults (`DD_TRACE_*`, `DD_SERVICE`, `DD_ENV`) for Magento services and stops generating `MAGE_PROFILER` payloads.",
+      "phase": "post_migrate",
+      "downtimeMinutes": 0,
+      "scope": "environment"
+    },
+    {
+      "id": "migration-sync-magento-datadog-tracing-env",
+      "description": "Upgrade migration now reconciles existing Magento service env vars to Datadog tracing and removes legacy profiler/OTLP env keys from running stacks.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"

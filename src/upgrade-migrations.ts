@@ -3,7 +3,7 @@ import path from 'path';
 import { runCommand } from './exec.js';
 import { buildNodeHeaders } from './node-hmac.js';
 import { bootstrapMonitoringDashboards } from './monitoring-dashboards.js';
-import { isEnabledFlag, resolveMageProfilerEnv } from './lib/apm-profiler.js';
+import { resolveDatadogTraceEnv } from './lib/apm-tracing.js';
 import { buildCapacityPayload } from './status.js';
 
 export type MigrationContext = {
@@ -1135,14 +1135,25 @@ registerMigration('frontend-placement-deadlock-recovery', async (ctx) => {
   }
 });
 
-registerMigration('sync-magento-apm-profiler-bootstrap', async (ctx) => {
+registerMigration('sync-magento-datadog-tracing-env', async (ctx) => {
   if (!ctx.environmentId) {
-    console.warn('upgrade.migration.sync_magento_apm_profiler_bootstrap: missing environmentId; skipping');
+    console.warn('upgrade.migration.sync_magento_datadog_tracing_env: missing environmentId; skipping');
     return;
   }
 
-  const explicitProfilerValue = process.env.MAGE_PROFILER;
   const serviceSuffixes = ['php-fpm', 'php-fpm-admin', 'cron'];
+  const legacyEnvKeysToRemove = [
+    'MAGE_PROFILER',
+    'MZ_APM_SERVER_URL',
+    'MZ_APM_SAMPLE_RATE',
+    'MZ_APM_SERVICE_NAME',
+    'MZ_APM_ENVIRONMENT',
+    'MZ_APM_SECRET_TOKEN',
+    'MZ_APM_SECRET_TOKEN_FILE',
+    'MZ_APM_DB_PROFILER_ENABLED',
+    'MZ_APM_STACK_TRACE_LIMIT',
+    'MZ_APM_TIMEOUT',
+  ];
 
   for (const suffix of serviceSuffixes) {
     const serviceName = `mz-env-${ctx.environmentId}_${suffix}`;
@@ -1154,7 +1165,7 @@ registerMigration('sync-magento-apm-profiler-bootstrap', async (ctx) => {
     if (inspect.code !== 0) {
       const inspectOutput = `${inspect.stdout}\n${inspect.stderr}`.toLowerCase();
       if (inspectOutput.includes('no such service')) {
-        console.warn(`upgrade.migration.sync_magento_apm_profiler_bootstrap: ${serviceName} not found; skipping`);
+        console.warn(`upgrade.migration.sync_magento_datadog_tracing_env: ${serviceName} not found; skipping`);
         continue;
       }
       throw new Error(
@@ -1167,37 +1178,45 @@ registerMigration('sync-magento-apm-profiler-bootstrap', async (ctx) => {
       const line = envLines.find((item) => item.startsWith(`${key}=`));
       return line ? line.slice(key.length + 1) : '';
     };
-    const apmEnabledValue = readEnvValue('MZ_APM_ENABLED');
-    const profilerValue = resolveMageProfilerEnv(
-      explicitProfilerValue,
-      isEnabledFlag(apmEnabledValue, true) ? '1' : '0',
-      {
-        serverUrl: readEnvValue('MZ_APM_SERVER_URL'),
-        serviceName: readEnvValue('MZ_APM_SERVICE_NAME'),
-        environment: readEnvValue('MZ_APM_ENVIRONMENT'),
-        transactionSampleRate: readEnvValue('MZ_APM_SAMPLE_RATE'),
-        stackTraceLimit: readEnvValue('MZ_APM_STACK_TRACE_LIMIT'),
-        timeout: readEnvValue('MZ_APM_TIMEOUT'),
-      },
-    );
+    const apmEnabledValue = readEnvValue('MZ_APM_ENABLED') || process.env.MZ_APM_ENABLED || '1';
+    const traceEnv = resolveDatadogTraceEnv(apmEnabledValue, {
+      traceEnabled: readEnvValue('DD_TRACE_ENABLED') || process.env.DD_TRACE_ENABLED,
+      traceAgentUrl: readEnvValue('DD_TRACE_AGENT_URL') || process.env.DD_TRACE_AGENT_URL,
+      service: readEnvValue('DD_SERVICE') || readEnvValue('MZ_APM_SERVICE_NAME') || `mz-env-${ctx.environmentId}`,
+      environment: readEnvValue('DD_ENV') || readEnvValue('MZ_APM_ENVIRONMENT') || process.env.DD_ENV || 'production',
+      sampleRate: readEnvValue('DD_TRACE_SAMPLE_RATE') || readEnvValue('MZ_APM_SAMPLE_RATE') || process.env.DD_TRACE_SAMPLE_RATE,
+      traceAgentTimeout: readEnvValue('DD_TRACE_AGENT_TIMEOUT') || process.env.DD_TRACE_AGENT_TIMEOUT,
+      traceAgentConnectTimeout:
+        readEnvValue('DD_TRACE_AGENT_CONNECT_TIMEOUT') || process.env.DD_TRACE_AGENT_CONNECT_TIMEOUT,
+    });
 
-    const args = profilerValue !== ''
-      ? ['service', 'update', '--env-add', `MAGE_PROFILER=${profilerValue}`, serviceName]
-      : ['service', 'update', '--env-rm', 'MAGE_PROFILER', serviceName];
+    const args: string[] = ['service', 'update'];
+    for (const [key, value] of Object.entries(traceEnv)) {
+      if (value === '' && (key === 'DD_TRACE_AGENT_TIMEOUT' || key === 'DD_TRACE_AGENT_CONNECT_TIMEOUT')) {
+        args.push('--env-rm', key);
+        continue;
+      }
+      args.push('--env-add', `${key}=${value}`);
+    }
+    for (const legacyKey of legacyEnvKeysToRemove) {
+      args.push('--env-rm', legacyKey);
+    }
+    args.push(serviceName);
+
     const result = await runCommand('docker', args, 120_000);
     if (result.code === 0) {
       continue;
     }
     const output = `${result.stdout}\n${result.stderr}`.toLowerCase();
     if (output.includes('no such service')) {
-      console.warn(`upgrade.migration.sync_magento_apm_profiler_bootstrap: ${serviceName} not found; skipping`);
+      console.warn(`upgrade.migration.sync_magento_datadog_tracing_env: ${serviceName} not found; skipping`);
       continue;
     }
     if (output.includes('nothing to update')) {
       continue;
     }
     throw new Error(
-      `Failed to sync MAGE_PROFILER on ${serviceName}: ${result.stderr || result.stdout || `exit ${result.code}`}`
+      `Failed to sync Datadog tracing env on ${serviceName}: ${result.stderr || result.stdout || `exit ${result.code}`}`
     );
   }
 });
