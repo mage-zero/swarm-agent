@@ -1,22 +1,22 @@
 {
-  "version": "0.4.42",
+  "version": "0.4.43",
   "date": "2026-02-20",
-  "summary": "Harden multi-node image pulls and swarm runbook jobs against registry alias/digest drift",
+  "summary": "Fix ProxySQL query rules reconciliation job entrypoint and command policy compliance",
   "requires": {
-    "cloud-swarm": ">=1.0.9",
+    "cloud-swarm": ">=1.0.8",
     "mz-control": ">=1.0.9"
   },
   "changes": [
     {
-      "id": "deploy-registry-pull-host-wireguard",
-      "description": "Deploy worker now rewrites loopback/`registry` pull hosts to the manager WireGuard IP in multi-node swarms so worker nodes can pull runtime images consistently.",
+      "id": "proxysql-rules-entrypoint-override",
+      "description": "ProxySQL query rules reconciliation job now overrides the container entrypoint to `sh` so the reconcile script runs directly instead of triggering the ProxySQL service entrypoint (which requires the `db_password` secret and would exit immediately).",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
     },
     {
-      "id": "swarm-job-image-digest-normalization",
-      "description": "Swarm runbook jobs now avoid digest-pinned tagged refs and use `--no-resolve-image` to prevent create-time failures when registry digests rotate.",
+      "id": "proxysql-rules-script-base64",
+      "description": "ProxySQL reconcile script is now base64-encoded before being passed as a command argument, eliminating newline characters from argv and resolving command policy `argv contains unsafe characters` violations.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
