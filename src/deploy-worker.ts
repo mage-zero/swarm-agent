@@ -5165,6 +5165,19 @@ async function processDeployment(recordPath: string) {
     MZ_LOG_STREAM_DIRECT_PASSWORD_FILE: process.env.MZ_LOG_STREAM_DIRECT_PASSWORD_FILE || '',
     MZ_LOG_STREAM_DIRECT_TIMEOUT_MS: process.env.MZ_LOG_STREAM_DIRECT_TIMEOUT_MS || '500',
     MZ_LOG_STREAM_DIRECT_VERIFY_TLS: process.env.MZ_LOG_STREAM_DIRECT_VERIFY_TLS || '1',
+    // Cloudflare R2 media storage (rendered into app/etc/config.php by the wrapper).
+    MZ_R2_ENABLED: process.env.MZ_R2_ENABLED || '0',
+    MZ_R2_ACCOUNT_ID: process.env.MZ_R2_ACCOUNT_ID || '',
+    MZ_R2_ENDPOINT: process.env.MZ_R2_ENDPOINT || '',
+    MZ_R2_REGION: process.env.MZ_R2_REGION || 'auto',
+    MZ_R2_BUCKET: process.env.MZ_R2_BUCKET || '',
+    MZ_R2_ACCESS_KEY: process.env.MZ_R2_ACCESS_KEY || '',
+    MZ_R2_ACCESS_KEY_FILE: process.env.MZ_R2_ACCESS_KEY_FILE || '',
+    MZ_R2_SECRET_KEY: process.env.MZ_R2_SECRET_KEY || '',
+    MZ_R2_SECRET_KEY_FILE: process.env.MZ_R2_SECRET_KEY_FILE || '',
+    MZ_R2_KEY_PREFIX: process.env.MZ_R2_KEY_PREFIX || '',
+    MZ_R2_PATH_STYLE: process.env.MZ_R2_PATH_STYLE || '0',
+    MZ_R2_CACHE_TTL: process.env.MZ_R2_CACHE_TTL || '3600',
   };
   assertRequiredEnv(envVars, [
     'MAGE_VERSION',
