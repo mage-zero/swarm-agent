@@ -1,21 +1,14 @@
 {
-  "version": "0.4.45",
-  "date": "2026-02-20",
-  "summary": "Fix ProxySQL query rules reconciliation: use remote admin user (radmin) and make non-fatal to prevent unrelated deploy failures",
+  "version": "0.4.46",
+  "date": "2026-02-21",
+  "summary": "Remove automatic deploy retry logic — failed deploys should be diagnosed and resolved rather than blindly retried",
   "requires": {
     "cloud-swarm": ">=1.0.12"
   },
   "changes": [
     {
-      "id": "proxysql-remote-admin",
-      "description": "ProxySQL query rules reconciliation now uses the remote admin user (radmin) instead of the localhost-only admin user, fixing 'proxysql admin not ready' failures that were the root cause of many deploy failures.",
-      "phase": "post_migrate",
-      "downtimeMinutes": 0,
-      "scope": "environment"
-    },
-    {
-      "id": "proxysql-reconciliation-non-fatal",
-      "description": "ProxySQL query rules reconciliation failure is now non-fatal — logs a warning and continues the deploy instead of failing it. The rules are already baked into the ProxySQL config template.",
+      "id": "remove-deploy-retry",
+      "description": "Removed automatic deploy-level retry with deduplication. Failed deploys now stop immediately instead of retrying, allowing the support agent or operator to diagnose the root cause.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
