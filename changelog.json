@@ -1,11 +1,11 @@
 {
-  "version": "0.4.50",
+  "version": "0.4.51",
   "date": "2026-02-22",
-  "summary": "Remove auto-heal (force-update loop corrupts IPVS), keep auto-rollback",
+  "summary": "Skip setup:upgrade on persistent schema mismatch (broken third-party db_schema.xml)",
   "changes": [
     {
-      "id": "remove-auto-heal",
-      "description": "Remove post-deploy smoke check auto-heal loop. Force-updating services during smoke failures causes IPVS load balancer table corruption in Docker Swarm overlay networks, making the outage worse. Auto-rollback to last known good artifact is retained.",
+      "id": "persistent-schema-mismatch",
+      "description": "After setup:upgrade completes, re-run setup:db:status. If the schema is still reported as 'not up to date' (e.g. due to a buggy third-party module db_schema.xml), record a marker. Subsequent deploys with the same artifact skip the upgrade cycle (no maintenance mode, no DB backup, no setup:upgrade), saving ~4 minutes per deploy and avoiding unnecessary downtime.",
       "phase": "pre_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"

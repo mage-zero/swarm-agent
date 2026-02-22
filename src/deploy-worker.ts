@@ -3097,6 +3097,51 @@ function writeJsonFileBestEffort(filePath: string, payload: unknown) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Schema upgrade marker — tracks persistent setup:db:status mismatches
+// ---------------------------------------------------------------------------
+
+type SchemaUpgradeMarker = {
+  artifact: string;
+  upgraded_at: string;
+  post_check_needed: boolean;
+};
+
+function schemaUpgradeMarkerPath(environmentId: number): string {
+  return path.join(DEPLOY_QUEUE_DIR, 'meta', `schema-upgrade-marker-env-${environmentId}.json`);
+}
+
+function readSchemaUpgradeMarker(environmentId: number): SchemaUpgradeMarker | null {
+  try {
+    const raw = fs.readFileSync(schemaUpgradeMarkerPath(environmentId), 'utf8');
+    const parsed = JSON.parse(raw) as SchemaUpgradeMarker;
+    if (parsed && typeof parsed.artifact === 'string' && parsed.post_check_needed) {
+      return parsed;
+    }
+  } catch {
+    // marker doesn't exist or is invalid
+  }
+  return null;
+}
+
+function writeSchemaUpgradeMarker(environmentId: number, artifact: string): void {
+  const marker: SchemaUpgradeMarker = {
+    artifact,
+    upgraded_at: new Date().toISOString(),
+    post_check_needed: true,
+  };
+  ensureDir(path.join(DEPLOY_QUEUE_DIR, 'meta'));
+  writeJsonFileBestEffort(schemaUpgradeMarkerPath(environmentId), marker);
+}
+
+function clearSchemaUpgradeMarker(environmentId: number): void {
+  try {
+    fs.unlinkSync(schemaUpgradeMarkerPath(environmentId));
+  } catch {
+    // ignore if doesn't exist
+  }
+}
+
 function enqueueDeploymentRecord(payload: DeployPayload, deploymentId: string) {
   ensureDir(DEPLOY_QUEUED_DIR);
   const target = path.join(DEPLOY_QUEUED_DIR, `${deploymentId}.json`);
@@ -4362,9 +4407,28 @@ async function processDeployment(recordPath: string) {
   };
   writeJsonFileBestEffort(recordPath, recordMeta);
 
+  // Check for persistent schema mismatch: if setup:upgrade already ran for this
+  // artifact and the schema was still "not up to date" afterwards (e.g. a third-party
+  // module bug), skip the upgrade cycle to avoid unnecessary maintenance + backup.
+  let upgradeNeeded = dbStatus.needed;
+  if (upgradeNeeded) {
+    const marker = readSchemaUpgradeMarker(environmentId);
+    if (marker && marker.artifact === artifactKey && marker.post_check_needed) {
+      log(`setup:upgrade skipped: persistent schema mismatch already recorded for this artifact (upgraded at ${marker.upgraded_at})`);
+      progress.detail('magento_steps', 'setup:upgrade skipped; persistent schema mismatch');
+      upgradeNeeded = false;
+      (recordMeta as Record<string, unknown>).setup_upgrade_skipped_persistent_mismatch = {
+        marker_artifact: marker.artifact,
+        marker_upgraded_at: marker.upgraded_at,
+        skipped_at: new Date().toISOString(),
+      };
+      writeJsonFileBestEffort(recordPath, recordMeta);
+    }
+  }
+
   let maintenanceEnabled = false;
   try {
-    if (!dbStatus.needed) {
+    if (!upgradeNeeded) {
       log('setup:upgrade not required; cache already flushed before status check');
       progress.detail('magento_steps', 'setup:upgrade not required; continuing');
     } else {
@@ -4407,6 +4471,27 @@ async function processDeployment(recordPath: string) {
       }
       progress.detail('magento_steps', 'setup:upgrade complete; flushing cache');
       adminContainerId = await flushMagentoCache(adminContainerId, stackName, log);
+
+      // Re-check setup:db:status after upgrade to detect persistent mismatches.
+      // Some third-party modules have broken db_schema.xml that causes setup:db:status
+      // to always report "not up to date" even after a successful setup:upgrade.
+      // Record this so future deploys with the same artifact skip the upgrade cycle.
+      if (!upgradeWarning) {
+        const postCheck = await runSetupDbStatus(adminContainerId, stackName, log);
+        adminContainerId = postCheck.containerId;
+        if (postCheck.needed) {
+          log('warning: setup:db:status still reports "not up to date" after successful setup:upgrade; recording persistent schema mismatch');
+          writeSchemaUpgradeMarker(environmentId, artifactKey);
+        } else {
+          clearSchemaUpgradeMarker(environmentId);
+        }
+        (recordMeta as Record<string, unknown>).setup_upgrade_post_check = {
+          needed: postCheck.needed,
+          output: postCheck.output || null,
+          checked_at: new Date().toISOString(),
+        };
+        writeJsonFileBestEffort(recordPath, recordMeta);
+      }
     }
 
     progress.detail('magento_steps', 'Checking app:config:status');
