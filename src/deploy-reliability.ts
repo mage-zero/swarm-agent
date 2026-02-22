@@ -49,12 +49,6 @@ export type DiskCheckResult = {
   reason: string;
 };
 
-export type AutoHealConfig = {
-  enabled: boolean;
-  rounds: number;
-  delayMs: number;
-  autoRollback: boolean;
-};
 
 // ---------------------------------------------------------------------------
 // Phase 1: Error Classification
@@ -183,41 +177,6 @@ export function shouldDeduplicateDeploy(
     (r) => r.artifact === artifact && r.timestamp >= cutoff,
   );
   return matching.length >= DEDUP_MIN_FAILURES;
-}
-
-// ---------------------------------------------------------------------------
-// Phase 5: Auto-Heal Configuration
-// ---------------------------------------------------------------------------
-
-export function resolveAutoHealConfig(env: Record<string, string | undefined>): AutoHealConfig {
-  const delayRaw = Number(env.MZ_DEPLOY_SMOKE_AUTO_HEAL_DELAY_MS || 10000);
-  return {
-    enabled: (env.MZ_DEPLOY_SMOKE_AUTO_HEAL_ENABLED || '1') !== '0',
-    rounds: Math.max(0, Number(env.MZ_DEPLOY_SMOKE_AUTO_HEAL_ROUNDS || 3)),
-    delayMs: Number.isFinite(delayRaw) && delayRaw > 0 ? delayRaw : 10000,
-    autoRollback: (env.MZ_DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED || '0') === '1',
-  };
-}
-
-export function resolveAutoHealTargets(failedChecks: string[]): string[] {
-  const targets = new Set<string>();
-
-  if (failedChecks.length === 0) {
-    targets.add('nginx');
-    targets.add('varnish');
-    return Array.from(targets);
-  }
-
-  for (const check of failedChecks) {
-    if (check.startsWith('nginx.')) targets.add('nginx');
-    if (check.startsWith('varnish.')) targets.add('varnish');
-    if (check === 'nginx.health_check.php') {
-      targets.add('php-fpm');
-      targets.add('proxysql');
-    }
-  }
-
-  return Array.from(targets);
 }
 
 // ---------------------------------------------------------------------------

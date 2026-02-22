@@ -11,8 +11,6 @@ import { bootstrapMonitoringDashboards } from './monitoring-dashboards.js';
 import { resolveDatadogTraceEnv } from './lib/apm-tracing.js';
 import {
   classifyDeployError,
-  resolveAutoHealConfig,
-  resolveAutoHealTargets,
   enrichCommandError,
 } from './deploy-reliability.js';
 import {
@@ -104,7 +102,6 @@ import {
   captureServicePs,
 } from './lib/docker-service.js';
 import {
-  type PostDeploySmokeCheckResult,
   runPostDeploySmokeChecks,
 } from './lib/smoke-check.js';
 
@@ -160,11 +157,7 @@ const DEPLOY_FAILED_ARTIFACT_RETAIN_COUNT = Math.max(0, Number(process.env.MZ_DE
 const DEPLOY_FAILED_IMAGE_RETAIN_COUNT = Math.max(0, Number(process.env.MZ_DEPLOY_FAILED_IMAGE_RETAIN_COUNT || 1));
 const DEPLOY_FAILED_RETAIN_COUNT = Math.max(0, Number(process.env.MZ_DEPLOY_FAILED_RETAIN_COUNT || 1));
 const DEPLOY_CLEANUP_ENABLED = (process.env.MZ_DEPLOY_CLEANUP_ENABLED || '1') !== '0';
-const AUTO_HEAL_CFG = resolveAutoHealConfig(process.env);
-const DEPLOY_SMOKE_AUTO_HEAL_ENABLED = AUTO_HEAL_CFG.enabled;
-const DEPLOY_SMOKE_AUTO_HEAL_ROUNDS = AUTO_HEAL_CFG.rounds;
-const DEPLOY_SMOKE_AUTO_HEAL_DELAY_MS = AUTO_HEAL_CFG.delayMs;
-const DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED = AUTO_HEAL_CFG.autoRollback;
+const DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED = (process.env.MZ_DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED || '0') === '1';
 const RELEASE_COHORT_GATE_ENABLED = (process.env.MZ_RELEASE_COHORT_GATE_ENABLED || '1') !== '0';
 // Rolling back a cohort to an unknown state can make things worse (e.g. rolling back to a tag that was never
 // a successful deploy). Default to "fail-fast + stop crash-looping services" instead.
@@ -3119,70 +3112,6 @@ function chooseLastKnownGoodArtifact(environmentId: number, repository: string):
   return artifact || null;
 }
 
-async function autoHealPostDeploySmokeFailure(params: {
-  stackName: string;
-  envHostname: string;
-  recordPath: string;
-  record: Record<string, unknown>;
-  initial: { summary: string; results: PostDeploySmokeCheckResult[] };
-  log: (message: string) => void;
-}): Promise<{ ok: true; results: PostDeploySmokeCheckResult[] } | { ok: false; summary: string; results: PostDeploySmokeCheckResult[] }> {
-  const run = {
-    id: crypto.randomUUID(),
-    started_at: new Date().toISOString(),
-    initial: params.initial,
-    rounds: [] as Array<Record<string, unknown>>,
-  };
-
-  const failingNames = params.initial.results.filter((r) => !r.ok).map((r) => r.name);
-  const healTargetNames = resolveAutoHealTargets(failingNames);
-  const restartTargets = new Set<string>(
-    healTargetNames.map((name) => `${params.stackName}_${name}`),
-  );
-
-  for (let round = 1; round <= DEPLOY_SMOKE_AUTO_HEAL_ROUNDS; round += 1) {
-    params.log(`auto-heal: round ${round}/${DEPLOY_SMOKE_AUTO_HEAL_ROUNDS}`);
-    const actions: string[] = [];
-    for (const serviceName of Array.from(restartTargets)) {
-      const ok = await tryForceUpdateService(serviceName, params.log);
-      actions.push(`${ok ? 'updated' : 'failed'}:${serviceName}`);
-      await delay(1000);
-    }
-
-    await delay(DEPLOY_SMOKE_AUTO_HEAL_DELAY_MS);
-
-    const verified = await runPostDeploySmokeChecks(params.stackName, params.envHostname, params.log);
-    const psSummary: Record<string, unknown> = {};
-    for (const serviceName of Array.from(restartTargets)) {
-      psSummary[serviceName] = await captureServicePs(serviceName);
-    }
-
-    run.rounds.push({
-      round,
-      actions,
-      verified_ok: verified.ok,
-      verified_summary: verified.ok ? null : verified.summary,
-      verified_results: verified.results,
-      service_ps: psSummary,
-      captured_at: new Date().toISOString(),
-    });
-
-    params.record.post_deploy_auto_heal = run;
-    writeJsonFileBestEffort(params.recordPath, params.record);
-
-    if (verified.ok) {
-      params.log('auto-heal: post-deploy verification passed');
-      return verified;
-    }
-  }
-
-  const last = run.rounds[run.rounds.length - 1] as Record<string, unknown> | undefined;
-  const summary = typeof last?.verified_summary === 'string' ? String(last.verified_summary) : params.initial.summary;
-  const results = (last?.verified_results as PostDeploySmokeCheckResult[] | undefined) || params.initial.results;
-  params.log('auto-heal: exhausted rounds; still failing');
-  return { ok: false, summary, results };
-}
-
 async function enforceMagentoPerformance(
   containerId: string,
   stackName: string,
@@ -4576,63 +4505,31 @@ async function processDeployment(recordPath: string) {
       };
       writeJsonFileBestEffort(recordPath, recordState);
 
-      if (DEPLOY_SMOKE_AUTO_HEAL_ENABLED && DEPLOY_SMOKE_AUTO_HEAL_ROUNDS > 0) {
-        log('post-deploy smoke checks failed; attempting auto-heal');
-        progress.detail('smoke_checks', 'Smoke checks failed; attempting auto-heal');
-        const healed = await autoHealPostDeploySmokeFailure({
-          stackName,
-          envHostname,
-          recordPath,
-          record: recordState,
-          initial: { summary: smoke.summary, results: smoke.results },
-          log,
-        });
-        if (healed.ok) {
-          recordState.post_deploy_smoke_checks = {
-            ok: true,
-            recovered_from: smoke.summary,
-            results: healed.results,
-            recovered_at: new Date().toISOString(),
+      if (!payload.rollback_of && DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED) {
+        const repository = String(payload.repository || '').trim() || inferRepositoryFromArtifactKey(artifactKey);
+        const lastGood = repository ? chooseLastKnownGoodArtifact(environmentId, repository) : null;
+        if (repository && lastGood && lastGood.replace(/^\/+/, '') !== artifactKey.replace(/^\/+/, '')) {
+          const rollbackDeploymentId = crypto.randomUUID();
+          enqueueDeploymentRecord({
+            artifact: lastGood,
+            stack_id: stackId,
+            environment_id: environmentId,
+            repository,
+            ref: ref || undefined,
+            rollback_of: artifactKey,
+          }, rollbackDeploymentId);
+          recordState.post_deploy_auto_rollback = {
+            queued_deployment_id: rollbackDeploymentId,
+            artifact: lastGood,
+            repository,
+            queued_at: new Date().toISOString(),
           };
           writeJsonFileBestEffort(recordPath, recordState);
-        } else {
-          recordState.post_deploy_smoke_checks = {
-            ok: false,
-            summary: healed.summary,
-            results: healed.results,
-            captured_at: new Date().toISOString(),
-          };
-          writeJsonFileBestEffort(recordPath, recordState);
-
-          if (!payload.rollback_of && DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED) {
-            const repository = String(payload.repository || '').trim() || inferRepositoryFromArtifactKey(artifactKey);
-            const lastGood = repository ? chooseLastKnownGoodArtifact(environmentId, repository) : null;
-            if (repository && lastGood && lastGood.replace(/^\/+/, '') !== artifactKey.replace(/^\/+/, '')) {
-              const rollbackDeploymentId = crypto.randomUUID();
-              enqueueDeploymentRecord({
-                artifact: lastGood,
-                stack_id: stackId,
-                environment_id: environmentId,
-                repository,
-                ref: ref || undefined,
-                rollback_of: artifactKey,
-              }, rollbackDeploymentId);
-              recordState.post_deploy_auto_rollback = {
-                queued_deployment_id: rollbackDeploymentId,
-                artifact: lastGood,
-                repository,
-                queued_at: new Date().toISOString(),
-              };
-              writeJsonFileBestEffort(recordPath, recordState);
-              throw new Error(`Post-deploy smoke checks failed: ${healed.summary}. Auto-rollback queued (${rollbackDeploymentId}).`);
-            }
-          }
-
-          throw new Error(`Post-deploy smoke checks failed: ${healed.summary}`);
+          throw new Error(`Post-deploy smoke checks failed: ${smoke.summary}. Auto-rollback queued (${rollbackDeploymentId}).`);
         }
-      } else {
-        throw new Error(`Post-deploy smoke checks failed: ${smoke.summary}`);
       }
+
+      throw new Error(`Post-deploy smoke checks failed: ${smoke.summary}`);
     }
     progress.ok('smoke_checks');
   } else {

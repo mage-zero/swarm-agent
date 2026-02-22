@@ -8,8 +8,6 @@ import {
   resolveRetryPolicy,
   buildRetryRecord,
   shouldDeduplicateDeploy,
-  resolveAutoHealConfig,
-  resolveAutoHealTargets,
   isDockerServiceId,
   enrichCommandError,
 } from '../src/deploy-reliability.js';
@@ -26,8 +24,6 @@ describe('deploy-reliability module', () => {
     expect(typeof resolveRetryPolicy).toBe('function');
     expect(typeof buildRetryRecord).toBe('function');
     expect(typeof shouldDeduplicateDeploy).toBe('function');
-    expect(typeof resolveAutoHealConfig).toBe('function');
-    expect(typeof resolveAutoHealTargets).toBe('function');
     expect(typeof isDockerServiceId).toBe('function');
     expect(typeof enrichCommandError).toBe('function');
   });
@@ -427,99 +423,6 @@ describe('stack templates failure_action', () => {
       expect(pauseMatches).not.toBeNull();
     });
   }
-});
-
-// ---------------------------------------------------------------------------
-// Phase 5: Auto-Heal Configuration
-// ---------------------------------------------------------------------------
-
-describe('resolveAutoHealConfig', () => {
-  it('returns defaults when no env vars set', () => {
-    const config = resolveAutoHealConfig({});
-    expect(config.enabled).toBe(true);
-    expect(config.rounds).toBe(3);
-    expect(config.delayMs).toBe(10000);
-    expect(config.autoRollback).toBe(false);
-  });
-
-  it('respects MZ_DEPLOY_SMOKE_AUTO_HEAL_ENABLED=0', () => {
-    const config = resolveAutoHealConfig({ MZ_DEPLOY_SMOKE_AUTO_HEAL_ENABLED: '0' });
-    expect(config.enabled).toBe(false);
-  });
-
-  it('respects explicit rounds override', () => {
-    const config = resolveAutoHealConfig({ MZ_DEPLOY_SMOKE_AUTO_HEAL_ROUNDS: '5' });
-    expect(config.rounds).toBe(5);
-  });
-
-  it('respects explicit delay override', () => {
-    const config = resolveAutoHealConfig({ MZ_DEPLOY_SMOKE_AUTO_HEAL_DELAY_MS: '15000' });
-    expect(config.delayMs).toBe(15000);
-  });
-
-  it('respects auto rollback enabled', () => {
-    const config = resolveAutoHealConfig({ MZ_DEPLOY_SMOKE_AUTO_ROLLBACK_ENABLED: '1' });
-    expect(config.autoRollback).toBe(true);
-  });
-
-  it('clamps rounds to 0 minimum', () => {
-    const config = resolveAutoHealConfig({ MZ_DEPLOY_SMOKE_AUTO_HEAL_ROUNDS: '-1' });
-    expect(config.rounds).toBe(0);
-  });
-
-  it('falls back to default delay for NaN input', () => {
-    const config = resolveAutoHealConfig({ MZ_DEPLOY_SMOKE_AUTO_HEAL_DELAY_MS: 'not-a-number' });
-    expect(config.delayMs).toBe(10000);
-  });
-
-  it('falls back to default delay for negative input', () => {
-    const config = resolveAutoHealConfig({ MZ_DEPLOY_SMOKE_AUTO_HEAL_DELAY_MS: '-5000' });
-    expect(config.delayMs).toBe(10000);
-  });
-
-  it('falls back to default delay for zero', () => {
-    const config = resolveAutoHealConfig({ MZ_DEPLOY_SMOKE_AUTO_HEAL_DELAY_MS: '0' });
-    expect(config.delayMs).toBe(10000);
-  });
-});
-
-describe('resolveAutoHealTargets', () => {
-  it('returns nginx when nginx health check fails', () => {
-    const targets = resolveAutoHealTargets(['nginx.mz-healthz']);
-    expect(targets).toContain('nginx');
-  });
-
-  it('returns varnish when varnish health check fails', () => {
-    const targets = resolveAutoHealTargets(['varnish.mz-healthz']);
-    expect(targets).toContain('varnish');
-  });
-
-  it('returns php-fpm when php health check fails', () => {
-    const targets = resolveAutoHealTargets(['nginx.health_check.php']);
-    expect(targets).toContain('php-fpm');
-  });
-
-  it('returns proxysql when any database-related check fails', () => {
-    const targets = resolveAutoHealTargets(['nginx.health_check.php']);
-    expect(targets).toContain('proxysql');
-  });
-
-  it('returns all frontline services when no checks specified', () => {
-    const targets = resolveAutoHealTargets([]);
-    expect(targets).toContain('nginx');
-    expect(targets).toContain('varnish');
-  });
-
-  it('deduplicates targets', () => {
-    const targets = resolveAutoHealTargets(['nginx.mz-healthz', 'nginx.health_check.php']);
-    const nginxCount = targets.filter((t) => t === 'nginx').length;
-    expect(nginxCount).toBe(1);
-  });
-
-  it('includes varnish root check', () => {
-    const targets = resolveAutoHealTargets(['varnish.root']);
-    expect(targets).toContain('varnish');
-  });
 });
 
 // ---------------------------------------------------------------------------
