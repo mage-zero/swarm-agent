@@ -1,10 +1,7 @@
 {
-  "version": "0.4.48",
+  "version": "0.4.49",
   "date": "2026-02-22",
-  "summary": "Fix setup:upgrade lock timeout, extract deploy modules, add overlay DNS hardening",
-  "requires": {
-    "cloud-swarm": ">=1.0.14"
-  },
+  "summary": "Fix setup:upgrade lock timeout, extract deploy modules",
   "changes": [
     {
       "id": "wait-for-cron-before-upgrade",
@@ -26,13 +23,6 @@
       "phase": "pre_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
-    },
-    {
-      "id": "dns-opt-use-vc",
-      "description": "Requires cloud-swarm >=1.0.14 which adds dns_opt use-vc to overlay network services, forcing TCP DNS to mitigate intermittent UDP resolution failures.",
-      "phase": "pre_migrate",
-      "downtimeMinutes": 0,
-      "scope": "stack"
     }
   ]
 }
