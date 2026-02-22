@@ -1135,6 +1135,25 @@ registerMigration('frontend-placement-deadlock-recovery', async (ctx) => {
   }
 });
 
+registerMigration('install-buildkitd-config', async (ctx) => {
+  const src = path.join(ctx.cloudSwarmDir, 'etc', 'buildkitd.toml');
+  const dest = '/etc/magezero/buildkitd.toml';
+  if (!fs.existsSync(src)) {
+    console.warn(`upgrade.migration.install_buildkitd_config: source not found at ${src}; skipping`);
+    return;
+  }
+  if (fs.existsSync(dest)) {
+    console.log('upgrade.migration.install_buildkitd_config: already exists; skipping');
+    return;
+  }
+  const destDir = path.dirname(dest);
+  if (!fs.existsSync(destDir)) {
+    fs.mkdirSync(destDir, { recursive: true });
+  }
+  fs.copyFileSync(src, dest);
+  console.log(`upgrade.migration.install_buildkitd_config: installed ${dest}`);
+});
+
 registerMigration('sync-magento-datadog-tracing-env', async (ctx) => {
   if (!ctx.environmentId) {
     console.warn('upgrade.migration.sync_magento_datadog_tracing_env: missing environmentId; skipping');

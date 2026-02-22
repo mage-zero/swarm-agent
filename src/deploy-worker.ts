@@ -210,7 +210,7 @@ const SETUP_DB_STATUS_TIMEOUT_SECONDS = Math.max(
     ? Math.floor(setupDbStatusTimeoutParsed)
     : 120
 );
-const REGISTRY_GC_ENABLED = (process.env.MZ_REGISTRY_GC_ENABLED || '0') === '1';
+const REGISTRY_GC_ENABLED = (process.env.MZ_REGISTRY_GC_ENABLED || '1') === '1';
 const REGISTRY_GC_SCRIPT = process.env.MZ_REGISTRY_GC_SCRIPT
   || path.join(process.env.MZ_CLOUD_SWARM_DIR || '/opt/mage-zero/cloud-swarm', 'scripts/registry-gc.sh');
 const SHUTDOWN_GRACE_MS = Number(process.env.MZ_SHUTDOWN_GRACE_MS || 10 * 60 * 1000);
@@ -851,6 +851,42 @@ async function cleanupLocalImages(
       // ignore
     }
   }
+
+  // Second pass: remove untagged images from known repos (e.g. old mz-magento:<none>).
+  // These accumulate when Swarm pulls a newer tag — the old image loses its tag but stays
+  // on disk. Safe to remove: buildx cache lives in the registry, not Docker's image store.
+  const knownRepos = new Set(REGISTRY_CLEANUP_REPOSITORIES.map((r) => `mz-${r}`.replace(/^mz-mz-/, 'mz-')));
+  for (const r of REGISTRY_CLEANUP_REPOSITORIES) {
+    knownRepos.add(r);
+  }
+  const { stdout: allImages } = await runCommandCapture('docker', [
+    'image', 'ls', '--format', '{{.Repository}} {{.Tag}} {{.ID}}',
+  ]);
+  const keepImageIds = new Set<string>();
+  for (const line of allImages.split('\n')) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 3) continue;
+    const [, imgTag, imgId] = parts;
+    if (imgTag && imgTag !== '<none>' && keepImageTags.has(imgTag)) {
+      keepImageIds.add(imgId);
+    }
+  }
+  for (const line of allImages.split('\n')) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 3) continue;
+    const [imgRepo, imgTag, imgId] = parts;
+    if (imgTag !== '<none>') continue;
+    if (keepImageIds.has(imgId)) continue;
+    // Check if the repo (stripped of registry host) matches a known cleanup repo.
+    const bareRepo = stripRegistryHost(imgRepo);
+    if (!knownRepos.has(bareRepo)) continue;
+    try {
+      await runCommand('docker', ['image', 'rm', '-f', imgId]);
+    } catch {
+      // ignore — may be referenced by a running container
+    }
+  }
+
   return removals;
 }
 
@@ -1087,6 +1123,16 @@ async function maybeAggressivePrune(stage: string, previousSuccessAt: string | n
     `cleanup: ${stage}: free space ${freeGb}GB < ${DEPLOY_AGGRESSIVE_PRUNE_MIN_FREE_GB}GB; ` +
     `running docker prune until ${cutoffIso} (previous-success minus ${DEPLOY_AGGRESSIVE_PRUNE_SUCCESS_LOOKBACK_HOURS}h)`
   );
+
+  // Remove dangling images first (untagged AND unreferenced). Fast, always safe,
+  // and does not affect buildx cache (which lives in the registry, not Docker's image store).
+  try {
+    await runCommand('docker', ['image', 'prune', '-f']);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`cleanup: docker image prune failed: ${message}`);
+  }
+
   try {
     await runCommand('docker', [
       'system',
