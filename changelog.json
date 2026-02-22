@@ -1,15 +1,22 @@
 {
-  "version": "0.4.46",
-  "date": "2026-02-21",
-  "summary": "Remove automatic deploy retry logic — failed deploys should be diagnosed and resolved rather than blindly retried",
+  "version": "0.4.47",
+  "date": "2026-02-22",
+  "summary": "Fix smoke check overlay DNS failures by probing from existing containers; restart Varnish before smoke checks to clear stale backend DNS",
   "requires": {
     "cloud-swarm": ">=1.0.12"
   },
   "changes": [
     {
-      "id": "remove-deploy-retry",
-      "description": "Removed automatic deploy-level retry with deduplication. Failed deploys now stop immediately instead of retrying, allowing the support agent or operator to diagnose the root cause.",
-      "phase": "post_migrate",
+      "id": "smoke-check-exec",
+      "description": "Smoke checks now run curl from the existing php-fpm container via docker exec instead of spawning a new curlimages/curl container. This avoids Docker overlay DNS resolution failures that caused false-negative smoke check results.",
+      "phase": "post_deploy",
+      "downtimeMinutes": 0,
+      "scope": "environment"
+    },
+    {
+      "id": "varnish-restart-pre-smoke",
+      "description": "Force-restart Varnish after deploy and wait 10s for stabilisation before running smoke checks. Clears stale backend DNS cache that caused Varnish to return 503 to old php-fpm container IPs.",
+      "phase": "post_deploy",
       "downtimeMinutes": 0,
       "scope": "environment"
     }

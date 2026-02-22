@@ -3559,6 +3559,36 @@ async function probeHttpViaBackendNetwork(
   };
 }
 
+async function probeHttpViaExistingContainer(
+  containerId: string,
+  url: string,
+  hostHeader: string | undefined,
+  timeoutSeconds: number,
+): Promise<HttpProbeResult> {
+  const hostArg = hostHeader ? `-H 'Host: ${hostHeader}' ` : '';
+  const cmd = `curl -sS -o /dev/null -w '%{http_code}' -m ${timeoutSeconds} ${hostArg}'${url}'`;
+  const result = await runCommandCaptureWithStatus('docker', ['exec', containerId, 'sh', '-c', cmd]);
+  const raw = (result.stdout || '').trim();
+  const status = Number(raw);
+  const stderr = (result.stderr || '').trim();
+
+  if (!Number.isFinite(status)) {
+    return {
+      url,
+      status: 0,
+      ok: false,
+      detail: stderr || `unexpected curl output: ${raw || '(empty)'}`,
+    };
+  }
+
+  return {
+    url,
+    status,
+    ok: status >= 200 && status < 400,
+    detail: stderr || undefined,
+  };
+}
+
 async function runPostDeploySmokeChecks(
   stackName: string,
   envHostname: string,
@@ -3574,6 +3604,16 @@ async function runPostDeploySmokeChecks(
   ];
 
   log('running post-deploy smoke checks');
+
+  // Prefer running probes from an existing container (docker exec) to avoid
+  // Docker overlay DNS resolution failures that affect newly-spawned containers.
+  let probeContainerId = await findLocalContainer(stackName, 'php-fpm');
+  if (probeContainerId) {
+    log(`smoke probes will exec into php-fpm container ${probeContainerId.slice(0, 12)}`);
+  } else {
+    log('no local php-fpm container found; falling back to docker run for probes');
+  }
+
   const deadline = Date.now() + 3 * 60 * 1000;
   let lastSummary = '';
   let lastResults: PostDeploySmokeCheckResult[] = [];
@@ -3581,7 +3621,9 @@ async function runPostDeploySmokeChecks(
   while (Date.now() < deadline) {
     const results: PostDeploySmokeCheckResult[] = [];
     for (const check of checks) {
-      const result = await probeHttpViaBackendNetwork(check.url, hostHeader, check.timeoutSeconds);
+      const result = probeContainerId
+        ? await probeHttpViaExistingContainer(probeContainerId, check.url, hostHeader, check.timeoutSeconds)
+        : await probeHttpViaBackendNetwork(check.url, hostHeader, check.timeoutSeconds);
       const ok = check.expectStatus ? result.status === check.expectStatus : result.ok;
       results.push({
         name: check.name,
@@ -5727,6 +5769,11 @@ async function processDeployment(recordPath: string) {
   progress.ok('magento_steps');
 
   if (envHostname) {
+    // Force-restart varnish to clear stale backend DNS cache (old php-fpm IPs).
+    log('restarting varnish to refresh backend DNS');
+    await tryForceUpdateService(`${stackName}_varnish`, log);
+    await delay(10_000);
+
     progress.start('smoke_checks');
     progress.detail('smoke_checks', `Checking ${envHostname}`);
     const smoke = await runPostDeploySmokeChecks(stackName, envHostname, log);
