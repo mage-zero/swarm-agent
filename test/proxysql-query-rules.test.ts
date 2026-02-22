@@ -1,7 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { __testing } from '../src/deploy-worker.js';
-
-const { buildProxySqlQueryRulesSql } = __testing;
+import { buildProxySqlQueryRulesSql } from '../src/lib/proxysql.js';
 
 describe('ProxySQL query rules SQL builder', () => {
   it('manages the expected rule ids and persists to runtime+disk', () => {

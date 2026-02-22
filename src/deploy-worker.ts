@@ -2,10 +2,8 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
-import { spawn } from 'child_process';
 import { isDeployPaused } from './deploy-pause.js';
 import { buildCapacityPayload, buildPlannerPayload, isSwarmManager, readConfig } from './status.js';
-import { enforceCommandPolicy } from './command-policy.js';
 import { parseListObjectsV2Xml } from './r2-list.js';
 import { getDbBackupZstdLevel } from './backup-utils.js';
 import { buildJobName, envServiceName, inspectServiceSpec, listServiceTasks, runSwarmJob } from './swarm.js';
@@ -17,6 +15,98 @@ import {
   resolveAutoHealTargets,
   enrichCommandError,
 } from './deploy-reliability.js';
+import {
+  ensureDir,
+  runCommand,
+  runCommandLogged,
+  runCommandLoggedWithRetry,
+  runCommandCapture,
+  runCommandCaptureWithStatus,
+  readCommandLogTail,
+  detectMissingRegistryManifest,
+  delay,
+  generateSecretHex,
+} from './lib/deploy-exec.js';
+import {
+  type AppSelection,
+  type ApplicationSelections,
+  type PlannerResourceSpec,
+  type PlannerResources,
+  type PlannerConfigChange,
+  type PlannerTuningProfileLike,
+  type PlannerTuningPayloadLike,
+  MIB,
+  GIB,
+  RESOURCE_ENV_MAP,
+  RESOURCE_ENV_KEYS,
+  assertRequiredEnv,
+  formatCpuCores,
+  formatMemoryBytes,
+  formatMemoryMiB,
+  buildPlannerResourceEnv,
+  resolveActiveProfile,
+  buildConfigEnv,
+  normalizeSelectionFlavor,
+  resolveVersionEnv,
+  readVersionDefaults,
+  resolveImageTag,
+} from './lib/version-config.js';
+import {
+  parseDetectedEngine,
+  defaultSearchEngine,
+  resolveSearchEngine,
+  buildSearchEngineEnvOverride,
+  buildSearchSystemConfigSql,
+} from './lib/search-engine.js';
+import {
+  type AppHaReplicaPolicyInput,
+  type AppHaReplicaPolicyDecision,
+  type FrontendRuntimePolicy,
+  type FrontendRuntimeSpec,
+  resolveAppHaReplicaPolicy,
+  resolveFrontendRuntimePolicy,
+} from './lib/replica-policy.js';
+import {
+  buildMagentoCliCommand,
+  buildSetupDbStatusCommand,
+} from './lib/magento-cli.js';
+import {
+  type ProxySqlQueryRuleSpec,
+  PROXYSQL_MANAGED_QUERY_RULES,
+  buildProxySqlQueryRulesSql,
+} from './lib/proxysql.js';
+import {
+  type DeployHistoryEntry,
+  type DeployHistory,
+  readDeploymentHistory,
+  writeDeploymentHistory,
+  normalizeHistoryList,
+  getDeploymentHistoryEntry,
+  getHistoryLastSuccessfulDeployAt,
+  parseIsoTimestampMs,
+  resolveAggressivePruneCutoffSeconds,
+  updateDeploymentHistory,
+  updateFailedDeploymentHistory,
+} from './lib/deploy-history.js';
+import {
+  type ServiceUpdateStatus,
+  type ServiceInspectSummary,
+  type ServiceTaskRow,
+  parseDockerJsonLines,
+  waitForContainer,
+  findLocalContainer,
+  inspectServiceUpdateStatus,
+  inspectServiceImage,
+  listStackServices,
+  inspectServices,
+  resumePausedServiceUpdate,
+  tryForceUpdateService,
+  captureServicePs,
+} from './lib/docker-service.js';
+import {
+  type PostDeploySmokeCheckResult,
+  runPostDeploySmokeChecks,
+} from './lib/smoke-check.js';
 
 type DeployPayload = {
   artifact?: string;
@@ -45,16 +135,6 @@ type EnvironmentSecrets = {
   graphql_id_salt?: string;
 };
 
-type AppSelection = { flavor?: string; version?: string };
-type ApplicationSelections = {
-  php?: string;
-  varnish?: string;
-  database?: AppSelection;
-  search?: AppSelection;
-  cache?: AppSelection;
-  queue?: AppSelection;
-};
-
 type EnvironmentRecord = {
   environment_id?: number;
   stack_id?: number;
@@ -67,49 +147,6 @@ type EnvironmentRecord = {
   application_version?: string;
   environment_secrets?: EnvironmentSecrets | null;
 };
-
-type PlannerResourceSpec = {
-  limits: {
-    cpu_cores: number;
-    memory_bytes: number;
-  };
-  reservations: {
-    cpu_cores: number;
-    memory_bytes: number;
-  };
-};
-
-type PlannerResources = Record<string, PlannerResourceSpec>;
-
-type PlannerConfigChange = {
-  service: string;
-  changes: Record<string, number | string>;
-};
-
-type PlannerTuningProfileLike = {
-  id?: string;
-  config_changes?: PlannerConfigChange[];
-};
-
-type PlannerTuningPayloadLike = {
-  active_profile_id?: string;
-  base_profile?: PlannerTuningProfileLike;
-  recommended_profile?: PlannerTuningProfileLike;
-  incremental_profile?: PlannerTuningProfileLike;
-  approved_profiles?: PlannerTuningProfileLike[];
-};
-
-type DeployHistoryEntry = {
-  artifacts: string[];
-  imageTags: string[];
-  failedArtifacts?: string[];
-  failedImageTags?: string[];
-  updated_at?: string;
-  last_success_at?: string;
-  last_failure_at?: string;
-};
-
-type DeployHistory = Record<string, DeployHistoryEntry>;
 
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/deployments';
@@ -193,182 +230,8 @@ const DEFAULT_DB_BACKUP_OBJECT = process.env.MZ_DB_BACKUP_OBJECT || 'provisionin
 const SECRET_VERSION = process.env.MZ_SECRET_VERSION || '1';
 const DEPLOY_INTERVAL_MS = Number(process.env.MZ_DEPLOY_WORKER_INTERVAL_MS || 5000);
 const FETCH_TIMEOUT_MS = Number(process.env.MZ_FETCH_TIMEOUT_MS || 30000);
-const MIB = 1024 * 1024;
-const GIB = 1024 * 1024 * 1024;
 const APP_HA_MIN_READY_NODES = Math.max(1, Number(process.env.MZ_APP_HA_MIN_READY_NODES || 2));
 const APP_HA_MAX_REPLICAS = Math.max(1, Number(process.env.MZ_APP_HA_MAX_REPLICAS || 2));
-const APP_HA_CPU_EPSILON = 0.01;
-
-type ProxySqlQueryRuleSpec = {
-  rule_id: number;
-  active: number;
-  match_pattern: string;
-  destination_hostgroup: number;
-  apply: number;
-  flagIN?: number | null;
-  flagOUT?: number | null;
-  re_modifiers?: string | null;
-};
-
-const PROXYSQL_MANAGED_QUERY_RULES: ProxySqlQueryRuleSpec[] = [
-  {
-    rule_id: 1,
-    active: 1,
-    match_pattern: '^(BEGIN|START TRANSACTION|SET\\s+AUTOCOMMIT\\s*=\\s*0)',
-    destination_hostgroup: 10,
-    apply: 1,
-    flagIN: 0,
-    flagOUT: 1,
-    re_modifiers: 'CASELESS',
-  },
-  {
-    rule_id: 2,
-    active: 1,
-    match_pattern: '^(COMMIT|ROLLBACK)',
-    destination_hostgroup: 10,
-    apply: 1,
-    flagIN: 0,
-    flagOUT: 0,
-    re_modifiers: 'CASELESS',
-  },
-  {
-    rule_id: 3,
-    active: 1,
-    match_pattern: '^SELECT.*FOR UPDATE',
-    destination_hostgroup: 10,
-    apply: 1,
-    flagIN: 0,
-    re_modifiers: 'CASELESS',
-  },
-  {
-    rule_id: 4,
-    active: 1,
-    match_pattern: 'search_tmp_',
-    destination_hostgroup: 10,
-    apply: 1,
-    flagIN: 0,
-    re_modifiers: 'CASELESS',
-  },
-  {
-    rule_id: 5,
-    active: 1,
-    match_pattern: '^SELECT',
-    destination_hostgroup: 20,
-    apply: 1,
-    flagIN: 0,
-    re_modifiers: 'CASELESS',
-  },
-];
-
-type AppHaReplicaPolicyInput = {
-  ready_node_count: number;
-  free_cpu_cores: number;
-  free_memory_bytes: number;
-  nginx_reserve_cpu_cores: number;
-  nginx_reserve_memory_bytes: number;
-  php_fpm_reserve_cpu_cores: number;
-  php_fpm_reserve_memory_bytes: number;
-  min_ready_nodes: number;
-  max_replicas: number;
-};
-
-type AppHaReplicaPolicyDecision = {
-  replicas: number;
-  reason: 'single_node' | 'insufficient_headroom' | 'ha_enabled';
-  required_cpu_cores: number;
-  required_memory_bytes: number;
-  shortfall_cpu_cores: number;
-  shortfall_memory_bytes: number;
-};
-
-type FrontendRuntimePolicy = {
-  replicas: number;
-  max_replicas_per_node: number;
-  update_order: 'start-first' | 'stop-first';
-  restart_condition: 'any';
-};
-
-type FrontendRuntimeSpec = {
-  replicas: number;
-  max_replicas_per_node: number;
-  update_order: string;
-  restart_condition: string;
-};
-
-function resolveAppHaReplicaPolicy(input: AppHaReplicaPolicyInput): AppHaReplicaPolicyDecision {
-  const readyNodeCount = Math.max(0, Math.floor(Number(input.ready_node_count) || 0));
-  const minReadyNodes = Math.max(1, Math.floor(Number(input.min_ready_nodes) || 1));
-  const maxReplicas = Math.max(1, Math.floor(Number(input.max_replicas) || 1));
-  if (readyNodeCount < minReadyNodes || maxReplicas <= 1) {
-    return {
-      replicas: 1,
-      reason: 'single_node',
-      required_cpu_cores: 0,
-      required_memory_bytes: 0,
-      shortfall_cpu_cores: 0,
-      shortfall_memory_bytes: 0,
-    };
-  }
-
-  const targetReplicas = Math.max(1, Math.min(maxReplicas, readyNodeCount));
-  if (targetReplicas <= 1) {
-    return {
-      replicas: 1,
-      reason: 'single_node',
-      required_cpu_cores: 0,
-      required_memory_bytes: 0,
-      shortfall_cpu_cores: 0,
-      shortfall_memory_bytes: 0,
-    };
-  }
-
-  const extraReplicas = targetReplicas - 1;
-  const nginxReserveCpu = Math.max(0, Number(input.nginx_reserve_cpu_cores) || 0);
-  const phpFpmReserveCpu = Math.max(0, Number(input.php_fpm_reserve_cpu_cores) || 0);
-  const nginxReserveMem = Math.max(0, Math.round(Number(input.nginx_reserve_memory_bytes) || 0));
-  const phpFpmReserveMem = Math.max(0, Math.round(Number(input.php_fpm_reserve_memory_bytes) || 0));
-  const requiredCpu = extraReplicas * (nginxReserveCpu + phpFpmReserveCpu);
-  const requiredMem = extraReplicas * (nginxReserveMem + phpFpmReserveMem);
-  const freeCpu = Math.max(0, Number(input.free_cpu_cores) || 0);
-  const freeMem = Math.max(0, Math.round(Number(input.free_memory_bytes) || 0));
-  const shortfallCpu = requiredCpu > (freeCpu + APP_HA_CPU_EPSILON)
-    ? Number((requiredCpu - freeCpu).toFixed(2))
-    : 0;
-  const shortfallMem = requiredMem > freeMem ? requiredMem - freeMem : 0;
-
-  if (shortfallCpu > 0 || shortfallMem > 0) {
-    return {
-      replicas: 1,
-      reason: 'insufficient_headroom',
-      required_cpu_cores: Number(requiredCpu.toFixed(2)),
-      required_memory_bytes: requiredMem,
-      shortfall_cpu_cores: shortfallCpu,
-      shortfall_memory_bytes: shortfallMem,
-    };
-  }
-
-  return {
-    replicas: targetReplicas,
-    reason: 'ha_enabled',
-    required_cpu_cores: Number(requiredCpu.toFixed(2)),
-    required_memory_bytes: requiredMem,
-    shortfall_cpu_cores: 0,
-    shortfall_memory_bytes: 0,
-  };
-}
-
-function resolveFrontendRuntimePolicy(targetReplicas: number): FrontendRuntimePolicy {
-  const replicas = Math.max(1, Math.round(Number(targetReplicas) || 1));
-  return {
-    replicas,
-    // Keep single replica unconstrained so start-first can overlap briefly.
-    max_replicas_per_node: replicas > 1 ? 1 : 0,
-    // With one-per-node spread, start-first can deadlock when all nodes are occupied.
-    update_order: replicas > 1 ? 'stop-first' : 'start-first',
-    restart_condition: 'any',
-  };
-}
-
 function isLoopbackHost(host: string) {
   const value = String(host || '').trim().toLowerCase();
   return value === '127.0.0.1' || value === 'localhost' || value === '::1';
@@ -600,22 +463,6 @@ class DeployProgress {
   }
 }
 
-const RESOURCE_ENV_MAP = [
-  { service: 'varnish', prefix: 'MZ_VARNISH' },
-  { service: 'nginx', prefix: 'MZ_NGINX' },
-  { service: 'php-fpm', prefix: 'MZ_PHP_FPM' },
-  { service: 'php-fpm-admin', prefix: 'MZ_PHP_FPM_ADMIN' },
-  { service: 'cron', prefix: 'MZ_CRON' },
-  { service: 'database', prefix: 'MZ_DATABASE' },
-  { service: 'database-replica', prefix: 'MZ_DATABASE_REPLICA' },
-  { service: 'proxysql', prefix: 'MZ_PROXYSQL' },
-  { service: 'opensearch', prefix: 'MZ_OPENSEARCH' },
-  { service: 'redis-cache', prefix: 'MZ_REDIS_CACHE' },
-  { service: 'redis-session', prefix: 'MZ_REDIS_SESSION' },
-  { service: 'rabbitmq', prefix: 'MZ_RABBITMQ' },
-  { service: 'mailhog', prefix: 'MZ_MAILHOG' },
-] as const;
-
 let processing = false;
 let currentDeploymentPath: string | null = null;
 let shutdownRequested = false;
@@ -662,12 +509,6 @@ function readNodeFile(name: string): string {
   }
 }
 
-function ensureDir(target: string) {
-  if (!fs.existsSync(target)) {
-    fs.mkdirSync(target, { recursive: true });
-  }
-}
-
 function inferRepositoryFromArtifactKey(artifactKey: string) {
   const normalized = artifactKey.replace(/^\/+/, '');
   const parts = normalized.split('/');
@@ -697,189 +538,6 @@ function inferCommitShaFromArtifactKey(artifactKey: string): string {
     file.match(/^([0-9a-f]{7,64})\.tar(?:\.(?:zst|gz|bz2|xz))?$/i) ||
     file.match(/[-_]([0-9a-f]{7,64})\.tar(?:\.(?:zst|gz|bz2|xz))?$/i);
   return match ? match[1] : '';
-}
-
-function readDeploymentHistory(): DeployHistory {
-  const candidates = [DEPLOY_HISTORY_FILE, LEGACY_DEPLOY_HISTORY_FILE];
-  for (const file of candidates) {
-    if (!file) continue;
-    try {
-      if (!fs.existsSync(file)) continue;
-      const raw = fs.readFileSync(file, 'utf8');
-      const parsed = JSON.parse(raw) as unknown;
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        continue;
-      }
-      const history = parsed as DeployHistory;
-      if (file === LEGACY_DEPLOY_HISTORY_FILE && DEPLOY_HISTORY_FILE !== LEGACY_DEPLOY_HISTORY_FILE) {
-        try {
-          ensureDir(path.dirname(DEPLOY_HISTORY_FILE));
-          fs.writeFileSync(DEPLOY_HISTORY_FILE, JSON.stringify(history, null, 2));
-          fs.unlinkSync(LEGACY_DEPLOY_HISTORY_FILE);
-        } catch {
-          // ignore migration failures
-        }
-      }
-      return history;
-    } catch {
-      continue;
-    }
-  }
-  return {};
-}
-
-function writeDeploymentHistory(history: DeployHistory) {
-  ensureDir(path.dirname(DEPLOY_HISTORY_FILE));
-  fs.writeFileSync(DEPLOY_HISTORY_FILE, JSON.stringify(history, null, 2));
-}
-
-function normalizeHistoryList(values: unknown): string[] {
-  if (!Array.isArray(values)) {
-    return [];
-  }
-  const output: string[] = [];
-  const seen = new Set<string>();
-  for (const value of values) {
-    const normalized = String(value || '').replace(/^\/+/, '').trim();
-    if (!normalized || seen.has(normalized)) {
-      continue;
-    }
-    seen.add(normalized);
-    output.push(normalized);
-  }
-  return output;
-}
-
-function getDeploymentHistoryEntry(
-  history: DeployHistory,
-  key: string
-): Required<Pick<DeployHistoryEntry, 'artifacts' | 'imageTags' | 'failedArtifacts' | 'failedImageTags'>> & { last_success_at?: string } {
-  const entry = history[key] || {};
-  const lastSuccessAt = String((entry as DeployHistoryEntry).last_success_at || '').trim();
-  return {
-    artifacts: normalizeHistoryList((entry as DeployHistoryEntry).artifacts),
-    imageTags: normalizeHistoryList((entry as DeployHistoryEntry).imageTags),
-    failedArtifacts: normalizeHistoryList((entry as DeployHistoryEntry).failedArtifacts),
-    failedImageTags: normalizeHistoryList((entry as DeployHistoryEntry).failedImageTags),
-    last_success_at: lastSuccessAt || undefined,
-  };
-}
-
-function parseIsoTimestampMs(value: string | null | undefined): number | null {
-  const normalized = String(value || '').trim();
-  if (!normalized) return null;
-  const parsed = Date.parse(normalized);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function getHistoryLastSuccessfulDeployAt(history: DeployHistory, key: string): string | null {
-  const raw = String((history[key] as DeployHistoryEntry | undefined)?.last_success_at || '').trim();
-  if (!raw) {
-    return null;
-  }
-  return parseIsoTimestampMs(raw) === null ? null : raw;
-}
-
-function resolveAggressivePruneCutoffSeconds(
-  previousSuccessAt: string | null,
-  nowMs = Date.now(),
-  lookbackHours = DEPLOY_AGGRESSIVE_PRUNE_SUCCESS_LOOKBACK_HOURS
-): number | null {
-  const successMs = parseIsoTimestampMs(previousSuccessAt);
-  if (successMs === null) {
-    return null;
-  }
-  const hours = Math.max(1, Number(lookbackHours) || 24);
-  const cutoffMs = successMs - (hours * 60 * 60 * 1000);
-  if (!Number.isFinite(cutoffMs) || cutoffMs <= 0) {
-    return null;
-  }
-  // Clock skew or bad timestamps: never ask docker to prune "future" objects.
-  if (cutoffMs >= nowMs) {
-    return null;
-  }
-  return Math.floor(cutoffMs / 1000);
-}
-
-function updateDeploymentHistory(
-  history: DeployHistory,
-  key: string,
-  artifactKey: string,
-  imageTag: string
-) {
-  const existing = getDeploymentHistoryEntry(history, key);
-  const normalizedArtifactKey = String(artifactKey || '').replace(/^\/+/, '').trim();
-  const normalizedImageTag = String(imageTag || '').trim();
-  const artifacts = [normalizedArtifactKey, ...existing.artifacts.filter((item) => item !== normalizedArtifactKey)];
-  const imageTags = [normalizedImageTag, ...existing.imageTags.filter((item) => item !== normalizedImageTag)];
-  const keepArtifacts = artifacts.slice(0, DEPLOY_RETAIN_COUNT);
-  const keepImageTags = imageTags.slice(0, DEPLOY_RETAIN_COUNT);
-  const removedArtifacts = artifacts.slice(DEPLOY_RETAIN_COUNT);
-  const removedImageTags = imageTags.slice(DEPLOY_RETAIN_COUNT);
-
-  // A successful deploy supersedes failed retries: purge failed retention immediately.
-  const removedFailedArtifacts = [...existing.failedArtifacts];
-  const removedFailedImageTags = [...existing.failedImageTags];
-  const nowIso = new Date().toISOString();
-  history[key] = {
-    artifacts: keepArtifacts,
-    imageTags: keepImageTags,
-    failedArtifacts: [],
-    failedImageTags: [],
-    updated_at: nowIso,
-    last_success_at: nowIso,
-  };
-  return {
-    keepArtifacts,
-    keepImageTags,
-    removedArtifacts,
-    removedImageTags,
-    removedFailedArtifacts,
-    removedFailedImageTags,
-  };
-}
-
-function updateFailedDeploymentHistory(
-  history: DeployHistory,
-  key: string,
-  artifactKey: string,
-  imageTag: string
-) {
-  const existing = getDeploymentHistoryEntry(history, key);
-  const normalizedArtifactKey = String(artifactKey || '').replace(/^\/+/, '').trim();
-  const normalizedImageTag = String(imageTag || '').trim();
-
-  const failedArtifacts = normalizedArtifactKey
-    ? [normalizedArtifactKey, ...existing.failedArtifacts.filter((item) => item !== normalizedArtifactKey)]
-    : [...existing.failedArtifacts];
-  const failedImageTags = normalizedImageTag
-    ? [normalizedImageTag, ...existing.failedImageTags.filter((item) => item !== normalizedImageTag)]
-    : [...existing.failedImageTags];
-
-  const keepFailedArtifacts = failedArtifacts.slice(0, DEPLOY_FAILED_ARTIFACT_RETAIN_COUNT);
-  const keepFailedImageTags = failedImageTags.slice(0, DEPLOY_FAILED_IMAGE_RETAIN_COUNT);
-  const removedFailedArtifacts = failedArtifacts.slice(DEPLOY_FAILED_ARTIFACT_RETAIN_COUNT);
-  const removedFailedImageTags = failedImageTags.slice(DEPLOY_FAILED_IMAGE_RETAIN_COUNT);
-
-  const nowIso = new Date().toISOString();
-  history[key] = {
-    artifacts: existing.artifacts,
-    imageTags: existing.imageTags,
-    failedArtifacts: keepFailedArtifacts,
-    failedImageTags: keepFailedImageTags,
-    updated_at: nowIso,
-    last_success_at: existing.last_success_at,
-    last_failure_at: nowIso,
-  };
-
-  return {
-    keepArtifacts: existing.artifacts,
-    keepImageTags: existing.imageTags,
-    keepFailedArtifacts,
-    keepFailedImageTags,
-    removedFailedArtifacts,
-    removedFailedImageTags,
-  };
 }
 
 function parseImageReference(reference: string) {
@@ -1472,7 +1130,7 @@ async function cleanupDeploymentResources(params: {
   r2: R2PresignContext;
   previousSuccessAt: string | null;
 }) {
-  const history = readDeploymentHistory();
+  const history = readDeploymentHistory(DEPLOY_HISTORY_FILE, LEGACY_DEPLOY_HISTORY_FILE);
   const normalizedArtifactKey = params.artifactKey.replace(/^\/+/, '');
   const repo = params.repository || inferRepositoryFromArtifactKey(normalizedArtifactKey) || 'unknown';
   const key = `env:${params.environmentId}:${repo}`;
@@ -1485,9 +1143,10 @@ async function cleanupDeploymentResources(params: {
     history,
     key,
     normalizedArtifactKey,
-    params.mageVersion
+    params.mageVersion,
+    DEPLOY_RETAIN_COUNT
   );
-  writeDeploymentHistory(history);
+  writeDeploymentHistory(history, DEPLOY_HISTORY_FILE);
 
   if (!DEPLOY_CLEANUP_ENABLED) {
     return;
@@ -1635,193 +1294,6 @@ async function initiateShutdown(signal: string) {
   process.exit(0);
 }
 
-async function runCommand(command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) {
-  // TODO: Harden command execution with an allowlist or explicit wrappers before production.
-  enforceCommandPolicy(command, args, { source: 'deploy-worker.runCommand' });
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      env: options.env,
-      stdio: 'inherit',
-    });
-    child.on('error', reject);
-    child.on('close', (code) => {
-      if (code === 0) {
-        resolve();
-      } else {
-        reject(new Error(`${command} ${args.join(' ')} exited with code ${code}`));
-      }
-    });
-  });
-}
-
-async function runCommandLogged(
-  command: string,
-  args: string[],
-  options: { cwd?: string; env?: NodeJS.ProcessEnv; logDir: string; label: string }
-) {
-  enforceCommandPolicy(command, args, { source: 'deploy-worker.runCommandLogged' });
-  ensureDir(options.logDir);
-  const safeLabel = options.label.replace(/[^a-z0-9._-]/gi, '_');
-  const stdoutPath = path.join(options.logDir, `${safeLabel}.stdout.log`);
-  const stderrPath = path.join(options.logDir, `${safeLabel}.stderr.log`);
-  const header = `\n# ${new Date().toISOString()} ${command} ${args.join(' ')}\n`;
-  fs.appendFileSync(stdoutPath, header);
-  fs.appendFileSync(stderrPath, header);
-
-  await new Promise<void>((resolve, reject) => {
-    const stdoutStream = fs.createWriteStream(stdoutPath, { flags: 'a' });
-    const stderrStream = fs.createWriteStream(stderrPath, { flags: 'a' });
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      env: options.env,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    child.stdout.on('data', (chunk) => {
-      stdoutStream.write(chunk);
-      process.stdout.write(chunk);
-    });
-    child.stderr.on('data', (chunk) => {
-      stderrStream.write(chunk);
-      process.stderr.write(chunk);
-    });
-    child.on('error', (error) => {
-      stdoutStream.end();
-      stderrStream.end();
-      reject(error);
-    });
-    child.on('close', (code) => {
-      stdoutStream.end();
-      stderrStream.end();
-      if (code === 0) {
-        resolve();
-      } else {
-        reject(new Error(`${command} ${args.join(' ')} exited with code ${code}`));
-      }
-    });
-  });
-}
-
-async function runCommandLoggedWithRetry(
-  command: string,
-  args: string[],
-  options: { cwd?: string; env?: NodeJS.ProcessEnv; logDir: string; label: string },
-  retryOptions: {
-    retries: number;
-    log?: (message: string) => void;
-    onRetry?: (attempt: number, error: Error) => Promise<void>;
-  }
-) {
-  const maxAttempts = Math.max(1, 1 + retryOptions.retries);
-  let attempt = 0;
-  while (attempt < maxAttempts) {
-    attempt += 1;
-    try {
-      await runCommandLogged(command, args, options);
-      return;
-    } catch (error) {
-      if (attempt >= maxAttempts) {
-        throw error;
-      }
-      const message = error instanceof Error ? error.message : String(error);
-      retryOptions.log?.(`retrying ${options.label} (attempt ${attempt}/${maxAttempts - 1}) after error: ${message}`);
-      if (retryOptions.onRetry && error instanceof Error) {
-        await retryOptions.onRetry(attempt, error);
-      }
-    }
-  }
-}
-
-function readCommandLogTail(logDir: string, label: string, stream: 'stdout' | 'stderr', maxBytes = 128 * 1024): string {
-  const safeLabel = label.replace(/[^a-z0-9._-]/gi, '_');
-  const filePath = path.join(logDir, `${safeLabel}.${stream}.log`);
-  try {
-    const raw = fs.readFileSync(filePath, 'utf8');
-    if (!raw) return '';
-    return raw.length > maxBytes ? raw.slice(raw.length - maxBytes) : raw;
-  } catch {
-    return '';
-  }
-}
-
-function detectMissingRegistryManifest(logDir: string, label: string): { matched: boolean; imageRef: string } {
-  const stderrTail = readCommandLogTail(logDir, label, 'stderr');
-  if (!stderrTail) {
-    return { matched: false, imageRef: '' };
-  }
-  const hasManifestNotFound = /manifests\/sha256:[0-9a-f]{64}\s+not found/i.test(stderrTail);
-  const hasResolveMetadataFailure = /failed to resolve source metadata for\s+.+?:\s+failed to copy/i.test(stderrTail);
-  if (!hasManifestNotFound || !hasResolveMetadataFailure) {
-    return { matched: false, imageRef: '' };
-  }
-  const imageMatch = stderrTail.match(/failed to resolve source metadata for\s+(.+?)(?::\s+failed to copy)/i);
-  return {
-    matched: true,
-    imageRef: imageMatch?.[1]?.trim() || '',
-  };
-}
-
-async function runCommandCapture(command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) {
-  enforceCommandPolicy(command, args, { source: 'deploy-worker.runCommandCapture' });
-  return await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      env: options.env,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
-    child.on('error', reject);
-    child.on('close', (code) => {
-      if (code === 0) {
-        resolve({ stdout, stderr });
-      } else {
-        reject(new Error(`${command} ${args.join(' ')} failed: ${stderr || stdout}`));
-      }
-    });
-  });
-}
-
-async function runCommandCaptureWithStatus(
-  command: string,
-  args: string[],
-  options: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
-) {
-  enforceCommandPolicy(command, args, { source: 'deploy-worker.runCommandCaptureWithStatus' });
-  return await new Promise<{ stdout: string; stderr: string; code: number }>((resolve, reject) => {
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      env: options.env,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
-    child.on('error', reject);
-    child.on('close', (code) => {
-      resolve({ stdout, stderr, code: typeof code === 'number' ? code : 0 });
-    });
-  });
-}
-
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function generateSecretHex(bytes: number) {
-  return crypto.randomBytes(bytes).toString('hex');
-}
-
-function assertRequiredEnv(env: NodeJS.ProcessEnv, keys: string[]) {
-  const missing = keys.filter((key) => !env[key]);
-  if (missing.length) {
-    throw new Error(`Missing required environment values: ${missing.join(', ')}`);
-  }
-}
-
 function assertNoLatestImages(stackConfig: string) {
   const latestLines = stackConfig
     .split('\n')
@@ -1830,183 +1302,6 @@ function assertNoLatestImages(stackConfig: string) {
     throw new Error(`Stack config resolved to :latest images: ${latestLines.join(' | ')}`);
   }
 }
-
-function formatCpuCores(value: number) {
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new Error(`Invalid CPU cores value: ${value}`);
-  }
-  return String(value);
-}
-
-function formatMemoryBytes(bytes: number) {
-  if (!Number.isFinite(bytes) || bytes <= 0) {
-    throw new Error(`Invalid memory bytes value: ${bytes}`);
-  }
-  if (bytes % GIB === 0) {
-    return `${bytes / GIB}G`;
-  }
-  if (bytes % MIB === 0) {
-    return `${bytes / MIB}M`;
-  }
-  return String(Math.round(bytes));
-}
-
-function buildPlannerResourceEnv(resources: PlannerResources) {
-  const env: Record<string, string> = {};
-  for (const entry of RESOURCE_ENV_MAP) {
-    const resource = resources[entry.service];
-    if (!resource) {
-      throw new Error(`Planner missing resource sizing for ${entry.service}`);
-    }
-    env[`${entry.prefix}_LIMIT_CPUS`] = formatCpuCores(resource.limits.cpu_cores);
-    env[`${entry.prefix}_LIMIT_MEMORY`] = formatMemoryBytes(resource.limits.memory_bytes);
-    env[`${entry.prefix}_RESERVE_CPUS`] = formatCpuCores(resource.reservations.cpu_cores);
-    env[`${entry.prefix}_RESERVE_MEMORY`] = formatMemoryBytes(resource.reservations.memory_bytes);
-  }
-  return env;
-}
-
-function formatMemoryMiB(bytes: number) {
-  if (!Number.isFinite(bytes) || bytes <= 0) {
-    throw new Error(`Invalid memory bytes value: ${bytes}`);
-  }
-  return String(Math.max(1, Math.round(bytes / MIB)));
-}
-
-function resolveActiveProfile(tuning: PlannerTuningPayloadLike | null | undefined): PlannerTuningProfileLike | null {
-  if (!tuning) {
-    return null;
-  }
-  const activeId = tuning.active_profile_id;
-  const approved = Array.isArray(tuning.approved_profiles) ? tuning.approved_profiles : [];
-  if (activeId) {
-    const fromApproved = approved.find((profile) => profile?.id === activeId);
-    if (fromApproved) {
-      return fromApproved;
-    }
-    if (tuning.recommended_profile?.id === activeId) {
-      return tuning.recommended_profile;
-    }
-    if (tuning.incremental_profile?.id === activeId) {
-      return tuning.incremental_profile;
-    }
-    if (tuning.base_profile?.id === activeId) {
-      return tuning.base_profile;
-    }
-  }
-  return tuning.base_profile || approved[0] || tuning.recommended_profile || null;
-}
-
-function buildConfigEnv(configChanges: PlannerConfigChange[]): Record<string, string> {
-  const env: Record<string, string> = {};
-  const seen = new Set<string>();
-
-  const setEnv = (key: string, value: string) => {
-    if (!seen.has(key)) {
-      env[key] = value;
-      seen.add(key);
-    }
-  };
-
-  for (const change of configChanges) {
-    const service = String(change?.service || '');
-    const changes = change?.changes || {};
-    for (const [key, rawValue] of Object.entries(changes)) {
-      if (rawValue === null || rawValue === undefined) {
-        continue;
-      }
-      if (service === 'php-fpm' || service === 'php-fpm-admin') {
-        switch (key) {
-          case 'php.memory_limit':
-            if (Number(rawValue) > 0) {
-              setEnv('MZ_PHP_MEMORY_LIMIT', formatMemoryBytes(Number(rawValue)));
-            }
-            break;
-          case 'opcache.memory_consumption':
-            if (Number(rawValue) > 0) {
-              setEnv('MZ_OPCACHE_MEMORY_CONSUMPTION', formatMemoryMiB(Number(rawValue)));
-            }
-            break;
-          case 'opcache.interned_strings_buffer':
-            if (Number(rawValue) > 0) {
-              setEnv('MZ_OPCACHE_INTERNED_STRINGS_BUFFER', formatMemoryMiB(Number(rawValue)));
-            }
-            break;
-          case 'opcache.max_accelerated_files':
-            setEnv('MZ_OPCACHE_MAX_ACCELERATED_FILES', String(rawValue));
-            break;
-          case 'fpm.pm.max_children':
-            setEnv('MZ_FPM_PM_MAX_CHILDREN', String(rawValue));
-            break;
-          case 'fpm.pm.start_servers':
-            setEnv('MZ_FPM_PM_START_SERVERS', String(rawValue));
-            break;
-          case 'fpm.pm.min_spare_servers':
-            setEnv('MZ_FPM_PM_MIN_SPARE_SERVERS', String(rawValue));
-            break;
-          case 'fpm.pm.max_spare_servers':
-            setEnv('MZ_FPM_PM_MAX_SPARE_SERVERS', String(rawValue));
-            break;
-          case 'fpm.pm.max_requests':
-            setEnv('MZ_FPM_PM_MAX_REQUESTS', String(rawValue));
-            break;
-          case 'fpm.request_terminate_timeout':
-            setEnv('MZ_FPM_REQUEST_TERMINATE_TIMEOUT', String(rawValue));
-            break;
-          default:
-            break;
-        }
-      } else if (service === 'database' || service === 'database-replica') {
-        switch (key) {
-          case 'innodb_buffer_pool_size':
-            if (Number(rawValue) > 0) {
-              setEnv('MZ_DB_INNODB_BUFFER_POOL_SIZE', formatMemoryBytes(Number(rawValue)));
-            }
-            break;
-          case 'innodb_log_file_size':
-            if (Number(rawValue) > 0) {
-              setEnv('MZ_DB_INNODB_LOG_FILE_SIZE', formatMemoryBytes(Number(rawValue)));
-            }
-            break;
-          case 'max_connections':
-            setEnv('MZ_DB_MAX_CONNECTIONS', String(rawValue));
-            break;
-          case 'tmp_table_size':
-            if (Number(rawValue) > 0) {
-              setEnv('MZ_DB_TMP_TABLE_SIZE', formatMemoryBytes(Number(rawValue)));
-            }
-            break;
-          case 'max_heap_table_size':
-            if (Number(rawValue) > 0) {
-              setEnv('MZ_DB_MAX_HEAP_TABLE_SIZE', formatMemoryBytes(Number(rawValue)));
-            }
-            break;
-          case 'thread_cache_size':
-            setEnv('MZ_DB_THREAD_CACHE_SIZE', String(rawValue));
-            break;
-          case 'query_cache_size':
-            if (Number(rawValue) > 0) {
-              setEnv('MZ_DB_QUERY_CACHE_SIZE', formatMemoryBytes(Number(rawValue)));
-            } else {
-              setEnv('MZ_DB_QUERY_CACHE_SIZE', '0');
-            }
-            break;
-          default:
-            break;
-        }
-      }
-    }
-  }
-
-  return env;
-}
-
-const RESOURCE_ENV_KEYS = RESOURCE_ENV_MAP.flatMap((entry) => [
-  `${entry.prefix}_LIMIT_CPUS`,
-  `${entry.prefix}_LIMIT_MEMORY`,
-  `${entry.prefix}_RESERVE_CPUS`,
-  `${entry.prefix}_RESERVE_MEMORY`,
-]);
 
 /**
  * Migrate a global (non-env-scoped) secret to a per-environment secret by
@@ -2214,77 +1509,6 @@ async function fetchEnvironmentRecord(stackId: number, environmentId: number, ba
   );
   const environments = Array.isArray(payload?.environments) ? payload.environments as EnvironmentRecord[] : [];
   return environments.find((env) => Number(env.environment_id ?? 0) === environmentId) || null;
-}
-
-function normalizeSelectionFlavor(flavor: string | undefined, fallback: string): string {
-  return (flavor || fallback).toLowerCase();
-}
-
-function resolveVersionEnv(selections: ApplicationSelections | undefined) {
-  const phpVersion = selections?.php || '';
-  const varnishVersion = selections?.varnish || '';
-  const databaseFlavor = normalizeSelectionFlavor(selections?.database?.flavor, 'mariadb');
-  const databaseVersion = selections?.database?.version || '';
-  const searchFlavor = normalizeSelectionFlavor(selections?.search?.flavor, 'opensearch');
-  const searchVersion = selections?.search?.version || '';
-  const cacheFlavor = normalizeSelectionFlavor(selections?.cache?.flavor, 'redis');
-  const cacheVersion = selections?.cache?.version || '';
-  const queueFlavor = normalizeSelectionFlavor(selections?.queue?.flavor, 'rabbitmq');
-  const queueVersion = selections?.queue?.version || '';
-
-  const mappedDb = databaseFlavor === 'mysql' ? 'mariadb' : databaseFlavor;
-  const mappedSearch = searchFlavor === 'elasticsearch' ? 'opensearch' : searchFlavor;
-  const mappedCache = cacheFlavor === 'valkey' ? 'redis' : cacheFlavor;
-  const mappedQueue = queueFlavor === 'activemq-artemis' ? 'rabbitmq' : queueFlavor;
-
-  return {
-    phpVersion,
-    varnishVersion,
-    mariadbVersion: mappedDb === 'mariadb' ? databaseVersion : '',
-    opensearchVersion: mappedSearch === 'opensearch' ? searchVersion : '',
-    redisVersion: mappedCache === 'redis' ? cacheVersion : '',
-    rabbitmqVersion: mappedQueue === 'rabbitmq' ? queueVersion : '',
-  };
-}
-
-function readVersionDefaults(): Record<string, string> {
-  const file = path.join(CLOUD_SWARM_DIR, 'config/versions.env');
-  if (!fs.existsSync(file)) {
-    return {};
-  }
-  const lines = fs.readFileSync(file, 'utf8').split('\n');
-  const output: Record<string, string> = {};
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) {
-      continue;
-    }
-    const idx = trimmed.indexOf('=');
-    if (idx === -1) {
-      continue;
-    }
-    const key = trimmed.slice(0, idx).trim();
-    const value = trimmed.slice(idx + 1).trim();
-    if (key && value) {
-      output[key] = value;
-    }
-  }
-  return output;
-}
-
-function resolveImageTag(artifactKey: string, ref: string, deploymentId: string) {
-  const base = path.basename(artifactKey);
-  const match = base.match(/-([0-9a-f]{7,40})\.tar\.zst$/);
-  if (match) {
-    return match[1].slice(0, 12);
-  }
-  if (ref.startsWith('refs/heads/')) {
-    return ref.split('/').pop() || ref;
-  }
-  if (ref) {
-    return ref.slice(0, 12);
-  }
-  return deploymentId.slice(0, 8);
 }
 
 function parseRegistryTagsResponse(raw: string): string[] {
@@ -2800,36 +2024,6 @@ async function stripDefiners(inputPath: string, outputPath: string) {
   });
 }
 
-async function waitForContainer(stackName: string, serviceName: string, timeoutMs: number) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const { stdout } = await runCommandCapture('docker', [
-      'ps',
-      '--filter',
-      `name=${stackName}_${serviceName}`,
-      '--format',
-      '{{.ID}}',
-    ]);
-    const id = stdout.trim().split('\n')[0] || '';
-    if (id) {
-      return id;
-    }
-    await delay(2000);
-  }
-  throw new Error(`Timed out waiting for ${serviceName} container`);
-}
-
-async function findLocalContainer(stackName: string, serviceName: string) {
-  const { stdout } = await runCommandCapture('docker', [
-    'ps',
-    '--filter',
-    `name=${stackName}_${serviceName}`,
-    '--format',
-    '{{.ID}}',
-  ]);
-  return stdout.trim().split('\n')[0] || '';
-}
-
 async function waitForDatabase(containerId: string, timeoutMs: number) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -3052,49 +2246,6 @@ async function configureReplicaViaSwarmJob(params: {
   }
 }
 
-function buildProxySqlQueryRulesSql(rules: ProxySqlQueryRuleSpec[] = PROXYSQL_MANAGED_QUERY_RULES): string {
-  const managedRuleIds = rules
-    .map((rule) => Math.floor(Number(rule.rule_id)))
-    .filter((ruleId) => Number.isFinite(ruleId) && ruleId > 0);
-  if (!managedRuleIds.length) {
-    throw new Error('ProxySQL managed rules are empty');
-  }
-
-  const statements: string[] = [
-    `DELETE FROM mysql_query_rules WHERE rule_id IN (${managedRuleIds.join(', ')})`,
-  ];
-
-  for (const rule of rules) {
-    const ruleId = Math.floor(Number(rule.rule_id));
-    if (!Number.isFinite(ruleId) || ruleId <= 0) {
-      throw new Error(`Invalid ProxySQL rule id: ${rule.rule_id}`);
-    }
-
-    const pattern = String(rule.match_pattern || '').trim();
-    if (!pattern) {
-      throw new Error(`ProxySQL rule ${ruleId} has empty match_pattern`);
-    }
-
-    const destinationHostgroup = Math.max(0, Math.floor(Number(rule.destination_hostgroup) || 0));
-    const active = Number(rule.active) === 0 ? 0 : 1;
-    const apply = Number(rule.apply) === 0 ? 0 : 1;
-    const flagIn = Number.isFinite(Number(rule.flagIN)) ? String(Math.floor(Number(rule.flagIN))) : '0';
-    const flagOut = Number.isFinite(Number(rule.flagOUT)) ? String(Math.floor(Number(rule.flagOUT))) : 'NULL';
-    const reModifiersRaw = String(rule.re_modifiers || '').trim();
-    const reModifiers = reModifiersRaw ? `'${escapeSqlValue(reModifiersRaw)}'` : 'NULL';
-
-    statements.push(
-      'INSERT INTO mysql_query_rules '
-      + '(rule_id, active, match_pattern, destination_hostgroup, apply, flagIN, flagOUT, re_modifiers) '
-      + `VALUES (${ruleId}, ${active}, '${escapeSqlValue(pattern)}', ${destinationHostgroup}, ${apply}, ${flagIn}, ${flagOut}, ${reModifiers})`
-    );
-  }
-
-  statements.push('LOAD MYSQL QUERY RULES TO RUNTIME');
-  statements.push('SAVE MYSQL QUERY RULES TO DISK');
-  return `${statements.map((statement) => `${statement};`).join('\n')}\n`;
-}
-
 function buildProxySqlRuleReconcileScript(proxysqlServiceFullName: string): string {
   const sql = buildProxySqlQueryRulesSql(PROXYSQL_MANAGED_QUERY_RULES).trimEnd();
   const script = [
@@ -3197,31 +2348,6 @@ async function setSearchEngine(
   return runDatabaseCommandWithRetry(stackName, containerId, command);
 }
 
-function parseDetectedEngine(stdout: string): string | null {
-  const engine = stdout.trim();
-  return (engine === 'elasticsearch7' || engine === 'opensearch') ? engine : null;
-}
-
-function defaultSearchEngine(applicationVersion: string): 'opensearch' | 'elasticsearch7' {
-  // Magento <2.4.6 does not have an opensearch adapter; use elasticsearch7
-  // (which is API-compatible with our OpenSearch containers).
-  const match = applicationVersion.match(/^(\d+)\.(\d+)\.(\d+)/);
-  if (!match) return 'opensearch';
-  const [, major, minor, patch] = match.map(Number);
-  if (major < 2 || (major === 2 && minor < 4) || (major === 2 && minor === 4 && patch < 6)) {
-    return 'elasticsearch7';
-  }
-  return 'opensearch';
-}
-
-function resolveSearchEngine(override: string, detected: string | null, applicationVersion = ''): string {
-  return override || detected || defaultSearchEngine(applicationVersion);
-}
-
-function buildSearchEngineEnvOverride(override: string): Record<string, string> {
-  return override ? { MZ_SEARCH_ENGINE: override } : {};
-}
-
 async function detectSearchEngine(
   containerId: string,
   dbName: string
@@ -3265,6 +2391,44 @@ async function databaseHasTables(containerId: string, dbName: string): Promise<b
     throw new Error(`Unable to determine table count for schema ${dbName}`);
   }
   return count > 0;
+}
+
+/**
+ * Wait for in-flight Magento cron jobs to finish before running setup:upgrade.
+ * Maintenance mode prevents new cron runs from starting work, but jobs already
+ * running hold locks on cron_schedule that cause setup:upgrade to fail with
+ * SQLSTATE 1205 "Lock wait timeout exceeded".
+ */
+async function waitForCronJobsToFinish(
+  containerId: string,
+  dbName: string,
+  log: (message: string) => void,
+  timeoutMs: number = 120_000,
+): Promise<void> {
+  const safeSchema = escapeSqlValue(dbName);
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const result = await runCommandCaptureWithStatus('docker', [
+      'exec',
+      containerId,
+      'sh',
+      '-c',
+      `ROOT_PASS="$(cat /run/secrets/db_root_password)"; mariadb -uroot -p"$ROOT_PASS" -N -s -e "SELECT COUNT(*) FROM ${safeSchema}.cron_schedule WHERE status='running'"`,
+    ]);
+    const count = Number((result.stdout || '').trim());
+    if (result.code === 0 && Number.isFinite(count) && count === 0) {
+      log('no running cron jobs; safe to proceed with setup:upgrade');
+      return;
+    }
+    if (result.code !== 0) {
+      log(`warning: cron_schedule check failed (exit ${result.code}); proceeding anyway`);
+      return;
+    }
+    log(`waiting for ${count} running cron job(s) to finish before setup:upgrade`);
+    await delay(5000);
+  }
+  log('warning: timed out waiting for cron jobs to finish; proceeding with setup:upgrade');
 }
 
 async function setFullPageCacheConfig(containerId: string, dbName: string, ttlSeconds: number) {
@@ -3343,24 +2507,6 @@ async function setSecureOffloaderConfig(containerId: string, dbName: string) {
     '-c',
     `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -D ${safeDbName} -e "${statements};"`,
   ]);
-}
-
-function buildSearchSystemConfigSql(host: string, port: string, timeout: string): string {
-  const safeHost = escapeSqlValue(String(host || ''));
-  const safePort = escapeSqlValue(String(port || ''));
-  const safeTimeout = escapeSqlValue(String(timeout || ''));
-  const upsert = (p: string, v: string) =>
-    `INSERT INTO core_config_data (scope, scope_id, path, value) VALUES ('default', 0, '${p}', '${v}') ON DUPLICATE KEY UPDATE value=VALUES(value)`;
-  return [
-    upsert('catalog/search/opensearch_server_hostname', safeHost),
-    upsert('catalog/search/opensearch_server_port', safePort),
-    upsert('catalog/search/opensearch_server_timeout', safeTimeout),
-    upsert('catalog/search/elasticsearch7_server_hostname', safeHost),
-    upsert('catalog/search/elasticsearch7_server_port', safePort),
-    upsert('catalog/search/elasticsearch7_server_timeout', safeTimeout),
-    upsert('catalog/search/elasticsearch7_enable_auth', '0'),
-    upsert('catalog/search/opensearch_enable_auth', '0'),
-  ].join('; ');
 }
 
 async function setSearchSystemConfig(
@@ -3480,233 +2626,6 @@ async function runMagentoCommandWithStatus(
 ) {
   const envArgs = buildDockerEnvArgs(env);
   return await runCommandCaptureWithStatus('docker', ['exec', ...envArgs, containerId, 'sh', '-c', command]);
-}
-
-function buildMagentoCliCommand(args: string): string {
-  return `php -d memory_limit=-1 bin/magento ${args}`.trim();
-}
-
-function buildSetupDbStatusCommand(timeoutSeconds: number): string {
-  const dbStatusCommand = buildMagentoCliCommand('setup:db:status');
-  return [
-    'if command -v timeout >/dev/null 2>&1; then',
-    `timeout ${timeoutSeconds} ${dbStatusCommand};`,
-    'else',
-    `${dbStatusCommand};`,
-    'fi',
-  ].join(' ');
-}
-
-type HttpProbeResult = {
-  url: string;
-  status: number;
-  ok: boolean;
-  detail?: string;
-};
-
-type PostDeploySmokeCheckResult = {
-  name: string;
-  url: string;
-  expected: string;
-  status: number;
-  ok: boolean;
-  detail?: string;
-};
-
-async function probeHttpViaBackendNetwork(
-  url: string,
-  hostHeader: string | undefined,
-  timeoutSeconds: number,
-): Promise<HttpProbeResult> {
-  const args = [
-    'run',
-    '--rm',
-    '--network',
-    'mz-backend',
-    'curlimages/curl:8.5.0',
-    '-sS',
-    '-o',
-    '/dev/null',
-    '-w',
-    '%{http_code}',
-    '-m',
-    String(timeoutSeconds),
-  ];
-  if (hostHeader) {
-    args.push('-H', `Host: ${hostHeader}`);
-  }
-  args.push(url);
-
-  const result = await runCommandCaptureWithStatus('docker', args);
-  const raw = (result.stdout || '').trim();
-  const status = Number(raw);
-  const stderr = (result.stderr || '').trim();
-
-  if (!Number.isFinite(status)) {
-    return {
-      url,
-      status: 0,
-      ok: false,
-      detail: stderr || `unexpected curl output: ${raw || '(empty)'}`,
-    };
-  }
-
-  return {
-    url,
-    status,
-    ok: status >= 200 && status < 400,
-    detail: stderr || undefined,
-  };
-}
-
-async function probeHttpViaExistingContainer(
-  containerId: string,
-  url: string,
-  hostHeader: string | undefined,
-  timeoutSeconds: number,
-): Promise<HttpProbeResult> {
-  const hostArg = hostHeader ? `-H 'Host: ${hostHeader}' ` : '';
-  const cmd = `curl -sS -o /dev/null -w '%{http_code}' -m ${timeoutSeconds} ${hostArg}'${url}'`;
-  const result = await runCommandCaptureWithStatus('docker', ['exec', containerId, 'sh', '-c', cmd]);
-  const raw = (result.stdout || '').trim();
-  const status = Number(raw);
-  const stderr = (result.stderr || '').trim();
-
-  if (!Number.isFinite(status)) {
-    return {
-      url,
-      status: 0,
-      ok: false,
-      detail: stderr || `unexpected curl output: ${raw || '(empty)'}`,
-    };
-  }
-
-  return {
-    url,
-    status,
-    ok: status >= 200 && status < 400,
-    detail: stderr || undefined,
-  };
-}
-
-async function runPostDeploySmokeChecks(
-  stackName: string,
-  envHostname: string,
-  log: (message: string) => void,
-) : Promise<{ ok: true; results: PostDeploySmokeCheckResult[] } | { ok: false; results: PostDeploySmokeCheckResult[]; summary: string }> {
-  const hostHeader = envHostname.trim() || undefined;
-  const checks: Array<{ name: string; url: string; timeoutSeconds: number; expectStatus?: number }> = [
-    { name: 'nginx.mz-healthz', url: `http://${stackName}_nginx/mz-healthz`, timeoutSeconds: 10, expectStatus: 200 },
-    { name: 'varnish.mz-healthz', url: `http://${stackName}_varnish/mz-healthz`, timeoutSeconds: 10, expectStatus: 200 },
-    { name: 'nginx.health_check.php', url: `http://${stackName}_nginx/health_check.php`, timeoutSeconds: 30, expectStatus: 200 },
-    // Root path can redirect (302) to https://<hostname>/, so accept any 2xx/3xx.
-    { name: 'varnish.root', url: `http://${stackName}_varnish/`, timeoutSeconds: 30 },
-  ];
-
-  log('running post-deploy smoke checks');
-
-  // Prefer running probes from an existing container (docker exec) to avoid
-  // Docker overlay DNS resolution failures that affect newly-spawned containers.
-  let probeContainerId = await findLocalContainer(stackName, 'php-fpm');
-  if (probeContainerId) {
-    log(`smoke probes will exec into php-fpm container ${probeContainerId.slice(0, 12)}`);
-  } else {
-    log('no local php-fpm container found; falling back to docker run for probes');
-  }
-
-  const deadline = Date.now() + 3 * 60 * 1000;
-  let lastSummary = '';
-  let lastResults: PostDeploySmokeCheckResult[] = [];
-
-  while (Date.now() < deadline) {
-    const results: PostDeploySmokeCheckResult[] = [];
-    for (const check of checks) {
-      const result = probeContainerId
-        ? await probeHttpViaExistingContainer(probeContainerId, check.url, hostHeader, check.timeoutSeconds)
-        : await probeHttpViaBackendNetwork(check.url, hostHeader, check.timeoutSeconds);
-      const ok = check.expectStatus ? result.status === check.expectStatus : result.ok;
-      results.push({
-        name: check.name,
-        url: check.url,
-        expected: check.expectStatus ? String(check.expectStatus) : '2xx/3xx',
-        status: result.status,
-        ok,
-        detail: result.detail,
-      });
-    }
-    lastResults = results;
-
-    const failed = results
-      .filter((result) => !result.ok);
-
-    if (!failed.length) {
-      log('post-deploy smoke checks passed');
-      return { ok: true, results };
-    }
-
-    lastSummary = failed
-      .map((result) => {
-        const detail = result.detail ? ` (${result.detail})` : '';
-        return `${result.name} expected ${result.expected} got ${result.status}${detail}`;
-      })
-      .join('; ');
-
-    log(`post-deploy smoke checks not ready: ${lastSummary}`);
-    await delay(5000);
-  }
-
-  return { ok: false, results: lastResults, summary: lastSummary || 'unknown error' };
-}
-
-type ServiceUpdateStatus = {
-  state: string;
-  started_at: string;
-  completed_at: string;
-  message: string;
-};
-
-type ServiceInspectSummary = {
-  name: string;
-  image: string;
-  labels: Record<string, string>;
-  replicas: number | null;
-};
-
-type ServiceTaskRow = {
-  id: string;
-  name: string;
-  node: string;
-  desired_state: string;
-  current_state: string;
-  error: string;
-  image: string;
-};
-
-async function inspectServiceUpdateStatus(serviceName: string): Promise<ServiceUpdateStatus | null> {
-  const result = await runCommandCaptureWithStatus('docker', ['service', 'inspect', serviceName, '--format', '{{json .UpdateStatus}}']);
-  if (result.code !== 0) {
-    return null;
-  }
-  const raw = (result.stdout || '').trim();
-  if (!raw || raw === '<no value>' || raw === 'null') {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(raw) as any;
-    if (!parsed || typeof parsed !== 'object') {
-      return null;
-    }
-    const state = String(parsed.State || '').trim();
-    const startedAt = String(parsed.StartedAt || '').trim();
-    const completedAt = String(parsed.CompletedAt || '').trim();
-    const message = String(parsed.Message || '').trim();
-    if (!state && !message) {
-      return null;
-    }
-    return { state, started_at: startedAt, completed_at: completedAt, message };
-  } catch {
-    return null;
-  }
 }
 
 function hasUnknownReplicasMaxPerNodeFlag(output: string): boolean {
@@ -3896,110 +2815,6 @@ async function enforceFrontendRuntimePolicy(
   for (const serviceName of services) {
     await enforceFrontendRuntimePolicyForService(serviceName, policy, log);
   }
-}
-
-async function resumePausedServiceUpdate(serviceName: string, log: (message: string) => void): Promise<boolean> {
-  const updateStatus = await inspectServiceUpdateStatus(serviceName);
-  const state = (updateStatus?.state || '').toLowerCase();
-  if (!state.includes('pause')) {
-    return true;
-  }
-  log(`service update paused: ${serviceName} (${updateStatus?.state || 'paused'})${updateStatus?.message ? ` ${updateStatus.message}` : ''}`);
-  const resume = await runCommandCaptureWithStatus('docker', [
-    'service',
-    'update',
-    '--update-failure-action',
-    'continue',
-    serviceName,
-  ]);
-  const output = (resume.stderr || resume.stdout || '').trim();
-  log(`service update resume: ${serviceName} exit=${resume.code}${output ? ` ${output}` : ''}`);
-  return resume.code === 0;
-}
-
-async function inspectServiceImage(serviceName: string): Promise<string | null> {
-  const result = await runCommandCaptureWithStatus('docker', [
-    'service',
-    'inspect',
-    serviceName,
-    '--format',
-    '{{.Spec.TaskTemplate.ContainerSpec.Image}}',
-  ]);
-  if (result.code !== 0) {
-    return null;
-  }
-  return (result.stdout || '').trim() || null;
-}
-
-function parseDockerJsonLines(raw: string): Array<Record<string, unknown>> {
-  const out: Array<Record<string, unknown>> = [];
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        out.push(parsed);
-      }
-    } catch {
-      continue;
-    }
-  }
-  return out;
-}
-
-async function listStackServices(stackName: string): Promise<string[]> {
-  const result = await runCommandCaptureWithStatus('docker', [
-    'service',
-    'ls',
-    '--filter',
-    `label=com.docker.stack.namespace=${stackName}`,
-    '--format',
-    '{{.Name}}',
-  ]);
-  if (result.code !== 0) {
-    return [];
-  }
-  return result.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
-}
-
-function parseReplicasFromServiceInspect(mode: any): number | null {
-  const replicas = mode?.Replicated?.Replicas;
-  if (typeof replicas === 'number' && Number.isFinite(replicas)) {
-    return replicas;
-  }
-  if (typeof replicas === 'string' && replicas.trim() && Number.isFinite(Number(replicas))) {
-    return Number(replicas);
-  }
-  return null;
-}
-
-async function inspectServices(serviceNames: string[]): Promise<ServiceInspectSummary[]> {
-  if (!serviceNames.length) return [];
-  const result = await runCommandCaptureWithStatus('docker', [
-    'service',
-    'inspect',
-    ...serviceNames,
-    '--format',
-    '{{json .}}',
-  ]);
-  if (result.code !== 0) {
-    return [];
-  }
-  return parseDockerJsonLines(result.stdout)
-    .map((row) => {
-      const spec = (row as any).Spec || {};
-      const name = String(spec?.Name || '').trim();
-      const image = String(spec?.TaskTemplate?.ContainerSpec?.Image || '').trim();
-      const labelsRaw = spec?.Labels && typeof spec.Labels === 'object' ? spec.Labels : {};
-      const labels: Record<string, string> = {};
-      for (const [key, value] of Object.entries(labelsRaw as Record<string, unknown>)) {
-        labels[String(key)] = String(value ?? '');
-      }
-      const replicas = parseReplicasFromServiceInspect(spec?.Mode);
-      return { name, image, labels, replicas };
-    })
-    .filter((entry) => entry.name !== '');
 }
 
 async function listServiceTasksWithImages(serviceName: string): Promise<ServiceTaskRow[]> {
@@ -4281,45 +3096,6 @@ async function scaleDownServices(services: string[], log: (message: string) => v
   return snapshot;
 }
 
-async function tryForceUpdateService(serviceName: string, log: (message: string) => void): Promise<boolean> {
-  let result = await runCommandCaptureWithStatus('docker', ['service', 'update', '--force', serviceName]);
-  if (result.code !== 0) {
-    const output = `${result.stderr || ''}\n${result.stdout || ''}`.toLowerCase();
-    if (output.includes('update paused') || output.includes('paused')) {
-      await resumePausedServiceUpdate(serviceName, log);
-      result = await runCommandCaptureWithStatus('docker', ['service', 'update', '--force', serviceName]);
-    }
-  }
-
-  if (result.code === 0) {
-    log(`forced update: ${serviceName}`);
-    return true;
-  }
-  const output = (result.stderr || result.stdout || '').trim();
-  const updateStatus = await inspectServiceUpdateStatus(serviceName);
-  const updateText = updateStatus
-    ? ` update=${updateStatus.state}${updateStatus.message ? ` (${updateStatus.message})` : ''}`
-    : '';
-  log(`forced update failed: ${serviceName} (exit ${result.code})${updateText} ${output}`);
-  return false;
-}
-
-async function captureServicePs(serviceName: string): Promise<string[]> {
-  const result = await runCommandCaptureWithStatus('docker', [
-    'service',
-    'ps',
-    serviceName,
-    '--no-trunc',
-    '--format',
-    '{{.Node}}|{{.CurrentState}}|{{.Error}}',
-  ]);
-  const out = (result.stdout || result.stderr || '').trim();
-  if (result.code !== 0) {
-    return [out ? `error: ${out}` : `error: exit ${result.code}`];
-  }
-  return out.split('\n').map((line) => line.trim()).filter(Boolean).slice(0, 10);
-}
-
 function writeJsonFileBestEffort(filePath: string, payload: unknown) {
   try {
     fs.writeFileSync(filePath, JSON.stringify(payload, null, 2));
@@ -4335,7 +3111,7 @@ function enqueueDeploymentRecord(payload: DeployPayload, deploymentId: string) {
 }
 
 function chooseLastKnownGoodArtifact(environmentId: number, repository: string): string | null {
-  const history = readDeploymentHistory();
+  const history = readDeploymentHistory(DEPLOY_HISTORY_FILE, LEGACY_DEPLOY_HISTORY_FILE);
   const key = `env:${environmentId}:${repository}`;
   const entry = history[key];
   const artifacts = Array.isArray(entry?.artifacts) ? entry.artifacts : [];
@@ -4478,6 +3254,7 @@ async function runSetupUpgradeWithRetry(
         || message.includes('is not running')
         || message.includes('Connection to Redis')
         || message.includes('redis-cache')
+        || message.includes('Lock wait timeout')
       ) {
         lastError = error instanceof Error ? error : new Error(message);
         log(`setup:upgrade attempt ${attempt} failed: ${message}`);
@@ -4904,7 +3681,7 @@ async function processDeployment(recordPath: string) {
   const environmentId = Number(payload.environment_id ?? 0);
   const repository = String(payload.repository || '').trim() || inferRepositoryFromArtifactKey(artifactKey);
   const deploymentHistoryKey = `env:${environmentId}:${repository || 'unknown'}`;
-  const prunePreviousSuccessAt = getHistoryLastSuccessfulDeployAt(readDeploymentHistory(), deploymentHistoryKey);
+  const prunePreviousSuccessAt = getHistoryLastSuccessfulDeployAt(readDeploymentHistory(DEPLOY_HISTORY_FILE, LEGACY_DEPLOY_HISTORY_FILE), deploymentHistoryKey);
   const ref = String(payload.ref || '').trim();
   const logPrefix = `[deploy ${deploymentId}]`;
   const log = (message: string) => {
@@ -4998,7 +3775,7 @@ async function processDeployment(recordPath: string) {
 
   const imageTag = resolveImageTag(artifactKey, ref, deploymentId);
   const mageVersion = `env-${environmentId}-${imageTag}`;
-  const defaultVersions = readVersionDefaults();
+  const defaultVersions = readVersionDefaults(CLOUD_SWARM_DIR);
   const overrideVersions: Record<string, string> = {};
   if (versions.phpVersion) overrideVersions.PHP_VERSION = versions.phpVersion;
   if (versions.varnishVersion) overrideVersions.VARNISH_VERSION = versions.varnishVersion;
@@ -5664,8 +4441,14 @@ async function processDeployment(recordPath: string) {
     } else {
       log('setup:upgrade required; enabling maintenance + pre-upgrade DB backup');
       progress.detail('magento_steps', 'setup:upgrade required; enabling maintenance + DB backup');
+
+      // Enable maintenance mode first — cron:run checks this flag and skips work.
       adminContainerId = await setMagentoMaintenanceMode(adminContainerId, stackName, 'enable', log);
       maintenanceEnabled = true;
+
+      // Wait for any in-flight cron jobs to finish so setup:upgrade doesn't hit
+      // cron_schedule lock contention (SQLSTATE 1205 Lock wait timeout).
+      await waitForCronJobsToFinish(dbContainerId, envVars.MYSQL_DATABASE || 'magento', log);
 
       const prevArtifactKey = repository ? chooseLastKnownGoodArtifact(environmentId, repository) : null;
       const prevTag = inferCommitShaFromArtifactKey(prevArtifactKey || '') || 'unknown';
@@ -5956,7 +4739,7 @@ async function cleanupFailedArtifact(record: Record<string, any>) {
 
     const normalizedArtifactKey = rawArtifact.replace(/^\/+/, '');
     const repository = String(payload.repository || '').trim() || inferRepositoryFromArtifactKey(normalizedArtifactKey) || 'unknown';
-    const history = readDeploymentHistory();
+    const history = readDeploymentHistory(DEPLOY_HISTORY_FILE, LEGACY_DEPLOY_HISTORY_FILE);
     const key = `env:${environmentId}:${repository}`;
     const prunePreviousSuccessAt = getHistoryLastSuccessfulDeployAt(history, key);
     const deploymentId = String(record?.id || '').trim();
@@ -5973,9 +4756,11 @@ async function cleanupFailedArtifact(record: Record<string, any>) {
       history,
       key,
       normalizedArtifactKey,
-      failedImageTag
+      failedImageTag,
+      DEPLOY_FAILED_ARTIFACT_RETAIN_COUNT,
+      DEPLOY_FAILED_IMAGE_RETAIN_COUNT
     );
-    writeDeploymentHistory(history);
+    writeDeploymentHistory(history, DEPLOY_HISTORY_FILE);
 
     if (!DEPLOY_CLEANUP_ENABLED) {
       return;

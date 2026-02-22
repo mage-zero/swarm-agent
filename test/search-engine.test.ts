@@ -1,17 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
-import { __testing } from '../src/deploy-worker.js';
-
-const {
+import {
   parseDetectedEngine,
   defaultSearchEngine,
   resolveSearchEngine,
   buildSearchEngineEnvOverride,
   buildSearchSystemConfigSql,
+} from '../src/lib/search-engine.js';
+import {
   resolveAppHaReplicaPolicy,
   resolveFrontendRuntimePolicy,
-} = __testing;
+} from '../src/lib/replica-policy.js';
 
 // ---------------------------------------------------------------------------
 // parseDetectedEngine – parses mariadb stdout into a known engine or null

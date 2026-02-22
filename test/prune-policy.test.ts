@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { __testing } from '../src/deploy-worker.js';
-
-const {
+import {
   resolveAggressivePruneCutoffSeconds,
   getHistoryLastSuccessfulDeployAt,
-  getQueueSourceDirs,
-} = __testing;
+} from '../src/lib/deploy-history.js';
+import { __testing } from '../src/deploy-worker.js';
+
+const { getQueueSourceDirs } = __testing;
 
 describe('aggressive prune cutoff policy', () => {
   it('uses previous successful deploy timestamp minus 24h by default', () => {

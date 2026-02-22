@@ -1,24 +1,38 @@
 {
-  "version": "0.4.47",
+  "version": "0.4.48",
   "date": "2026-02-22",
-  "summary": "Fix smoke check overlay DNS failures by probing from existing containers; restart Varnish before smoke checks to clear stale backend DNS",
+  "summary": "Fix setup:upgrade lock timeout, extract deploy modules, add overlay DNS hardening",
   "requires": {
-    "cloud-swarm": ">=1.0.12"
+    "cloud-swarm": ">=1.0.14"
   },
   "changes": [
     {
-      "id": "smoke-check-exec",
-      "description": "Smoke checks now run curl from the existing php-fpm container via docker exec instead of spawning a new curlimages/curl container. This avoids Docker overlay DNS resolution failures that caused false-negative smoke check results.",
-      "phase": "post_deploy",
+      "id": "wait-for-cron-before-upgrade",
+      "description": "Enable maintenance mode and wait for in-flight cron jobs to finish before running setup:upgrade, preventing cron_schedule lock contention (SQLSTATE 1205).",
+      "phase": "pre_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
     },
     {
-      "id": "varnish-restart-pre-smoke",
-      "description": "Force-restart Varnish after deploy and wait 10s for stabilisation before running smoke checks. Clears stale backend DNS cache that caused Varnish to return 503 to old php-fpm container IPs.",
-      "phase": "post_deploy",
+      "id": "retry-on-lock-timeout",
+      "description": "Add Lock wait timeout to the list of retryable errors in setup:upgrade, so transient DB lock contention triggers a retry instead of an immediate failure.",
+      "phase": "pre_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
+    },
+    {
+      "id": "extract-deploy-modules",
+      "description": "Extract 9 service modules from deploy-worker.ts into src/lib/ (deploy-exec, version-config, search-engine, replica-policy, magento-cli, proxysql, deploy-history, docker-service, smoke-check). Pure refactoring, no behavior change.",
+      "phase": "pre_migrate",
+      "downtimeMinutes": 0,
+      "scope": "environment"
+    },
+    {
+      "id": "dns-opt-use-vc",
+      "description": "Requires cloud-swarm >=1.0.14 which adds dns_opt use-vc to overlay network services, forcing TCP DNS to mitigate intermittent UDP resolution failures.",
+      "phase": "pre_migrate",
+      "downtimeMinutes": 0,
+      "scope": "stack"
     }
   ]
 }

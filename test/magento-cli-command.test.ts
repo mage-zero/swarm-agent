@@ -1,7 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { __testing } from '../src/deploy-worker.js';
-
-const { buildMagentoCliCommand, buildSetupDbStatusCommand } = __testing;
+import { buildMagentoCliCommand, buildSetupDbStatusCommand } from '../src/lib/magento-cli.js';
 
 describe('Magento CLI deploy command builders', () => {
   it('forces unlimited PHP memory for Magento CLI commands', () => {
