@@ -1,36 +1,22 @@
 {
-  "version": "0.4.52",
-  "date": "2026-02-22",
-  "summary": "Improve deploy disk cleanup: remove untagged images, add dangling image prune, enable registry GC, install BuildKit GC config",
+  "version": "0.4.53",
+  "date": "2026-02-23",
+  "summary": "Fix docker prune compatibility bugs in aggressive prune",
   "requires": {
     "cloud-swarm": ">=1.0.18"
   },
   "changes": [
     {
-      "id": "cleanup-untagged-images",
-      "description": "cleanupLocalImages() now removes untagged (<none>) images from known repos (mz-magento, mz-nginx-app). These accumulate when Swarm pulls a newer tag and the old image loses its tag but stays on disk. Safe to remove because buildx cache lives in the registry, not Docker's image store.",
+      "id": "fix-system-prune-volumes-filter",
+      "description": "docker system prune --volumes is incompatible with --filter until=. Split into separate system prune (with filter) and volume prune (without filter) calls so both work correctly.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "stack"
     },
     {
-      "id": "aggressive-prune-dangling-images",
-      "description": "maybeAggressivePrune() now runs 'docker image prune -f' before the existing system prune. This removes truly dangling images (untagged AND unreferenced) without affecting buildx cache or tagged images.",
+      "id": "fix-builder-prune-duration-format",
+      "description": "docker builder prune expects a duration string (e.g. '24h'), not a unix timestamp. Convert the cutoff to a duration before passing it.",
       "phase": "post_migrate",
-      "downtimeMinutes": 0,
-      "scope": "stack"
-    },
-    {
-      "id": "enable-registry-gc-default",
-      "description": "REGISTRY_GC_ENABLED now defaults to '1' (was '0'). The registry GC script runs after manifest deletions to reclaim unreferenced blobs. Override with MZ_REGISTRY_GC_ENABLED=0 to disable.",
-      "phase": "post_migrate",
-      "downtimeMinutes": 0,
-      "scope": "stack"
-    },
-    {
-      "id": "install-buildkitd-config",
-      "description": "Install BuildKit GC config from cloud-swarm/etc/buildkitd.toml to /etc/magezero/buildkitd.toml. Prevents the builder from being unnecessarily recreated each build (preserving its internal cache) and ensures BuildKit manages its own disk usage with a 5GB aggressive / 10GB soft limit.",
-      "phase": "pre_migrate",
       "downtimeMinutes": 0,
       "scope": "stack"
     }

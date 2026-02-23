@@ -1133,12 +1133,12 @@ async function maybeAggressivePrune(stage: string, previousSuccessAt: string | n
     console.warn(`cleanup: docker image prune failed: ${message}`);
   }
 
+  // Note: --volumes is incompatible with --filter until=, so we run them separately.
   try {
     await runCommand('docker', [
       'system',
       'prune',
       '-a',
-      '--volumes',
       '--filter',
       `until=${cutoffSeconds}`,
       '-f',
@@ -1148,7 +1148,16 @@ async function maybeAggressivePrune(stage: string, previousSuccessAt: string | n
     console.warn(`cleanup: docker system prune failed: ${message}`);
   }
   try {
-    await runCommand('docker', ['builder', 'prune', '-a', '--filter', `until=${cutoffSeconds}`, '-f']);
+    await runCommand('docker', ['volume', 'prune', '-f']);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`cleanup: docker volume prune failed: ${message}`);
+  }
+
+  // docker builder prune expects a duration string (e.g. "24h"), not a unix timestamp.
+  const cutoffDurationHours = Math.max(1, Math.round((Date.now() / 1000 - cutoffSeconds) / 3600));
+  try {
+    await runCommand('docker', ['builder', 'prune', '-a', '--filter', `until=${cutoffDurationHours}h`, '-f']);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`cleanup: docker builder prune failed: ${message}`);
