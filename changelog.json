@@ -1,15 +1,15 @@
 {
-  "version": "0.4.54",
+  "version": "0.4.55",
   "date": "2026-02-23",
-  "summary": "Scale down cron service during setup:upgrade to prevent OOM kills",
+  "summary": "Fix deploy failure caused by ddtrace stderr noise in app:config:status",
   "requires": {
     "cloud-swarm": ">=1.0.18"
   },
   "changes": [
     {
-      "id": "scale-cron-during-upgrade",
-      "description": "Scale the cron service to 0 replicas before setup:upgrade and restore it afterwards. The cron container runs php bin/magento cron:run in a loop which loads the full Magento DI container (~135MB+ per invocation) even in maintenance mode, causing OOM kills on memory-constrained nodes.",
-      "phase": "deploy",
+      "id": "config-status-prefer-stdout",
+      "description": "app:config:status now reads stdout first for status parsing. Previously it preferred stderr, which could contain unrelated noise from PHP extensions like ddtrace, causing the deploy to fail with a spurious config mismatch error.",
+      "phase": "pre_migrate",
       "downtimeMinutes": 0,
       "scope": "stack"
     }

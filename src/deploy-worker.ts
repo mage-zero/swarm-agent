@@ -3516,7 +3516,11 @@ async function runAppConfigStatus(
       stackName,
       buildMagentoCliCommand('app:config:status')
     );
-    const output = (result.stderr || result.stdout || '').trim();
+    // Prefer stdout for status parsing — stderr often contains noise from
+    // PHP extensions (e.g. ddtrace) that isn't related to the command result.
+    const stdout = (result.stdout || '').trim();
+    const stderr = (result.stderr || '').trim();
+    const output = stdout || stderr;
     const outputLower = output.toLowerCase();
     const exitCode = result.code;
 
