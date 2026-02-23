@@ -1,22 +1,15 @@
 {
-  "version": "0.4.53",
+  "version": "0.4.54",
   "date": "2026-02-23",
-  "summary": "Fix docker prune compatibility bugs in aggressive prune",
+  "summary": "Scale down cron service during setup:upgrade to prevent OOM kills",
   "requires": {
     "cloud-swarm": ">=1.0.18"
   },
   "changes": [
     {
-      "id": "fix-system-prune-volumes-filter",
-      "description": "docker system prune --volumes is incompatible with --filter until=. Split into separate system prune (with filter) and volume prune (without filter) calls so both work correctly.",
-      "phase": "post_migrate",
-      "downtimeMinutes": 0,
-      "scope": "stack"
-    },
-    {
-      "id": "fix-builder-prune-duration-format",
-      "description": "docker builder prune expects a duration string (e.g. '24h'), not a unix timestamp. Convert the cutoff to a duration before passing it.",
-      "phase": "post_migrate",
+      "id": "scale-cron-during-upgrade",
+      "description": "Scale the cron service to 0 replicas before setup:upgrade and restore it afterwards. The cron container runs php bin/magento cron:run in a loop which loads the full Magento DI container (~135MB+ per invocation) even in maintenance mode, causing OOM kills on memory-constrained nodes.",
+      "phase": "deploy",
       "downtimeMinutes": 0,
       "scope": "stack"
     }

@@ -4482,6 +4482,7 @@ async function processDeployment(recordPath: string) {
   }
 
   let maintenanceEnabled = false;
+  let cronScaledDown = false;
   try {
     if (!upgradeNeeded) {
       log('setup:upgrade not required; cache already flushed before status check');
@@ -4489,6 +4490,19 @@ async function processDeployment(recordPath: string) {
     } else {
       log('setup:upgrade required; enabling maintenance + pre-upgrade DB backup');
       progress.detail('magento_steps', 'setup:upgrade required; enabling maintenance + DB backup');
+
+      // Scale cron to 0 replicas so cron:run doesn't consume memory during upgrade.
+      // The cron container runs `php bin/magento cron:run` in a loop which loads
+      // the full Magento DI container (~135MB+ per invocation) even in maintenance
+      // mode, and can OOM-kill the container on memory-constrained nodes.
+      const cronServiceName = `${stackName}_cron`;
+      try {
+        await scaleDownServices([cronServiceName], log);
+        cronScaledDown = true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        log(`warning: failed to scale down cron: ${message}; continuing`);
+      }
 
       // Enable maintenance mode first — cron:run checks this flag and skips work.
       adminContainerId = await setMagentoMaintenanceMode(adminContainerId, stackName, 'enable', log);
@@ -4597,6 +4611,22 @@ async function processDeployment(recordPath: string) {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         log(`maintenance:disable failed: ${message}`);
+      }
+    }
+    if (cronScaledDown) {
+      try {
+        const cronServiceName = `${stackName}_cron`;
+        const result = await runCommandCaptureWithStatus('docker', [
+          'service', 'scale', `${cronServiceName}=1`,
+        ]);
+        if (result.code === 0) {
+          log(`restored cron service: ${cronServiceName} replicas=1`);
+        } else {
+          log(`warning: failed to restore cron service: ${cronServiceName} (exit ${result.code})`);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        log(`warning: failed to restore cron service: ${message}`);
       }
     }
   }
