@@ -1,14 +1,14 @@
 {
-  "version": "0.4.55",
+  "version": "0.4.56",
   "date": "2026-02-23",
-  "summary": "Fix deploy failure caused by ddtrace stderr noise in app:config:status",
+  "summary": "Replace per-node maintenance mode Swarm jobs with a single Redis key",
   "requires": {
-    "cloud-swarm": ">=1.0.18"
+    "cloud-swarm": ">=1.0.22"
   },
   "changes": [
     {
-      "id": "config-status-prefer-stdout",
-      "description": "app:config:status now reads stdout first for status parsing. Previously it preferred stderr, which could contain unrelated noise from PHP extensions like ddtrace, causing the deploy to fail with a spurious config mismatch error.",
+      "id": "redis-maintenance-mode",
+      "description": "Maintenance mode is now toggled via a Redis key (maintenance:flag in DB 2) instead of creating one-shot Docker Swarm jobs on every node. This eliminates the fragile per-node job orchestration that caused deploy failures when task creation failed on individual nodes (e.g. create_failed on workers). Requires the MageZero_ClusterMaintenance Magento module to be installed.",
       "phase": "pre_migrate",
       "downtimeMinutes": 0,
       "scope": "stack"

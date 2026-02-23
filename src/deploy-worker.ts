@@ -3298,72 +3298,27 @@ async function runSetupUpgradeWithRetry(
   throw lastError || new Error('setup:upgrade failed after retries');
 }
 
-function parseEnvironmentIdFromStackName(stackName: string): number | null {
-  const match = /^mz-env-(\d+)$/.exec(String(stackName || '').trim());
-  if (!match) return null;
-  const id = Number(match[1]);
-  if (!Number.isFinite(id) || id <= 0) return null;
-  return id;
-}
+async function setMaintenanceModeViaRedis(
+  stackName: string,
+  mode: 'enable' | 'disable',
+  log: (message: string) => void,
+): Promise<void> {
+  const redisContainerId = await waitForContainer(stackName, 'redis-cache', 30_000);
+  const cmd =
+    mode === 'enable'
+      ? ['redis-cli', '-n', '2', 'SET', 'maintenance:flag', '1']
+      : ['redis-cli', '-n', '2', 'DEL', 'maintenance:flag'];
 
-async function toggleMagentoMaintenanceFlagOnService(params: {
-  environmentId: number;
-  serviceName: string;
-  mode: 'enable' | 'disable';
-  log: (message: string) => void;
-}): Promise<{ ok: boolean; details: string[] }> {
-  const serviceFullName = envServiceName(params.environmentId, params.serviceName);
-  const spec = await inspectServiceSpec(serviceFullName);
-  if (!spec) {
-    return { ok: false, details: [`missing service: ${serviceFullName}`] };
-  }
-
-  const tasks = await listServiceTasks(serviceFullName);
-  const desiredRunning = tasks.filter((t) => String(t.desired_state || '').toLowerCase() === 'running' && t.node);
-  const nodes = Array.from(new Set((desiredRunning.length ? desiredRunning : tasks).map((t) => t.node).filter(Boolean)));
-  if (!nodes.length) {
-    return { ok: false, details: [`no tasks/nodes found for service: ${serviceFullName}`] };
-  }
-
-  const networks = Array.from(new Set(spec.networks.map((net) => net.name).filter(Boolean)));
-  if (!networks.length) networks.push('mz-backend');
-  const secrets = spec.secrets.map((secret) => ({ source: secret.secret_name, target: secret.file_name }));
-  const mounts = spec.mounts.map((mount) => ({
-    type: mount.type,
-    source: mount.source,
-    target: mount.target,
-    read_only: mount.read_only,
-  }));
-
-  const flagPath = '/var/www/html/magento/var/.maintenance.flag';
-  const script = params.mode === 'enable'
-    ? `set -eu; mkdir -p /var/www/html/magento/var; touch ${flagPath}`
-    : `set -eu; rm -f ${flagPath} || true`;
-
-  let ok = true;
-  const details: string[] = [];
-  for (const node of nodes) {
-    const jobName = buildJobName(`deploy-maint-${params.mode}-${params.serviceName}`, params.environmentId);
-    const job = await runSwarmJob({
-      name: jobName,
-      image: spec.image,
-      networks,
-      secrets,
-      mounts,
-      env: spec.env,
-      constraints: [`node.hostname==${node}`],
-      command: ['sh', '-lc', script],
-      timeout_ms: 90_000,
-    });
-    params.log(`maintenance:${params.mode} ${serviceFullName} on ${node}: ${job.ok ? 'ok' : job.state}`);
-    if (!job.ok) {
-      ok = false;
-      const jobOutput = (job.logs || job.error || '').trim();
-      details.push(`${serviceFullName} on ${node}: ${job.state}${jobOutput ? ` (${jobOutput})` : ''}`);
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const result = await runCommandCaptureWithStatus('docker', ['exec', redisContainerId, ...cmd]);
+    if (result.code === 0) {
+      log(`maintenance:${mode} via redis: ok`);
+      return;
     }
+    log(`maintenance:${mode} via redis attempt ${attempt}: exit ${result.code}`);
+    await delay(2000);
   }
-
-  return { ok, details };
+  throw new Error(`maintenance:${mode} via redis failed after retries`);
 }
 
 async function setMagentoMaintenanceMode(
@@ -3372,61 +3327,8 @@ async function setMagentoMaintenanceMode(
   mode: 'enable' | 'disable',
   log: (message: string) => void,
 ) {
-  const environmentId = parseEnvironmentIdFromStackName(stackName);
-  if (!environmentId) {
-    // Fallback for unexpected stack names: best-effort in php-fpm-admin only.
-    let currentId = containerId;
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      currentId = await ensureMagentoEnvWrapperWithRetry(currentId, stackName, log);
-      const result = await runMagentoCommandWithStatus(
-        currentId,
-        stackName,
-        buildMagentoCliCommand(`maintenance:${mode} --no-interaction`),
-      );
-      if (result.code === 0) {
-        log(`maintenance:${mode} ok`);
-        return currentId;
-      }
-      const output = (result.stderr || result.stdout || '').trim();
-      if (!output || output.includes('No such container') || output.includes('is not running')) {
-        log(`maintenance:${mode} retry ${attempt}: ${output || `exit ${result.code}`}`);
-        currentId = await waitForContainer(stackName, 'php-fpm-admin', 60 * 1000);
-        await delay(2000);
-        continue;
-      }
-      throw new Error(`maintenance:${mode} failed (exit ${result.code}): ${output}`);
-    }
-    return currentId;
-  }
-
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      const frontend = await toggleMagentoMaintenanceFlagOnService({
-        environmentId,
-        serviceName: 'php-fpm',
-        mode,
-        log,
-      });
-      const admin = await toggleMagentoMaintenanceFlagOnService({
-        environmentId,
-        serviceName: 'php-fpm-admin',
-        mode,
-        log,
-      });
-      if (frontend.ok && admin.ok) {
-        log(`maintenance:${mode} ok`);
-        return containerId;
-      }
-      const combined = [...frontend.details, ...admin.details].filter(Boolean).join('; ');
-      throw new Error(combined || 'maintenance flag toggle failed');
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      log(`maintenance:${mode} retry ${attempt}: ${message}`);
-      await delay(2000);
-    }
-  }
-
-  throw new Error(`maintenance:${mode} failed after retries`);
+  await setMaintenanceModeViaRedis(stackName, mode, log);
+  return containerId;
 }
 
 async function runSetupDbStatus(
