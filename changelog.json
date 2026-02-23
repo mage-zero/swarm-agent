@@ -1,17 +1,16 @@
 {
-  "version": "0.4.56",
+  "version": "0.4.57",
   "date": "2026-02-23",
-  "summary": "Replace per-node maintenance mode Swarm jobs with a single Redis key",
+  "summary": "Fix maintenance mode on multi-node clusters where redis-cache is on a different node",
   "requires": {
     "cloud-swarm": ">=1.0.22"
   },
   "changes": [
     {
-      "id": "redis-maintenance-mode",
-      "description": "Maintenance mode is now toggled via a Redis key (maintenance:flag in DB 2) instead of creating one-shot Docker Swarm jobs on every node. This eliminates the fragile per-node job orchestration that caused deploy failures when task creation failed on individual nodes (e.g. create_failed on workers). Requires the MageZero_ClusterMaintenance Magento module to be installed.",
-      "phase": "pre_migrate",
+      "id": "redis-maintenance-via-admin",
+      "description": "setMaintenanceModeViaRedis now executes redis commands via the php-fpm-admin container over the overlay network instead of requiring a local redis-cache container. Fixes deploy failures on multi-node clusters when Swarm schedules redis-cache on a worker node.",
       "downtimeMinutes": 0,
-      "scope": "stack"
+      "scope": "deploy"
     }
   ]
 }

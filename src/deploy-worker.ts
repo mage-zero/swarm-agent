@@ -3299,23 +3299,30 @@ async function runSetupUpgradeWithRetry(
 }
 
 async function setMaintenanceModeViaRedis(
-  stackName: string,
+  adminContainerId: string,
+  _stackName: string,
   mode: 'enable' | 'disable',
   log: (message: string) => void,
 ): Promise<void> {
-  const redisContainerId = await waitForContainer(stackName, 'redis-cache', 30_000);
-  const cmd =
+  const op =
     mode === 'enable'
-      ? ['redis-cli', '-n', '2', 'SET', 'maintenance:flag', '1']
-      : ['redis-cli', '-n', '2', 'DEL', 'maintenance:flag'];
+      ? '$r->set("maintenance:flag", "1");'
+      : '$r->del("maintenance:flag");';
+  const script = [
+    '$host = getenv("MZ_REDIS_CACHE_HOST") ?: "redis-cache";',
+    '$r = new Redis();',
+    '$r->connect($host, 6379);',
+    '$r->select(2);',
+    op,
+  ].join(' ');
 
   for (let attempt = 1; attempt <= 3; attempt++) {
-    const result = await runCommandCaptureWithStatus('docker', ['exec', redisContainerId, ...cmd]);
+    const result = await runCommandCaptureWithStatus('docker', ['exec', adminContainerId, 'php', '-r', script]);
     if (result.code === 0) {
       log(`maintenance:${mode} via redis: ok`);
       return;
     }
-    log(`maintenance:${mode} via redis attempt ${attempt}: exit ${result.code}`);
+    log(`maintenance:${mode} via redis attempt ${attempt}: exit ${result.code} — ${(result.stderr || result.stdout || '').trim()}`);
     await delay(2000);
   }
   throw new Error(`maintenance:${mode} via redis failed after retries`);
@@ -3327,7 +3334,7 @@ async function setMagentoMaintenanceMode(
   mode: 'enable' | 'disable',
   log: (message: string) => void,
 ) {
-  await setMaintenanceModeViaRedis(stackName, mode, log);
+  await setMaintenanceModeViaRedis(containerId, stackName, mode, log);
   return containerId;
 }
 
