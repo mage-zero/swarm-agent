@@ -1,17 +1,17 @@
 {
-  "version": "0.4.59",
+  "version": "0.4.60",
   "date": "2026-02-24",
-  "summary": "Fix monitoring stack image pulls on multi-node swarms when REGISTRY_HOST is the 'registry' alias",
+  "summary": "Pin Varnish to 1 replica regardless of HA scaling policy",
   "requires": {
     "cloud-swarm": ">=1.0.22"
   },
   "changes": [
     {
-      "id": "fix-monitoring-registry-alias-resolution",
-      "description": "The resolveRegistryPullHost() in upgrade-migrations was only handling loopback hosts (127.0.0.1/localhost) but not the 'registry' alias. On multi-node swarms where the monitoring stack template defaults REGISTRY_HOST to 'registry', Docker daemon image pulls failed because 'registry' only resolves inside overlay networks. Now detects the 'registry' alias and substitutes the WireGuard IP, matching the existing logic in deploy-worker.",
-      "phase": "pre_migrate",
+      "id": "varnish-single-replica",
+      "description": "Decouple Varnish from the frontend HA replica policy so it always runs as a single replica with start-first updates and no max-per-node constraint, regardless of how many nodes are in the swarm. Nginx and PHP-FPM continue to scale with the HA policy.",
+      "phase": "deploy",
       "downtimeMinutes": 0,
-      "scope": "environment"
+      "scope": "stack"
     }
   ]
 }

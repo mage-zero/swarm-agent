@@ -2907,7 +2907,7 @@ async function enforceFrontendRuntimePolicy(
   policy: FrontendRuntimePolicy,
   log: (message: string) => void,
 ) {
-  const services = ['varnish', 'nginx', 'php-fpm']
+  const services = ['nginx', 'php-fpm']
     .map((service) => `${stackName}_${service}`);
   for (const serviceName of services) {
     await enforceFrontendRuntimePolicyForService(serviceName, policy, log);
@@ -3959,13 +3959,13 @@ async function processDeployment(recordPath: string) {
     MZ_MARIADB_MASTER_HOST: stackService('database'),
     MZ_REPLICATION_USER: replicaUser,
     MZ_DATABASE_REPLICA_REPLICAS: replicaEnabled ? '1' : '0',
-    MZ_VARNISH_REPLICAS: String(frontendReplicaCount),
+    MZ_VARNISH_REPLICAS: '1',
     MZ_NGINX_REPLICAS: String(frontendReplicaCount),
     MZ_PHP_FPM_REPLICAS: String(frontendReplicaCount),
-    MZ_VARNISH_MAX_REPLICAS_PER_NODE: String(frontendRuntimePolicy.max_replicas_per_node),
+    MZ_VARNISH_MAX_REPLICAS_PER_NODE: '0',
     MZ_NGINX_MAX_REPLICAS_PER_NODE: String(frontendRuntimePolicy.max_replicas_per_node),
     MZ_PHP_FPM_MAX_REPLICAS_PER_NODE: String(frontendRuntimePolicy.max_replicas_per_node),
-    MZ_VARNISH_UPDATE_ORDER: frontendRuntimePolicy.update_order,
+    MZ_VARNISH_UPDATE_ORDER: 'start-first',
     MZ_NGINX_UPDATE_ORDER: frontendRuntimePolicy.update_order,
     MZ_PHP_FPM_UPDATE_ORDER: frontendRuntimePolicy.update_order,
     MZ_RABBITMQ_HOST: stackService('rabbitmq'),
