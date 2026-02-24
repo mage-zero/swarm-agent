@@ -86,6 +86,10 @@ function isLoopbackHost(host: string): boolean {
   return value === '127.0.0.1' || value === 'localhost' || value === '::1';
 }
 
+function isRegistryAliasHost(host: string): boolean {
+  return String(host || '').trim().toLowerCase() === 'registry';
+}
+
 async function swarmHasMultipleNodes(): Promise<boolean> {
   const result = await runCommand('docker', ['node', 'ls', '--format', '{{.ID}}'], 12_000);
   if (result.code !== 0) {
@@ -109,17 +113,27 @@ async function resolveRegistryPullHost(candidate: string): Promise<string> {
   if (!trimmed) {
     return '127.0.0.1';
   }
-  if (!isLoopbackHost(trimmed)) {
+
+  const multiNode = await swarmHasMultipleNodes();
+  if (!multiNode) {
     return trimmed;
   }
-  if (!(await swarmHasMultipleNodes())) {
-    return trimmed;
-  }
+
   const wgIp = await detectWireGuardIpV4();
-  if (wgIp) {
-    console.log(`upgrade.migration.registry_pull_host: using WireGuard IP ${wgIp}`);
+
+  if (isLoopbackHost(trimmed)) {
+    if (wgIp) {
+      console.log(`upgrade.migration.registry_pull_host: loopback in multi-node swarm; using WireGuard IP ${wgIp}`);
+      return wgIp;
+    }
+    return trimmed;
+  }
+
+  if (isRegistryAliasHost(trimmed) && wgIp) {
+    console.log(`upgrade.migration.registry_pull_host: '${trimmed}' is alias-based in multi-node swarm; using WireGuard IP ${wgIp}`);
     return wgIp;
   }
+
   return trimmed;
 }
 

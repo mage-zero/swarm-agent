@@ -1,31 +1,17 @@
 {
-  "version": "0.4.58",
+  "version": "0.4.59",
   "date": "2026-02-24",
-  "summary": "Reconcile ProxySQL query rules on upgrade, flush Varnish after maintenance mode exits, and auto-refresh stale monitoring configs",
+  "summary": "Fix monitoring stack image pulls on multi-node swarms when REGISTRY_HOST is the 'registry' alias",
   "requires": {
     "cloud-swarm": ">=1.0.22"
   },
   "changes": [
     {
-      "id": "reconcile-proxysql-query-rules",
-      "description": "Reconcile ProxySQL query rules on existing environments during agent upgrade so Magento search_tmp_* temporary-table queries are pinned to the writer before the catch-all SELECT->reader rule (prevents intermittent 500s on category/search pages after agent/template drift).",
+      "id": "fix-monitoring-registry-alias-resolution",
+      "description": "The resolveRegistryPullHost() in upgrade-migrations was only handling loopback hosts (127.0.0.1/localhost) but not the 'registry' alias. On multi-node swarms where the monitoring stack template defaults REGISTRY_HOST to 'registry', Docker daemon image pulls failed because 'registry' only resolves inside overlay networks. Now detects the 'registry' alias and substitutes the WireGuard IP, matching the existing logic in deploy-worker.",
       "phase": "pre_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
-    },
-    {
-      "id": "restart-varnish-after-maintenance-disable",
-      "description": "When deploys disable Magento maintenance mode, immediately force-restart the Varnish service and wait for all desired Varnish tasks to be Running so cached maintenance responses are flushed across all replicas before traffic resumes. Also replaces the fixed 10s post-deploy Varnish sleep with task-state waiting.",
-      "phase": "deploy",
-      "downtimeMinutes": 0,
-      "scope": "stack"
-    },
-    {
-      "id": "reconcile-stale-monitoring-configs",
-      "description": "Before each monitoring stack deploy, compare deployed Docker Swarm config content with the current files on disk. When configs are stale (Docker Swarm configs are immutable so docker stack deploy silently keeps old content), tear down the monitoring stack and redeploy so changes like new otel-collector receivers actually take effect.",
-      "phase": "deploy",
-      "downtimeMinutes": 0,
-      "scope": "stack"
     }
   ]
 }
