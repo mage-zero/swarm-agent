@@ -4,7 +4,9 @@ import { runCommand } from './exec.js';
 import { buildNodeHeaders } from './node-hmac.js';
 import { bootstrapMonitoringDashboards } from './monitoring-dashboards.js';
 import { resolveDatadogTraceEnv } from './lib/apm-tracing.js';
+import { buildProxySqlQueryRulesSql, PROXYSQL_MANAGED_QUERY_RULES } from './lib/proxysql.js';
 import { buildCapacityPayload } from './status.js';
+import { buildJobName, inspectServiceSpec, listServiceTasks, runSwarmJob } from './swarm.js';
 
 export type MigrationContext = {
   environmentId?: number;
@@ -203,6 +205,101 @@ function isNoopServiceUpdateOutput(text: string): boolean {
 
 function envServiceName(environmentId: number, service: string): string {
   return `mz-env-${environmentId}_${service}`;
+}
+
+function buildProxySqlRuleReconcileMigrationScript(proxysqlServiceFullName: string): string {
+  const sql = buildProxySqlQueryRulesSql(PROXYSQL_MANAGED_QUERY_RULES).trimEnd();
+  const script = [
+    'set -eu',
+    `PROXYSQL_HOST="${proxysqlServiceFullName}"`,
+    'SQL_FILE="$(mktemp)"',
+    'cleanup() { rm -f "$SQL_FILE"; }',
+    'trap cleanup EXIT',
+    "cat > \"$SQL_FILE\" <<'SQL'",
+    sql,
+    'SQL',
+    'CLIENT=""',
+    'if command -v mariadb >/dev/null 2>&1; then CLIENT="mariadb"; elif command -v mysql >/dev/null 2>&1; then CLIENT="mysql"; fi',
+    'if [ -z "$CLIENT" ]; then echo "missing mariadb/mysql client" >&2; exit 2; fi',
+    'ADMIN_USER=""',
+    'ADMIN_PASS=""',
+    'i=0',
+    'while [ -z "$ADMIN_USER" ]; do',
+    '  for AUTH in "radmin:radmin" "admin:admin"; do',
+    '    USER="${AUTH%%:*}"',
+    '    PASS="${AUTH#*:}"',
+    '    if $CLIENT -h "$PROXYSQL_HOST" -P 6032 -u "$USER" -p"$PASS" -e "SELECT 1" >/dev/null 2>&1; then',
+    '      ADMIN_USER="$USER"',
+    '      ADMIN_PASS="$PASS"',
+    '      break',
+    '    fi',
+    '  done',
+    '  if [ -n "$ADMIN_USER" ]; then break; fi',
+    '  i=$((i+1))',
+    '  if [ "$i" -gt 60 ]; then echo "proxysql admin not ready" >&2; exit 1; fi',
+    '  sleep 1',
+    'done',
+    '$CLIENT -h "$PROXYSQL_HOST" -P 6032 -u "$ADMIN_USER" -p"$ADMIN_PASS" < "$SQL_FILE"',
+  ].join('\n');
+
+  // Base64-encode to avoid multi-line command argv content in Swarm job args.
+  const encoded = Buffer.from(script).toString('base64');
+  return `printf '%s' '${encoded}' | base64 -d | sh`;
+}
+
+async function reconcileProxySqlQueryRulesForEnvironment(environmentId: number): Promise<void> {
+  const proxysqlServiceFullName = envServiceName(environmentId, 'proxysql');
+  const proxysqlSpec = await inspectServiceSpec(proxysqlServiceFullName);
+  if (!proxysqlSpec) {
+    console.log(
+      `upgrade.migration.reconcile_proxysql_query_rules: env=${environmentId} skipped (missing ${proxysqlServiceFullName})`
+    );
+    return;
+  }
+
+  const networks = Array.from(new Set(proxysqlSpec.networks.map((net) => net.name).filter(Boolean)));
+  if (!networks.length) {
+    networks.push('mz-backend');
+  }
+
+  const tasks = await listServiceTasks(proxysqlServiceFullName);
+  const runningTask = tasks.find((task) => task.current_state.startsWith('Running') && task.node)
+    || tasks.find((task) => Boolean(task.node));
+  const constraints = runningTask?.node ? [`node.hostname==${runningTask.node}`] : [];
+  const script = buildProxySqlRuleReconcileMigrationScript(proxysqlServiceFullName);
+
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const job = await runSwarmJob({
+      name: buildJobName('upgrade-proxysql-rules', environmentId),
+      image: proxysqlSpec.image,
+      entrypoint: 'sh',
+      networks,
+      constraints,
+      command: ['-lc', script],
+      timeout_ms: 120_000,
+    });
+
+    if (job.ok) {
+      console.log(
+        `upgrade.migration.reconcile_proxysql_query_rules: env=${environmentId} reconciled `
+        + '(search_tmp_ -> writer, SELECT -> reader)'
+      );
+      return;
+    }
+
+    const detail = (job.logs || job.error || '').trim();
+    lastError = new Error(detail || `swarm job failed (${job.state})`);
+    console.warn(
+      `upgrade.migration.reconcile_proxysql_query_rules: env=${environmentId} `
+      + `attempt ${attempt}/3 failed (${lastError.message})`
+    );
+    if (attempt < 3) {
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+    }
+  }
+
+  throw lastError || new Error(`ProxySQL query rules reconciliation failed for env ${environmentId}`);
 }
 
 async function inspectServiceReplicaConfig(serviceName: string): Promise<ServiceReplicaConfig | null> {
@@ -1099,6 +1196,15 @@ registerMigration('frontend-runtime-policy-reconcile', async (ctx) => {
   await executeMigration('rebalance-frontend-ha-replicas', ctx);
   await executeMigration('normalize-env-runtime-policies', ctx);
   console.log(`upgrade.migration.frontend_runtime_policy_reconcile: env=${environmentId} complete`);
+});
+
+registerMigration('reconcile-proxysql-query-rules', async (ctx) => {
+  const environmentId = Number(ctx.environmentId || 0);
+  if (!Number.isFinite(environmentId) || environmentId <= 0) {
+    console.warn('upgrade.migration.reconcile_proxysql_query_rules: missing environmentId; skipping');
+    return;
+  }
+  await reconcileProxySqlQueryRulesForEnvironment(environmentId);
 });
 
 registerMigration('frontend-placement-deadlock-recovery', async (ctx) => {

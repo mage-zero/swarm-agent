@@ -2891,6 +2891,52 @@ async function listServiceTasksWithImages(serviceName: string): Promise<ServiceT
     .filter((task) => task.id !== '' && task.name !== '');
 }
 
+async function waitForAllDesiredServiceTasksRunning(
+  serviceName: string,
+  log: (message: string) => void,
+  timeoutMs = 120_000,
+): Promise<boolean> {
+  const startedAt = Date.now();
+  let lastStatus = 'no task data';
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const tasks = await listServiceTasksWithImages(serviceName);
+    const desiredRunning = tasks.filter((t) => t.desired_state.toLowerCase() === 'running');
+    if (desiredRunning.length > 0) {
+      const notRunning = desiredRunning.filter((t) => !t.current_state.startsWith('Running'));
+      if (notRunning.length === 0) {
+        return true;
+      }
+
+      const runningCount = desiredRunning.length - notRunning.length;
+      lastStatus = `${runningCount}/${desiredRunning.length} desired tasks running`;
+
+      const failedTask = notRunning.find((t) =>
+        t.current_state.startsWith('Failed') || t.current_state.startsWith('Rejected'));
+      if (failedTask) {
+        const suffix = failedTask.error ? ` (${failedTask.error})` : '';
+        log(
+          `warning: ${serviceName} task failed during rollout: ${failedTask.name} on ${failedTask.node || '(unknown)'} ${failedTask.current_state}${suffix}`.trim(),
+        );
+        return false;
+      }
+    } else if (tasks.length === 0) {
+      lastStatus = 'no tasks reported';
+    } else {
+      lastStatus = 'no tasks desired running';
+    }
+
+    await delay(2000);
+  }
+
+  log(`warning: timed out waiting for ${serviceName} desired tasks to be running (${lastStatus})`);
+  const servicePs = await captureServicePs(serviceName);
+  for (const line of servicePs.slice(0, 5)) {
+    log(`warning: ${serviceName} ps: ${line}`);
+  }
+  return false;
+}
+
 function summarizeReleaseServiceState(tasks: ServiceTaskRow[], expectedTag: string): {
   ok: boolean;
   desired_running: number;
@@ -4396,6 +4442,7 @@ async function processDeployment(recordPath: string) {
 
   let maintenanceEnabled = false;
   let cronScaledDown = false;
+  let varnishRestartedAfterMaintenance = false;
   try {
     if (!upgradeNeeded) {
       log('setup:upgrade not required; cache already flushed before status check');
@@ -4518,12 +4565,28 @@ async function processDeployment(recordPath: string) {
   } finally {
     dbContainerId = await setSearchEngine(stackName, dbContainerId, envVars.MYSQL_DATABASE || 'magento', searchEngine);
     if (maintenanceEnabled) {
+      let maintenanceDisabled = false;
       try {
         progress.detail('magento_steps', 'Disabling maintenance mode');
         adminContainerId = await setMagentoMaintenanceMode(adminContainerId, stackName, 'disable', log);
+        maintenanceDisabled = true;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         log(`maintenance:disable failed: ${message}`);
+      }
+
+      if (maintenanceDisabled) {
+        const varnishServiceName = `${stackName}_varnish`;
+        try {
+          log('restarting varnish after maintenance:disable to clear cached maintenance responses');
+          if (await tryForceUpdateService(varnishServiceName, log)) {
+            varnishRestartedAfterMaintenance = true;
+            await waitForAllDesiredServiceTasksRunning(varnishServiceName, log);
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          log(`warning: failed to restart varnish after maintenance:disable: ${message}`);
+        }
       }
     }
     if (cronScaledDown) {
@@ -4564,10 +4627,15 @@ async function processDeployment(recordPath: string) {
   progress.ok('magento_steps');
 
   if (envHostname) {
-    // Force-restart varnish to clear stale backend DNS cache (old php-fpm IPs).
-    log('restarting varnish to refresh backend DNS');
-    await tryForceUpdateService(`${stackName}_varnish`, log);
-    await delay(10_000);
+    const varnishServiceName = `${stackName}_varnish`;
+    if (varnishRestartedAfterMaintenance) {
+      log('varnish already restarted after maintenance:disable; skipping additional post-deploy restart');
+    } else {
+      // Force-restart varnish to clear stale backend DNS cache (old php-fpm IPs).
+      log('restarting varnish to refresh backend DNS');
+      await tryForceUpdateService(varnishServiceName, log);
+      await waitForAllDesiredServiceTasksRunning(varnishServiceName, log);
+    }
 
     progress.start('smoke_checks');
     progress.detail('smoke_checks', `Checking ${envHostname}`);

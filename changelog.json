@@ -1,16 +1,24 @@
 {
-  "version": "0.4.57",
-  "date": "2026-02-23",
-  "summary": "Fix maintenance mode on multi-node clusters where redis-cache is on a different node",
+  "version": "0.4.58",
+  "date": "2026-02-24",
+  "summary": "Reconcile ProxySQL query rules on upgrade and flush Varnish after maintenance mode exits",
   "requires": {
     "cloud-swarm": ">=1.0.22"
   },
   "changes": [
     {
-      "id": "redis-maintenance-via-admin",
-      "description": "setMaintenanceModeViaRedis now executes redis commands via the php-fpm-admin container over the overlay network instead of requiring a local redis-cache container. Fixes deploy failures on multi-node clusters when Swarm schedules redis-cache on a worker node.",
+      "id": "reconcile-proxysql-query-rules",
+      "description": "Reconcile ProxySQL query rules on existing environments during agent upgrade so Magento search_tmp_* temporary-table queries are pinned to the writer before the catch-all SELECT->reader rule (prevents intermittent 500s on category/search pages after agent/template drift).",
+      "phase": "pre_migrate",
       "downtimeMinutes": 0,
-      "scope": "deploy"
+      "scope": "environment"
+    },
+    {
+      "id": "restart-varnish-after-maintenance-disable",
+      "description": "When deploys disable Magento maintenance mode, immediately force-restart the Varnish service and wait for all desired Varnish tasks to be Running so cached maintenance responses are flushed across all replicas before traffic resumes. Also replaces the fixed 10s post-deploy Varnish sleep with task-state waiting.",
+      "phase": "deploy",
+      "downtimeMinutes": 0,
+      "scope": "stack"
     }
   ]
 }
