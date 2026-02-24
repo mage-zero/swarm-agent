@@ -119,4 +119,116 @@ describe('proxysql query rule upgrade migration', () => {
     expect(decodedScript).toContain('"radmin:radmin" "admin:admin"');
     expect(decodedScript).toContain('PROXYSQL_HOST="mz-env-15_proxysql"');
   });
+
+  it('skips without failing the upgrade when proxysql admin is not ready', async () => {
+    runCommandMock.mockImplementation(async (_cmd, args) => {
+      const a = args.map((value) => String(value));
+
+      if (a[0] === 'service' && a[1] === 'inspect' && a[2] === 'mz-env-5_proxysql' && a[4] === '{{json .}}') {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            Spec: {
+              TaskTemplate: {
+                ContainerSpec: { Image: '10.100.0.10:5000/mz-proxysql:env-5-test', Env: [] },
+                Networks: [{ Target: 'net-backend-id', Aliases: ['proxysql'] }],
+              },
+            },
+          }),
+          stderr: '',
+        };
+      }
+      if (a[0] === 'network' && a[1] === 'inspect' && a[2] === 'net-backend-id') {
+        return { code: 0, stdout: 'mz-backend\n', stderr: '' };
+      }
+      if (a[0] === 'service' && a[1] === 'ps' && a[2] === 'mz-env-5_proxysql' && a.includes('{{json .}}')) {
+        return {
+          code: 0,
+          stdout: `${JSON.stringify({
+            ID: 'task1',
+            Name: 'mz-env-5_proxysql.1',
+            Node: 'worker-node-1',
+            DesiredState: 'Running',
+            CurrentState: 'Running 5 seconds ago',
+            Error: '',
+          })}\n`,
+          stderr: '',
+        };
+      }
+      if (a[0] === 'service' && a[1] === 'create') {
+        return { code: 0, stdout: 'created-job-id\n', stderr: '' };
+      }
+      if (a[0] === 'service' && a[1] === 'ps' && a[2].startsWith('mz-rb-upgrade-proxysql-rules-')) {
+        return { code: 0, stdout: 'Failed 1 second ago|\n', stderr: '' };
+      }
+      if (a[0] === 'service' && a[1] === 'logs' && a[2].startsWith('mz-rb-upgrade-proxysql-rules-')) {
+        return { code: 0, stdout: 'proxysql admin not ready\n', stderr: '' };
+      }
+      if (a[0] === 'service' && a[1] === 'rm' && a[2].startsWith('mz-rb-upgrade-proxysql-rules-')) {
+        return { code: 0, stdout: '', stderr: '' };
+      }
+      return { code: 0, stdout: '', stderr: '' };
+    });
+
+    await expect(executeMigration('reconcile-proxysql-query-rules', {
+      environmentId: 5,
+      cloudSwarmDir: '/tmp/cloud-swarm',
+    })).resolves.toBe(true);
+  });
+
+  it('keeps non-readiness proxysql job failures fatal', async () => {
+    runCommandMock.mockImplementation(async (_cmd, args) => {
+      const a = args.map((value) => String(value));
+
+      if (a[0] === 'service' && a[1] === 'inspect' && a[2] === 'mz-env-5_proxysql' && a[4] === '{{json .}}') {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            Spec: {
+              TaskTemplate: {
+                ContainerSpec: { Image: '10.100.0.10:5000/mz-proxysql:env-5-test', Env: [] },
+                Networks: [{ Target: 'net-backend-id', Aliases: ['proxysql'] }],
+              },
+            },
+          }),
+          stderr: '',
+        };
+      }
+      if (a[0] === 'network' && a[1] === 'inspect' && a[2] === 'net-backend-id') {
+        return { code: 0, stdout: 'mz-backend\n', stderr: '' };
+      }
+      if (a[0] === 'service' && a[1] === 'ps' && a[2] === 'mz-env-5_proxysql' && a.includes('{{json .}}')) {
+        return {
+          code: 0,
+          stdout: `${JSON.stringify({
+            ID: 'task1',
+            Name: 'mz-env-5_proxysql.1',
+            Node: 'worker-node-1',
+            DesiredState: 'Running',
+            CurrentState: 'Running 5 seconds ago',
+            Error: '',
+          })}\n`,
+          stderr: '',
+        };
+      }
+      if (a[0] === 'service' && a[1] === 'create') {
+        return { code: 0, stdout: 'created-job-id\n', stderr: '' };
+      }
+      if (a[0] === 'service' && a[1] === 'ps' && a[2].startsWith('mz-rb-upgrade-proxysql-rules-')) {
+        return { code: 0, stdout: 'Failed 1 second ago|\n', stderr: '' };
+      }
+      if (a[0] === 'service' && a[1] === 'logs' && a[2].startsWith('mz-rb-upgrade-proxysql-rules-')) {
+        return { code: 0, stdout: 'SQL syntax error near ...\n', stderr: '' };
+      }
+      if (a[0] === 'service' && a[1] === 'rm' && a[2].startsWith('mz-rb-upgrade-proxysql-rules-')) {
+        return { code: 0, stdout: '', stderr: '' };
+      }
+      return { code: 0, stdout: '', stderr: '' };
+    });
+
+    await expect(executeMigration('reconcile-proxysql-query-rules', {
+      environmentId: 5,
+      cloudSwarmDir: '/tmp/cloud-swarm',
+    })).rejects.toThrow(/SQL syntax error/i);
+  });
 });

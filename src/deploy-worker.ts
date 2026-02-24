@@ -1892,6 +1892,45 @@ async function ensureMonitoringDashboards(log: (msg: string) => void): Promise<v
  * Ensure the mz-monitoring overlay network and monitoring stack exist.
  * Idempotent: skips only when required monitoring services are present and healthy.
  */
+/** Configs defined in monitoring.yml that Docker Swarm treats as immutable. */
+const MONITORING_STACK_CONFIGS: Array<{ dockerName: string; filePath: string }> = [
+  { dockerName: 'mz-monitoring_mz-monitoring-otel-collector-config', filePath: 'config/monitoring/otel-collector-config.yaml' },
+  { dockerName: 'mz-monitoring_mz-monitoring-data-prepper-config', filePath: 'config/monitoring/data-prepper-config.yaml' },
+  { dockerName: 'mz-monitoring_mz-monitoring-data-prepper-pipelines', filePath: 'config/monitoring/data-prepper-pipelines.yaml' },
+];
+
+/**
+ * Docker Swarm configs are immutable — `docker stack deploy` silently keeps the
+ * old config even when the source file on disk has changed.  Compare each
+ * deployed config's content (base64 from `docker config inspect`) with the
+ * current file on disk and return true if any differ.
+ */
+async function monitoringConfigsStale(log: (msg: string) => void): Promise<boolean> {
+  for (const { dockerName, filePath } of MONITORING_STACK_CONFIGS) {
+    const diskPath = path.join(CLOUD_SWARM_DIR, filePath);
+    if (!fs.existsSync(diskPath)) continue;
+
+    const { code, stdout } = await runCommandCaptureWithStatus(
+      'docker', ['config', 'inspect', dockerName, '--format', '{{json .Spec.Data}}'],
+    );
+    if (code !== 0) continue; // config doesn't exist yet — will be created on deploy
+
+    let deployedBase64: string;
+    try {
+      deployedBase64 = JSON.parse(stdout.trim());
+    } catch {
+      continue;
+    }
+
+    const diskBase64 = fs.readFileSync(diskPath).toString('base64');
+    if (deployedBase64 !== diskBase64) {
+      log(`monitoring config ${filePath} is stale — will tear down stack for fresh deploy`);
+      return true;
+    }
+  }
+  return false;
+}
+
 async function ensureMonitoringStack(log: (msg: string) => void, envVars: NodeJS.ProcessEnv) {
   // 1. Ensure the mz-monitoring overlay network exists
   const { code: netCode } = await runCommandCaptureWithStatus(
@@ -1922,10 +1961,20 @@ async function ensureMonitoringStack(log: (msg: string) => void, envVars: NodeJS
     [...MONITORING_RUNTIME_SERVICES].filter((serviceName) => existingServices.has(serviceName)),
   );
   const healthy = missingServices.length === 0 && monitoringRuntimeHealthy(currentStatuses);
-  if (healthy) {
+  const configsStale = await monitoringConfigsStale(log);
+
+  if (healthy && !configsStale) {
     log('monitoring stack already deployed and healthy');
     await ensureMonitoringDashboards(log);
     return;
+  }
+
+  if (configsStale) {
+    // Docker Swarm configs are immutable — the only way to update them is to
+    // remove the stack (which frees the config names) and redeploy.
+    log('tearing down monitoring stack to refresh stale configs');
+    await runCommandCapture('docker', ['stack', 'rm', 'mz-monitoring']);
+    await delay(10_000);
   }
 
   if (missingServices.length) {

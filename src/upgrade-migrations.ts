@@ -299,6 +299,18 @@ async function reconcileProxySqlQueryRulesForEnvironment(environmentId: number):
     }
   }
 
+  // ProxySQL can still be booting / recovering during upgrades. Re-throwing this
+  // transient case causes the whole upgrade plan to fail and the manager retry
+  // loop to spawn a new runbook job every minute, which churns the mz-backend
+  // overlay network. Keep other failures fatal.
+  if (lastError && /proxysql admin not ready/i.test(lastError.message)) {
+    console.warn(
+      `upgrade.migration.reconcile_proxysql_query_rules: env=${environmentId} `
+      + 'skipped (proxysql admin not ready; will reconcile on a later deploy)'
+    );
+    return;
+  }
+
   throw lastError || new Error(`ProxySQL query rules reconciliation failed for env ${environmentId}`);
 }
 

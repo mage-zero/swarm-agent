@@ -1,7 +1,7 @@
 {
   "version": "0.4.58",
   "date": "2026-02-24",
-  "summary": "Reconcile ProxySQL query rules on upgrade and flush Varnish after maintenance mode exits",
+  "summary": "Reconcile ProxySQL query rules on upgrade, flush Varnish after maintenance mode exits, and auto-refresh stale monitoring configs",
   "requires": {
     "cloud-swarm": ">=1.0.22"
   },
@@ -16,6 +16,13 @@
     {
       "id": "restart-varnish-after-maintenance-disable",
       "description": "When deploys disable Magento maintenance mode, immediately force-restart the Varnish service and wait for all desired Varnish tasks to be Running so cached maintenance responses are flushed across all replicas before traffic resumes. Also replaces the fixed 10s post-deploy Varnish sleep with task-state waiting.",
+      "phase": "deploy",
+      "downtimeMinutes": 0,
+      "scope": "stack"
+    },
+    {
+      "id": "reconcile-stale-monitoring-configs",
+      "description": "Before each monitoring stack deploy, compare deployed Docker Swarm config content with the current files on disk. When configs are stale (Docker Swarm configs are immutable so docker stack deploy silently keeps old content), tear down the monitoring stack and redeploy so changes like new otel-collector receivers actually take effect.",
       "phase": "deploy",
       "downtimeMinutes": 0,
       "scope": "stack"
