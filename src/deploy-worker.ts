@@ -201,7 +201,18 @@ const DEPLOY_AGGRESSIVE_PRUNE_SUCCESS_LOOKBACK_HOURS = Math.max(
 );
 const DEPLOY_ABORT_MIN_FREE_GB = Number(process.env.MZ_DEPLOY_ABORT_MIN_FREE_GB || 5);
 const DEPLOY_BUILD_RETRIES = Math.max(0, Number(process.env.MZ_DEPLOY_BUILD_RETRIES || 1));
-const DEPLOY_SKIP_SERVICE_BUILD_IF_PRESENT = (process.env.MZ_DEPLOY_SKIP_SERVICE_BUILD_IF_PRESENT || '1') !== '0';
+// Legacy precheck: skip build-services when service image tags already exist.
+// Default is now OFF because tag existence alone can bypass cloud-swarm's smarter
+// rebuild invalidation (cloud-swarm ref/base digest labels), leaving stale base
+// images such as mz-php-fpm in the registry.
+function resolveSkipServiceBuildIfPresent(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = String(env.MZ_DEPLOY_SKIP_SERVICE_BUILD_IF_PRESENT ?? '').trim();
+  if (!raw) {
+    return false;
+  }
+  return raw !== '0';
+}
+const DEPLOY_SKIP_SERVICE_BUILD_IF_PRESENT = resolveSkipServiceBuildIfPresent();
 const DEPLOY_SKIP_APP_BUILD_IF_PRESENT = (process.env.MZ_DEPLOY_SKIP_APP_BUILD_IF_PRESENT || '1') !== '0';
 const setupDbStatusTimeoutParsed = Number(process.env.MZ_SETUP_DB_STATUS_TIMEOUT_SECONDS || 120);
 const SETUP_DB_STATUS_TIMEOUT_SECONDS = Math.max(
@@ -4090,13 +4101,17 @@ async function processDeployment(recordPath: string) {
   progress.start('build_images');
   const missingServiceImages = DEPLOY_SKIP_SERVICE_BUILD_IF_PRESENT
     ? await collectMissingServiceImages(envVars)
-    : ['forced'];
-  if (!missingServiceImages.length) {
+    : null;
+  if (DEPLOY_SKIP_SERVICE_BUILD_IF_PRESENT && missingServiceImages && !missingServiceImages.length) {
     progress.detail('build_images', 'Skipping service image build (images present in registry)');
     log('base service images already present in registry; skipping build-services');
   } else {
-    progress.detail('build_images', 'Building service images (database, search, cache)');
-    log(`building service images; missing: ${missingServiceImages.join(', ')}`);
+    progress.detail('build_images', 'Ensuring service images are current');
+    if (DEPLOY_SKIP_SERVICE_BUILD_IF_PRESENT && missingServiceImages) {
+      log(`building service images; missing: ${missingServiceImages.join(', ')}`);
+    } else {
+      log('ensuring service images are current via build-services (tag-only precheck disabled)');
+    }
     await runCommandLoggedWithRetry(
       'bash',
       [path.join(CLOUD_SWARM_DIR, 'scripts/build-services.sh')],
@@ -5046,6 +5061,7 @@ export const __testing = {
   resolveDatadogTraceEnv,
   resolveAppHaReplicaPolicy,
   resolveFrontendRuntimePolicy,
+  resolveSkipServiceBuildIfPresent,
   buildProxySqlQueryRulesSql,
   getQueueSourceDirs,
   resolveAggressivePruneCutoffSeconds,
