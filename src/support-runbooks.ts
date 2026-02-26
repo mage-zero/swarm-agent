@@ -37,6 +37,22 @@ const DEPLOY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 const STACK_MASTER_PUBLIC_KEY_PATH = process.env.MZ_STACK_MASTER_PUBLIC_KEY_PATH || '/etc/magezero/stack_master_ssh.pub';
 const STACK_MASTER_KEY_PATH = process.env.MZ_STACK_MASTER_KEY_PATH || '/etc/magezero/stack_master_ssh';
 const DEFAULT_DB_RESTORE_OBJECT = process.env.MZ_DB_BACKUP_OBJECT || 'provisioning-database.sql.zst.age';
+const SCD_DB_SNAPSHOT_PROFILE = 'scd-minimal-v1';
+const SCD_DB_SNAPSHOT_TABLES = ['core_config_data', 'store', 'store_group', 'store_website', 'theme', 'translation'] as const;
+const SCD_DB_SNAPSHOT_OPTIONAL_TABLES = new Set<string>(['translation']);
+const SCD_DB_SNAPSHOT_PAYLOAD_BEGIN = 'MZ_SCD_DB_SNAPSHOT_PAYLOAD_BEGIN';
+const SCD_DB_SNAPSHOT_PAYLOAD_END = 'MZ_SCD_DB_SNAPSHOT_PAYLOAD_END';
+const DEFAULT_SCD_DB_REDACT_PATH_PATTERNS = [
+  '~(?:^|/)(?:password|passwd)(?:$|/)~i',
+  '~(?:^|/)(?:secret|secret_key|client_secret)(?:$|/)~i',
+  '~(?:^|/)(?:token|access_token|refresh_token)(?:$|/)~i',
+  '~(?:^|/)(?:api_key|access_key|private_key)(?:$|/)~i',
+  '~(?:^|/)(?:license_key|serial|signature)(?:$|/)~i',
+] as const;
+const DEFAULT_SCD_DB_REDACT_VALUE_PATTERNS = [
+  // Magento encrypted payloads are commonly base64-like strings with enough length/entropy.
+  '~^[A-Za-z0-9+/]{32,}={0,2}$~',
+] as const;
 
 type RunbookDefinition = {
   id: string;
@@ -1213,6 +1229,220 @@ function parseProxySqlHostgroups(raw: string): Array<{ hostgroup: number; hostna
     .filter((row) => Number.isFinite(row.hostgroup) && row.hostgroup > 0 && row.hostname !== '');
 }
 
+type ScdDbSnapshotPayload = {
+  profile: string;
+  environment_id: number;
+  generated_at: string;
+  root_path: string;
+  included_tables: string[];
+  skipped_tables: string[];
+  row_counts: Record<string, number>;
+  redaction: {
+    path_patterns: string[];
+    value_patterns: string[];
+    redacted_rows: number;
+    redacted_rows_by_path: number;
+    redacted_rows_by_value: number;
+  };
+  sql_gz_sha256: string;
+  sql_gz_base64: string;
+};
+
+function normalizeScdDbRedactPathPatterns(input: unknown): string[] {
+  const fromInput = Array.isArray(input)
+    ? input.filter((value): value is string => typeof value === 'string').map((value) => value.trim()).filter(Boolean)
+    : [];
+  const unique = new Set<string>([...DEFAULT_SCD_DB_REDACT_PATH_PATTERNS, ...fromInput]);
+  const valid: string[] = [];
+  for (const pattern of unique) {
+    try {
+      // Validate the supplied PCRE pattern locally before passing it into the PHP exporter.
+      void new RegExp(pattern.replace(/^~|~[a-z]*$/gi, ''));
+      valid.push(pattern);
+    } catch {
+      // Ignore invalid caller-supplied patterns. Defaults are known-good.
+    }
+  }
+  return valid.length ? valid : Array.from(DEFAULT_SCD_DB_REDACT_PATH_PATTERNS);
+}
+
+function normalizeScdDbRedactValuePatterns(input: unknown): string[] {
+  const fromInput = Array.isArray(input)
+    ? input.filter((value): value is string => typeof value === 'string').map((value) => value.trim()).filter(Boolean)
+    : [];
+  const unique = new Set<string>([...DEFAULT_SCD_DB_REDACT_VALUE_PATTERNS, ...fromInput]);
+  const valid: string[] = [];
+  for (const pattern of unique) {
+    try {
+      void new RegExp(pattern.replace(/^~|~[a-z]*$/gi, ''));
+      valid.push(pattern);
+    } catch {
+      // Ignore invalid caller-supplied patterns. Defaults are known-good.
+    }
+  }
+  return valid.length ? valid : Array.from(DEFAULT_SCD_DB_REDACT_VALUE_PATTERNS);
+}
+
+function parseScdDbSnapshotPayload(logs: string): ScdDbSnapshotPayload | null {
+  const startIdx = logs.indexOf(SCD_DB_SNAPSHOT_PAYLOAD_BEGIN);
+  if (startIdx === -1) return null;
+  const endIdx = logs.indexOf(SCD_DB_SNAPSHOT_PAYLOAD_END, startIdx + SCD_DB_SNAPSHOT_PAYLOAD_BEGIN.length);
+  if (endIdx === -1) return null;
+  const payloadText = logs
+    .slice(startIdx + SCD_DB_SNAPSHOT_PAYLOAD_BEGIN.length, endIdx)
+    .replace(/^\s+|\s+$/g, '');
+  if (!payloadText) return null;
+  try {
+    const parsed = JSON.parse(payloadText) as ScdDbSnapshotPayload;
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (typeof parsed.sql_gz_base64 !== 'string' || !parsed.sql_gz_base64) return null;
+    if (!Array.isArray(parsed.included_tables)) return null;
+    if (!parsed.redaction || typeof parsed.redaction !== 'object') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function buildScdDbSnapshotExporterScript(environmentId: number, input: Record<string, unknown>): string {
+  const profile = String(input.profile ?? SCD_DB_SNAPSHOT_PROFILE).trim() || SCD_DB_SNAPSHOT_PROFILE;
+  const redactPathPatterns = normalizeScdDbRedactPathPatterns(input.redact_path_patterns);
+  const redactValuePatterns = normalizeScdDbRedactValuePatterns(input.redact_value_patterns);
+  const config = {
+    profile,
+    environment_id: environmentId,
+    tables: Array.from(SCD_DB_SNAPSHOT_TABLES),
+    optional_tables: Array.from(SCD_DB_SNAPSHOT_OPTIONAL_TABLES),
+    redact_path_patterns: redactPathPatterns,
+    redact_value_patterns: redactValuePatterns,
+    payload_begin: SCD_DB_SNAPSHOT_PAYLOAD_BEGIN,
+    payload_end: SCD_DB_SNAPSHOT_PAYLOAD_END,
+  };
+  const cfgB64 = Buffer.from(JSON.stringify(config), 'utf8').toString('base64');
+  return [
+    `export MZ_SCD_DB_SNAPSHOT_CFG_B64='${cfgB64}'`,
+    "cat > /tmp/mz-scd-db-snapshot.php <<'PHP'",
+    "<?php",
+    "error_reporting(E_ALL & ~E_NOTICE & ~E_WARNING);",
+    "$cfg = json_decode(base64_decode((string)getenv('MZ_SCD_DB_SNAPSHOT_CFG_B64')), true);",
+    "if (!is_array($cfg)) { fwrite(STDERR, 'invalid config'.PHP_EOL); exit(2); }",
+    "$roots = ['/var/www/html/magento', '/var/www/html'];",
+    "$root = null;",
+    "foreach ($roots as $candidate) { if (is_file($candidate . '/app/etc/env.php')) { $root = $candidate; break; } }",
+    "if (!$root) { fwrite(STDERR, 'app/etc/env.php not found'.PHP_EOL); exit(3); }",
+    "$env = require $root . '/app/etc/env.php';",
+    "if (!is_array($env)) { fwrite(STDERR, 'invalid env.php'.PHP_EOL); exit(4); }",
+    "$db = $env['db']['connection']['default'] ?? [];",
+    "$host = (string)($db['host'] ?? '');",
+    "$port = (int)($db['port'] ?? 3306);",
+    "$dbname = (string)($db['dbname'] ?? 'magento');",
+    "$user = (string)($db['username'] ?? '');",
+    "$pass = (string)($db['password'] ?? '');",
+    "if ($host === '' || $user === '') { fwrite(STDERR, 'db connection missing in env.php'.PHP_EOL); exit(5); }",
+    "$dsn = sprintf('mysql:host=%s;port=%d;dbname=%s;charset=utf8mb4', $host, $port ?: 3306, $dbname);",
+    "$options = [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC];",
+    "if (defined('PDO::MYSQL_ATTR_INIT_COMMAND')) { $options[PDO::MYSQL_ATTR_INIT_COMMAND] = 'SET NAMES utf8mb4'; }",
+    "$pdo = new PDO($dsn, $user, $pass, $options);",
+    "$tables = array_values(array_filter(array_map('strval', (array)($cfg['tables'] ?? []))));",
+    "$optional = array_fill_keys(array_values(array_filter(array_map('strval', (array)($cfg['optional_tables'] ?? [])))), true);",
+    "$pathPatterns = array_values(array_filter(array_map('strval', (array)($cfg['redact_path_patterns'] ?? []))));",
+    "$valuePatterns = array_values(array_filter(array_map('strval', (array)($cfg['redact_value_patterns'] ?? []))));",
+    "$tableExists = function(string $table) use ($pdo): bool {",
+    "  $stmt = $pdo->prepare('SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1');",
+    "  $stmt->execute([$table]);",
+    "  return (bool)$stmt->fetchColumn();",
+    "};",
+    "$matchesAnyPattern = function(string $value, array $patternList): bool {",
+    "  foreach ($patternList as $pattern) { if (@preg_match($pattern, $value)) { if (preg_match($pattern, $value)) return true; } }",
+    "  return false;",
+    "};",
+    "$isSensitivePath = function(string $path) use ($matchesAnyPattern, $pathPatterns): bool {",
+    "  return $matchesAnyPattern($path, $pathPatterns);",
+    "};",
+    "$isSensitiveValue = function($value) use ($matchesAnyPattern, $valuePatterns): bool {",
+    "  if ($value === null) return false;",
+    "  if (!is_scalar($value)) return false;",
+    "  return $matchesAnyPattern((string)$value, $valuePatterns);",
+    "};",
+    "$sqlValue = function($value) use ($pdo): string {",
+    "  if ($value === null) return 'NULL';",
+    "  if (is_bool($value)) return $value ? '1' : '0';",
+    "  if (is_int($value) || is_float($value)) return (string)$value;",
+    "  return $pdo->quote((string)$value);",
+    "};",
+    "$lines = [];",
+    "$lines[] = 'SET FOREIGN_KEY_CHECKS=0;';",
+    "$included = []; $skipped = []; $rowCounts = []; $redacted = 0; $redactedByPath = 0; $redactedByValue = 0;",
+    "foreach ($tables as $table) {",
+    "  if (!preg_match('/^[A-Za-z0-9_]+$/', $table)) continue;",
+    "  if (!$tableExists($table)) { if (isset($optional[$table])) { $skipped[] = $table; continue; } throw new RuntimeException('Missing required table: ' . $table); }",
+    "  $createRow = $pdo->query('SHOW CREATE TABLE `'.$table.'`')->fetch(PDO::FETCH_ASSOC);",
+    "  if (!is_array($createRow) || !isset($createRow['Create Table'])) throw new RuntimeException('SHOW CREATE TABLE failed for ' . $table);",
+    "  $lines[] = 'DROP TABLE IF EXISTS `'.$table.'`;';",
+    "  $lines[] = rtrim((string)$createRow['Create Table']) . ';';",
+    "  $orderBy = '';",
+    "  if ($table === 'core_config_data' && $tableExists('core_config_data')) { $orderBy = ' ORDER BY `config_id`'; }",
+    "  elseif ($table === 'store_website') { $orderBy = ' ORDER BY `website_id`'; }",
+    "  elseif ($table === 'store_group') { $orderBy = ' ORDER BY `group_id`'; }",
+    "  elseif ($table === 'store') { $orderBy = ' ORDER BY `store_id`'; }",
+    "  elseif ($table === 'theme') { $orderBy = ' ORDER BY `theme_id`'; }",
+    "  $stmt = $pdo->query('SELECT * FROM `'.$table.'`' . $orderBy);",
+    "  $count = 0;",
+    "  while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {",
+    "    $cols = []; $vals = [];",
+    "    $redactRow = false;",
+    "    $redactBy = '';",
+    "    if ($table === 'core_config_data') {",
+    "      $rowPath = (string)($row['path'] ?? '');",
+    "      if ($isSensitivePath($rowPath)) { $redactRow = true; $redactBy = 'path'; }",
+    "      elseif ($isSensitiveValue($row['value'] ?? null)) { $redactRow = true; $redactBy = 'value'; }",
+    "    }",
+    "    foreach ($row as $col => $val) {",
+    "      $cols[] = '`' . str_replace('`', '``', (string)$col) . '`';",
+    "      if ($table === 'core_config_data' && $col === 'value' && $redactRow) {",
+    "        $val = '';",
+    "        $redacted++;",
+    "        if ($redactBy === 'path') { $redactedByPath++; }",
+    "        elseif ($redactBy === 'value') { $redactedByValue++; }",
+    "      }",
+    "      $vals[] = $sqlValue($val);",
+    "    }",
+    "    $lines[] = 'INSERT INTO `'.$table.'` (' . implode(', ', $cols) . ') VALUES (' . implode(', ', $vals) . ');';",
+    "    $count++;",
+    "  }",
+    "  $rowCounts[$table] = $count;",
+    "  $included[] = $table;",
+    "}",
+    "$lines[] = 'SET FOREIGN_KEY_CHECKS=1;';",
+    "$sql = implode(PHP_EOL, $lines) . PHP_EOL;",
+    "$gz = gzencode($sql, 9);",
+    "if ($gz === false) { fwrite(STDERR, 'gzencode failed'.PHP_EOL); exit(6); }",
+    "$payload = [",
+    "  'profile' => (string)($cfg['profile'] ?? 'scd-minimal-v1'),",
+    "  'environment_id' => (int)($cfg['environment_id'] ?? 0),",
+    "  'generated_at' => gmdate('c'),",
+    "  'root_path' => $root,",
+    "  'included_tables' => array_values($included),",
+    "  'skipped_tables' => array_values($skipped),",
+    "  'row_counts' => $rowCounts,",
+    "  'redaction' => [",
+    "    'path_patterns' => $pathPatterns,",
+    "    'value_patterns' => $valuePatterns,",
+    "    'redacted_rows' => $redacted,",
+    "    'redacted_rows_by_path' => $redactedByPath,",
+    "    'redacted_rows_by_value' => $redactedByValue,",
+    "  ],",
+    "  'sql_gz_sha256' => hash('sha256', $gz),",
+    "  'sql_gz_base64' => base64_encode($gz),",
+    "];",
+    "echo (string)($cfg['payload_begin'] ?? 'MZ_SCD_DB_SNAPSHOT_PAYLOAD_BEGIN') . PHP_EOL;",
+    "echo json_encode($payload, JSON_UNESCAPED_SLASHES) . PHP_EOL;",
+    "echo (string)($cfg['payload_end'] ?? 'MZ_SCD_DB_SNAPSHOT_PAYLOAD_END') . PHP_EOL;",
+    "PHP",
+    'php /tmp/mz-scd-db-snapshot.php',
+  ].join('\n');
+}
+
 async function runServiceJob(
   environmentId: number,
   serviceName: string,
@@ -2062,6 +2292,8 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
       return runDbBackup(environmentId, input);
     case 'db_restore_provisioning':
       return runDbRestoreProvisioning(environmentId, input);
+    case 'magento_scd_db_snapshot':
+      return runMagentoScdDbSnapshot(environmentId, input);
     case 'environment_teardown':
       return runEnvironmentTeardown(environmentId, input);
     case 'proxysql_restart':
@@ -2159,6 +2391,72 @@ async function stripDefiners(inputPath: string, outputPath: string) {
     });
     rl.on('error', reject);
   });
+}
+
+async function runMagentoScdDbSnapshot(environmentId: number, input: Record<string, unknown>): Promise<RunbookResult> {
+  const runbookId = 'magento_scd_db_snapshot';
+  const script = buildScdDbSnapshotExporterScript(environmentId, input);
+  const preferredService = String(input.service_name ?? '').trim();
+  const servicesToTry = preferredService
+    ? [preferredService, 'php-fpm-admin', 'php-fpm']
+    : ['php-fpm-admin', 'php-fpm'];
+  const seen = new Set<string>();
+  const orderedServices = servicesToTry.filter((name) => {
+    const normalized = String(name || '').trim();
+    if (!normalized || seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  });
+
+  let lastFailure: { service: string; job?: Awaited<ReturnType<typeof runServiceJob>> } | null = null;
+  for (const service of orderedServices) {
+    const job = await runServiceJob(environmentId, service, 'scd-db-snapshot', script, { timeout_ms: 10 * 60_000 });
+    if (!job.ok) {
+      lastFailure = { service, job };
+      continue;
+    }
+    const payload = parseScdDbSnapshotPayload(job.logs || '');
+    if (!payload) {
+      lastFailure = { service, job };
+      continue;
+    }
+    const rowCounts = payload.row_counts || {};
+    const rowCountSummary = Object.entries(rowCounts)
+      .map(([table, count]) => `${table}=${Number(count || 0)}`)
+      .join(', ');
+    return {
+      runbook_id: runbookId,
+      status: 'ok',
+      summary: `Generated sanitized SCD DB snapshot via ${service}.`,
+      observations: [
+        `Service: ${service}`,
+        `Profile: ${payload.profile || SCD_DB_SNAPSHOT_PROFILE}`,
+        `Included tables: ${(payload.included_tables || []).join(', ') || '(none)'}`,
+        payload.skipped_tables?.length ? `Skipped optional tables: ${payload.skipped_tables.join(', ')}` : '',
+        rowCountSummary ? `Row counts: ${rowCountSummary}` : '',
+        `Redacted core_config_data rows: ${Number(payload.redaction?.redacted_rows ?? 0)}`,
+        `Redacted by path: ${Number(payload.redaction?.redacted_rows_by_path ?? 0)}`,
+        `Redacted by value: ${Number(payload.redaction?.redacted_rows_by_value ?? 0)}`,
+        `sql.gz sha256: ${payload.sql_gz_sha256 || ''}`,
+      ].filter(Boolean),
+      data: payload as unknown as Record<string, unknown>,
+    };
+  }
+
+  const failureLogs = String(lastFailure?.job?.logs || '').trim();
+  const failureDetail = [
+    `Tried services: ${orderedServices.join(', ')}`,
+    lastFailure?.service ? `Last service: ${lastFailure.service}` : '',
+    lastFailure?.job?.error ? `Last error: ${lastFailure.job.error}` : '',
+    lastFailure?.job?.state ? `Last state: ${lastFailure.job.state}` : '',
+    failureLogs ? `Last logs (tail): ${tailLines(failureLogs, 20)}` : '',
+  ].filter(Boolean);
+  return {
+    runbook_id: runbookId,
+    status: 'failed',
+    summary: 'Failed to generate SCD DB snapshot.',
+    observations: failureDetail,
+  };
 }
 
 async function runDbRestoreProvisioning(environmentId: number, input: Record<string, unknown>): Promise<RunbookResult> {
@@ -5020,6 +5318,10 @@ export const __testing = {
   parseDbReplicationProbe,
   buildDbProbeScript,
   parseProxySqlHostgroups,
+  parseScdDbSnapshotPayload,
+  normalizeScdDbRedactPathPatterns,
+  normalizeScdDbRedactValuePatterns,
+  buildScdDbSnapshotExporterScript,
   parseNodeResourceStats,
   hasCapacityPlacementSignal,
   normalizeProfileType,

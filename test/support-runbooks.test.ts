@@ -117,6 +117,75 @@ describe('support-runbooks helpers', () => {
     ]);
   });
 
+  it('normalizes SCD DB snapshot redact path patterns and keeps defaults', () => {
+    const patterns = __testing.normalizeScdDbRedactPathPatterns([
+      '~(?:^|/)(?:custom_secret)(?:$|/)~i',
+      'invalid(',
+      '',
+    ]);
+    expect(patterns.some((pattern: string) => pattern.includes('password'))).toBe(true);
+    expect(patterns).toContain('~(?:^|/)(?:custom_secret)(?:$|/)~i');
+    expect(patterns).not.toContain('invalid(');
+  });
+
+  it('normalizes SCD DB snapshot redact value patterns and keeps defaults', () => {
+    const patterns = __testing.normalizeScdDbRedactValuePatterns([
+      '~^ENC\\[[^\\]]+\\]$~',
+      'invalid(',
+      '',
+    ]);
+    expect(patterns.some((pattern: string) => pattern.includes('A-Za-z0-9+/'))).toBe(true);
+    expect(patterns).toContain('~^ENC\\[[^\\]]+\\]$~');
+    expect(patterns).not.toContain('invalid(');
+  });
+
+  it('parses SCD DB snapshot payload from runServiceJob logs', () => {
+    const payload = {
+      profile: 'scd-minimal-v1',
+      environment_id: 15,
+      generated_at: '2026-02-26T00:00:00Z',
+      root_path: '/var/www/html/magento',
+      included_tables: ['core_config_data'],
+      skipped_tables: ['translation'],
+      row_counts: { core_config_data: 123 },
+      redaction: {
+        path_patterns: ['~secret~i'],
+        value_patterns: ['~^[A-Za-z0-9+/]{32,}={0,2}$~'],
+        redacted_rows: 4,
+        redacted_rows_by_path: 3,
+        redacted_rows_by_value: 1,
+      },
+      sql_gz_sha256: 'abc123',
+      sql_gz_base64: 'H4sIAAAAAAAA/woA',
+    };
+    const logs = [
+      'some preamble',
+      'MZ_SCD_DB_SNAPSHOT_PAYLOAD_BEGIN',
+      JSON.stringify(payload),
+      'MZ_SCD_DB_SNAPSHOT_PAYLOAD_END',
+      'some epilogue',
+    ].join('\n');
+    const parsed = __testing.parseScdDbSnapshotPayload(logs);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.environment_id).toBe(15);
+    expect(parsed?.redaction.redacted_rows).toBe(4);
+    expect(parsed?.included_tables).toEqual(['core_config_data']);
+  });
+
+  it('builds SCD DB snapshot exporter script with embedded config markers', () => {
+    const script = __testing.buildScdDbSnapshotExporterScript(15, {
+      profile: 'scd-minimal-v1',
+      redact_path_patterns: ['~custom_sensitive~i'],
+      redact_value_patterns: ['~^ENC\\[[^\\]]+\\]$~'],
+    });
+    expect(script).toContain('MZ_SCD_DB_SNAPSHOT_CFG_B64');
+    expect(script).toContain("cat > /tmp/mz-scd-db-snapshot.php <<'PHP'");
+    expect(script).toContain('MZ_SCD_DB_SNAPSHOT_PAYLOAD_BEGIN');
+    expect(script).toContain('redact_value_patterns');
+    expect(script).toContain('redacted_rows_by_value');
+    expect(script).toContain('php /tmp/mz-scd-db-snapshot.php');
+  });
+
   it('registers deploy_retry_latest runbook as remediation', async () => {
     const runbooks = await listRunbooks();
     const retry = runbooks.find((entry) => entry.id === 'deploy_retry_latest');

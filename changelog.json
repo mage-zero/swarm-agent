@@ -1,17 +1,17 @@
 {
-  "version": "0.4.61",
-  "date": "2026-02-25",
-  "summary": "Always run build-services by default so cloud-swarm base image changes rebuild stale service images",
+  "version": "0.4.62",
+  "date": "2026-02-26",
+  "summary": "Add sanitized Magento SCD DB snapshot export runbook for CI builds",
   "requires": {
     "cloud-swarm": ">=1.0.22"
   },
   "changes": [
     {
-      "id": "disable-tag-only-service-build-preskip-by-default",
-      "description": "Swarm-agent no longer skips cloud-swarm/scripts/build-services.sh by default just because mz-php-fpm/mz-nginx/etc tags already exist in the registry. The old tag-only precheck could bypass cloud-swarm's image-label/base-digest rebuild invalidation and leave stale base images (for example an old mz-php-fpm entrypoint) in use during Magento image rebuilds. The legacy behavior remains available by explicitly setting MZ_DEPLOY_SKIP_SERVICE_BUILD_IF_PRESENT=1.",
+      "id": "add-sanitized-magento-scd-db-snapshot-runbook",
+      "description": "Adds a support runbook for CI build-time static-content deployment that exports a minimal Magento database snapshot (store/theme/config tables) from the environment's PHP service. core_config_data rows are preserved while sensitive values are redacted by path and encrypted-value patterns, and the payload is returned as a compressed snapshot for mz-control/build consumption.",
       "phase": "deploy",
       "downtimeMinutes": 0,
-      "scope": "stack"
+      "scope": "environment"
     }
   ]
 }
