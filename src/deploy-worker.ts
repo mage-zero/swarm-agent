@@ -2658,14 +2658,23 @@ async function ensureMagentoEnvWrapper(containerId: string) {
     '  elif ! grep -q "env.base.php" /var/www/html/magento/app/etc/env.php; then',
     '    cp /var/www/html/magento/app/etc/env.php /var/www/html/magento/app/etc/env.base.php;',
     '  fi;',
-    '  cp /usr/local/share/mz-env.php /var/www/html/magento/app/etc/env.php;',
-    '  chown www-data:www-data /var/www/html/magento/app/etc/env.php /var/www/html/magento/app/etc/env.base.php;',
     'fi',
     ';',
+    'if [ ! -f /var/www/html/magento/app/etc/env.base.php ] && [ -f /var/www/html/magento/app/etc/env.warden.php ]; then',
+    '  cp /var/www/html/magento/app/etc/env.warden.php /var/www/html/magento/app/etc/env.base.php;',
+    'fi',
+    ';',
+    'if [ ! -f /var/www/html/magento/app/etc/env.base.php ]; then',
+    '  printf "%s\\n" "<?php" "return [];" > /var/www/html/magento/app/etc/env.base.php;',
+    'fi',
+    ';',
+    'cp /usr/local/share/mz-env.php /var/www/html/magento/app/etc/env.php;',
+    'chown www-data:www-data /var/www/html/magento/app/etc/env.php /var/www/html/magento/app/etc/env.base.php;',
+    ';',
     'if [ -f /var/www/html/magento/app/etc/config.php ]; then',
-    '  if [ ! -f /var/www/html/magento/app/etc/config.base.php ]; then',
-    '    cp /var/www/html/magento/app/etc/config.php /var/www/html/magento/app/etc/config.base.php;',
-    '  elif ! grep -q "config.base.php" /var/www/html/magento/app/etc/config.php; then',
+      '  if [ ! -f /var/www/html/magento/app/etc/config.base.php ]; then',
+      '    cp /var/www/html/magento/app/etc/config.php /var/www/html/magento/app/etc/config.base.php;',
+      '  elif ! grep -q "config.base.php" /var/www/html/magento/app/etc/config.php; then',
     '    cp /var/www/html/magento/app/etc/config.php /var/www/html/magento/app/etc/config.base.php;',
     '  fi;',
     '  cp /usr/local/share/mz-config.php /var/www/html/magento/app/etc/config.php;',
@@ -4470,6 +4479,12 @@ async function processDeployment(recordPath: string) {
   await waitForRedisCache(adminContainerId, stackName, 5 * 60 * 1000);
   progress.detail('app_prepare', 'Applying runtime configuration');
   adminContainerId = await ensureMagentoEnvWrapperWithRetry(adminContainerId, stackName, log);
+  if (webContainerId) {
+    await ensureMagentoEnvWrapper(webContainerId).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`php-fpm env/config wrapper setup skipped: ${message}`);
+    });
+  }
   progress.ok('app_prepare');
 
   progress.start('magento_steps');

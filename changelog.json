@@ -1,15 +1,15 @@
 {
-  "version": "0.4.62",
-  "date": "2026-02-26",
-  "summary": "Add sanitized Magento SCD DB snapshot export runbook for CI builds",
+  "version": "0.4.63",
+  "date": "2026-02-27",
+  "summary": "Ensure deploy wrapper bootstraps env.php when artifact omits it",
   "requires": {
     "cloud-swarm": ">=1.0.22"
   },
   "changes": [
     {
-      "id": "add-sanitized-magento-scd-db-snapshot-runbook",
-      "description": "Adds a support runbook for CI build-time static-content deployment that exports a minimal Magento database snapshot (store/theme/config tables) from the environment's PHP service. core_config_data rows are preserved while sensitive values are redacted by path and encrypted-value patterns, and the payload is returned as a compressed snapshot for mz-control/build consumption.",
-      "phase": "deploy",
+      "id": "bootstrap-env-wrapper-when-env-php-missing",
+      "description": "Updates deploy-time env/config wrapper setup so Magento artifacts that do not include app/etc/env.php are still bootstrapped correctly. The agent now creates env.base.php from env.warden.php (or an empty fallback), writes wrapper env.php unconditionally, and applies wrapper setup to both php-fpm-admin and the local php-fpm storefront container to prevent frontend 500s.",
+      "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
     }
