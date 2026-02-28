@@ -1,14 +1,14 @@
 {
-  "version": "0.4.64",
-  "date": "2026-02-27",
-  "summary": "Fix deploy wrapper shell syntax regression blocking env/config bootstrap",
+  "version": "0.4.65",
+  "date": "2026-02-28",
+  "summary": "Harden ProxySQL temp-table routing reconciliation during deploys",
   "requires": {
     "cloud-swarm": ">=1.0.22"
   },
   "changes": [
     {
-      "id": "fix-env-wrapper-shell-command-syntax",
-      "description": "Corrects the generated shell command used for deploy-time env/config wrapper setup. The wrapper script is now emitted as a valid multiline shell script without stray command separators, preventing php-fpm bootstrap failures and deployment aborts with `sh: syntax error: unexpected \";\"`.",
+      "id": "reconcile-proxysql-query-rules",
+      "description": "Deploy-time ProxySQL query-rule reconciliation now retries both known admin credentials and restores the broader temp-table writer rule used by the stack template. This prevents Magento `search_tmp_*`, `_tmp_*`, `_temp_*`, and `TEMPORARY` table reads from being misrouted to replicas after deploys, which was surfacing as missing temp-table exceptions on kit-builder pages.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "environment"

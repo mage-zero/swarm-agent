@@ -9,13 +9,15 @@ describe('ProxySQL query rules SQL builder', () => {
     expect(sql).toContain('SAVE MYSQL QUERY RULES TO DISK;');
   });
 
-  it('routes search_tmp_ traffic to writer before catch-all SELECT reader rule', () => {
+  it('routes temp-table traffic to writer before catch-all SELECT reader rule', () => {
     const sql = buildProxySqlQueryRulesSql();
-    expect(sql).toContain("VALUES (4, 1, 'search_tmp_', 10, 1, 0, NULL, 'CASELESS');");
-    expect(sql).toContain("VALUES (5, 1, '^SELECT', 20, 1, 0, NULL, 'CASELESS');");
-    expect(sql.indexOf("'search_tmp_'")).toBeGreaterThan(-1);
-    expect(sql.indexOf("'^SELECT'")).toBeGreaterThan(-1);
-    expect(sql.indexOf("'search_tmp_'")).toBeLessThan(sql.indexOf("'^SELECT'"));
+    const tempRule = "VALUES (4, 1, '(TEMPORARY|search_tmp_|\\btmp_|_tmp_|_tmp\\b|_temp_|_temp\\b)', 10, 1, 0, NULL, 'CASELESS');";
+    const selectRule = "VALUES (5, 1, '^SELECT', 20, 1, 0, NULL, 'CASELESS');";
+    expect(sql).toContain(tempRule);
+    expect(sql).toContain(selectRule);
+    expect(sql.indexOf(tempRule)).toBeGreaterThan(-1);
+    expect(sql.indexOf(selectRule)).toBeGreaterThan(-1);
+    expect(sql.indexOf(tempRule)).toBeLessThan(sql.indexOf(selectRule));
   });
 
   it('keeps transaction-start and transaction-end routes pinned to writer', () => {

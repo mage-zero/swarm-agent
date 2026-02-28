@@ -42,7 +42,7 @@ export const PROXYSQL_MANAGED_QUERY_RULES: ProxySqlQueryRuleSpec[] = [
   {
     rule_id: 4,
     active: 1,
-    match_pattern: 'search_tmp_',
+    match_pattern: '(TEMPORARY|search_tmp_|\\btmp_|_tmp_|_tmp\\b|_temp_|_temp\\b)',
     destination_hostgroup: 10,
     apply: 1,
     flagIN: 0,
