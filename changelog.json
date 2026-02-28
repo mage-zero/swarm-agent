@@ -1,15 +1,15 @@
 {
-  "version": "0.4.65",
+  "version": "0.4.66",
   "date": "2026-02-28",
-  "summary": "Harden ProxySQL temp-table routing reconciliation during deploys",
+  "summary": "Rebuild app images when cloud-swarm changed under the same artifact tag",
   "requires": {
     "cloud-swarm": ">=1.0.22"
   },
   "changes": [
     {
-      "id": "reconcile-proxysql-query-rules",
-      "description": "Deploy-time ProxySQL query-rule reconciliation now retries both known admin credentials and restores the broader temp-table writer rule used by the stack template. This prevents Magento `search_tmp_*`, `_tmp_*`, `_temp_*`, and `TEMPORARY` table reads from being misrouted to replicas after deploys, which was surfacing as missing temp-table exceptions on kit-builder pages.",
-      "phase": "post_migrate",
+      "id": "rebuild-app-images-on-cloud-swarm-ref-change",
+      "description": "Deploy-time app-image reuse now validates the `org.magezero.cloud_swarm_ref` label on both `mz-magento` and `mz-nginx-app`. If the current `cloud-swarm` checkout changed under the same artifact tag, the deploy rebuilds the Magento app images instead of incorrectly reusing stale ones.",
+      "phase": "migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
     }

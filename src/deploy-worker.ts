@@ -1651,7 +1651,68 @@ async function appImagesExist(envVars: NodeJS.ProcessEnv, mageVersion: string): 
     return false;
   }
   const nginxAppExists = await registryImageTagExists(registryHost, registryPort, 'mz-nginx-app', mageVersion);
-  return nginxAppExists;
+  if (!nginxAppExists) {
+    return false;
+  }
+
+  const currentCloudSwarmRef = await getCloudSwarmRef();
+  if (!currentCloudSwarmRef) {
+    return true;
+  }
+
+  const registryRefPrefix = `${registryHost}:${registryPort}`;
+  const [magentoCloudSwarmRef, nginxAppCloudSwarmRef] = await Promise.all([
+    getDockerImageLabel(
+      `${registryRefPrefix}/mz-magento:${mageVersion}`,
+      'org.magezero.cloud_swarm_ref',
+    ),
+    getDockerImageLabel(
+      `${registryRefPrefix}/mz-nginx-app:${mageVersion}`,
+      'org.magezero.cloud_swarm_ref',
+    ),
+  ]);
+
+  return shouldReuseAppImagesForCloudSwarmRef(currentCloudSwarmRef, {
+    magento: magentoCloudSwarmRef,
+    nginxApp: nginxAppCloudSwarmRef,
+  });
+}
+
+async function getCloudSwarmRef(): Promise<string | null> {
+  const result = await runCommandCaptureWithStatus('git', ['-C', CLOUD_SWARM_DIR, 'rev-parse', 'HEAD']);
+  if (result.code !== 0) {
+    return null;
+  }
+  const value = String(result.stdout || '').trim();
+  return value || null;
+}
+
+async function getDockerImageLabel(imageRef: string, label: string): Promise<string | null> {
+  const inspectArgs = ['image', 'inspect', imageRef, '--format', `{{ index .Config.Labels "${label}" }}`];
+  let result = await runCommandCaptureWithStatus('docker', inspectArgs);
+  if (result.code !== 0) {
+    const pull = await runCommandCaptureWithStatus('docker', ['pull', imageRef]);
+    if (pull.code !== 0) {
+      return null;
+    }
+    result = await runCommandCaptureWithStatus('docker', inspectArgs);
+    if (result.code !== 0) {
+      return null;
+    }
+  }
+  const value = String(result.stdout || '').trim();
+  return value || null;
+}
+
+function shouldReuseAppImagesForCloudSwarmRef(
+  currentCloudSwarmRef: string | null,
+  imageCloudSwarmRefs: { magento: string | null; nginxApp: string | null },
+): boolean {
+  const current = String(currentCloudSwarmRef || '').trim();
+  if (!current) {
+    return true;
+  }
+  return imageCloudSwarmRefs.magento === current && imageCloudSwarmRefs.nginxApp === current;
 }
 
 async function ensureCloudSwarmRepo() {
@@ -5097,6 +5158,7 @@ export const __testing = {
   resolveSkipServiceBuildIfPresent,
   buildProxySqlQueryRulesSql,
   buildProxySqlRuleReconcileScript,
+  shouldReuseAppImagesForCloudSwarmRef,
   getQueueSourceDirs,
   resolveAggressivePruneCutoffSeconds,
   getHistoryLastSuccessfulDeployAt,
