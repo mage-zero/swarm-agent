@@ -212,6 +212,16 @@ function resolveSkipServiceBuildIfPresent(env: NodeJS.ProcessEnv = process.env):
   }
   return raw !== '0';
 }
+
+function buildNginxPhpUpstreamEnv() {
+  // Swarm service VIPs have shown intermittent blackholes during app rollouts.
+  // Route nginx FastCGI traffic directly to task DNS instead.
+  return {
+    MZ_PHP_FPM_HOST: 'tasks.php-fpm',
+    MZ_PHP_FPM_ADMIN_HOST: 'tasks.php-fpm-admin',
+  };
+}
+
 const DEPLOY_SKIP_SERVICE_BUILD_IF_PRESENT = resolveSkipServiceBuildIfPresent();
 const DEPLOY_SKIP_APP_BUILD_IF_PRESENT = (process.env.MZ_DEPLOY_SKIP_APP_BUILD_IF_PRESENT || '1') !== '0';
 const setupDbStatusTimeoutParsed = Number(process.env.MZ_SETUP_DB_STATUS_TIMEOUT_SECONDS || 120);
@@ -3951,6 +3961,7 @@ async function processDeployment(recordPath: string) {
   const envHostnameOnly = envHostname
     ? envHostname.replace(/^https?:\/\//, '').split('/')[0]?.replace(/\/+$/, '') || ''
     : '';
+  const nginxPhpUpstreamEnv = buildNginxPhpUpstreamEnv();
   const apmEnabledValue = process.env.MZ_APM_ENABLED || '1';
   const apmSpanEventsEnabledValue = process.env.MZ_APM_SPAN_EVENTS_ENABLED || '1';
   const apmSpanLayoutEnabledValue = process.env.MZ_APM_SPAN_LAYOUT_ENABLED || '1';
@@ -4071,8 +4082,7 @@ async function processDeployment(recordPath: string) {
     MZ_REDIS_CACHE_HOST: stackService('redis-cache'),
     MZ_REDIS_SESSION_HOST: stackService('redis-session'),
     MZ_VARNISH_HOST: stackService('varnish'),
-    MZ_PHP_FPM_HOST: stackService('php-fpm'),
-    MZ_PHP_FPM_ADMIN_HOST: stackService('php-fpm-admin'),
+    ...nginxPhpUpstreamEnv,
     MZ_VARNISH_BACKEND_HOST: stackService('nginx'),
     MZ_VARNISH_BACKEND_PORT: '80',
     ...buildSearchEngineEnvOverride(searchEngineOverride),
@@ -5156,6 +5166,7 @@ export const __testing = {
   resolveAppHaReplicaPolicy,
   resolveFrontendRuntimePolicy,
   resolveSkipServiceBuildIfPresent,
+  buildNginxPhpUpstreamEnv,
   buildProxySqlQueryRulesSql,
   buildProxySqlRuleReconcileScript,
   shouldReuseAppImagesForCloudSwarmRef,
