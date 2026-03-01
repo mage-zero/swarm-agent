@@ -1,21 +1,21 @@
 {
-  "version": "0.4.67",
-  "date": "2026-02-28",
-  "summary": "Route nginx FastCGI traffic to php-fpm task DNS during deploys",
+  "version": "0.4.68",
+  "date": "2026-03-01",
+  "summary": "Keep cron out of the pre-upgrade deploy path",
   "requires": {
     "cloud-swarm": ">=1.0.22"
   },
   "changes": [
     {
-      "id": "rebuild-app-images-on-cloud-swarm-ref-change",
-      "description": "Deploy-time app-image reuse now validates the `org.magezero.cloud_swarm_ref` label on both `mz-magento` and `mz-nginx-app`. If the current `cloud-swarm` checkout changed under the same artifact tag, the deploy rebuilds the Magento app images instead of incorrectly reusing stale ones.",
+      "id": "exclude-cron-from-pre-upgrade-gate",
+      "description": "Release-cohort gating now excludes the Magento cron service, so deploys no longer wait for new cron tasks to converge before `setup:upgrade` and `app:config:import` run.",
       "phase": "migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
     },
     {
-      "id": "nginx-fastcgi-task-dns",
-      "description": "Deploy-time nginx env now pins `MZ_PHP_FPM_HOST` and `MZ_PHP_FPM_ADMIN_HOST` to `tasks.php-fpm` and `tasks.php-fpm-admin` so rollouts do not fall back to the Swarm service VIP path.",
+      "id": "recover-db-container-during-upgrade-retry",
+      "description": "If `setup:upgrade` loses the MariaDB container during deploy retries, the worker now forces a database service restart before retrying instead of leaving the deploy stranded on `Timed out waiting for database container`.",
       "phase": "migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
