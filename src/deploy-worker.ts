@@ -3133,23 +3133,27 @@ function summarizeReleaseServiceState(tasks: ServiceTaskRow[], expectedTag: stri
   };
 }
 
+function filterReleaseCohortServicesForGate(services: string[]): string[] {
+  return services.filter((name) => !name.endsWith('_cron'));
+}
+
 async function resolveReleaseCohortServices(stackName: string): Promise<string[]> {
   const stackServices = await listStackServices(stackName);
   if (!stackServices.length) {
     return [];
   }
   const inspected = await inspectServices(stackServices);
-  const labelled = inspected
+  const labelled = filterReleaseCohortServicesForGate(inspected
     .filter((svc) => String(svc.labels?.[RELEASE_COHORT_LABEL_KEY] || '').trim() === RELEASE_COHORT_LABEL_VALUE)
     .map((svc) => svc.name)
-    .filter(Boolean)
+    .filter(Boolean))
     .sort();
   if (labelled.length) {
     return labelled;
   }
-  const fallback = ['nginx', 'php-fpm', 'php-fpm-admin', 'cron']
+  const fallback = filterReleaseCohortServicesForGate(['nginx', 'php-fpm', 'php-fpm-admin', 'cron']
     .map((svc) => `${stackName}_${svc}`)
-    .filter((name) => stackServices.includes(name));
+    .filter((name) => stackServices.includes(name)));
   return fallback;
 }
 
@@ -3453,6 +3457,33 @@ async function enforceMagentoPerformance(
   throw new Error('Magento performance config not set: unknown error');
 }
 
+async function ensureDatabaseContainerReady(
+  stackName: string,
+  log: (message: string) => void,
+  timeoutMs: number = 5 * 60 * 1000,
+): Promise<string> {
+  const serviceName = `${stackName}_database`;
+  try {
+    const containerId = await waitForContainer(stackName, 'database', 30_000);
+    await waitForDatabase(containerId, timeoutMs);
+    return containerId;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log(`database recovery: ${message}; forcing service restart for ${serviceName}`);
+  }
+
+  const restart = await runCommandCaptureWithStatus('docker', ['service', 'update', '--force', serviceName]);
+  if (restart.code !== 0) {
+    const output = (restart.stderr || restart.stdout || '').trim();
+    throw new Error(`database recovery failed for ${serviceName}: ${output || `exit ${restart.code}`}`);
+  }
+
+  const containerId = await waitForContainer(stackName, 'database', timeoutMs);
+  await waitForDatabase(containerId, timeoutMs);
+  log(`database recovery: ${serviceName} running again`);
+  return containerId;
+}
+
 async function runSetupUpgradeWithRetry(
   containerId: string,
   stackName: string,
@@ -3492,6 +3523,12 @@ async function runSetupUpgradeWithRetry(
         lastError = error instanceof Error ? error : new Error(message);
         log(`setup:upgrade attempt ${attempt} failed: ${message}`);
         await delay(5000);
+        try {
+          await ensureDatabaseContainerReady(stackName, log);
+        } catch (dbError) {
+          const dbMessage = dbError instanceof Error ? dbError.message : String(dbError);
+          log(`setup:upgrade database recovery attempt ${attempt} failed: ${dbMessage}`);
+        }
         adminContainerId = await waitForContainer(stackName, 'php-fpm-admin', 5 * 60 * 1000);
         await waitForRedisCache(adminContainerId, stackName, 5 * 60 * 1000);
         continue;
@@ -4072,6 +4109,7 @@ async function processDeployment(recordPath: string) {
     MZ_VARNISH_REPLICAS: '1',
     MZ_NGINX_REPLICAS: String(frontendReplicaCount),
     MZ_PHP_FPM_REPLICAS: String(frontendReplicaCount),
+    MZ_CRON_REPLICAS: '0',
     MZ_VARNISH_MAX_REPLICAS_PER_NODE: '0',
     MZ_NGINX_MAX_REPLICAS_PER_NODE: String(frontendRuntimePolicy.max_replicas_per_node),
     MZ_PHP_FPM_MAX_REPLICAS_PER_NODE: String(frontendRuntimePolicy.max_replicas_per_node),
@@ -4609,8 +4647,10 @@ async function processDeployment(recordPath: string) {
   }
 
   let maintenanceEnabled = false;
-  let cronScaledDown = false;
+  const cronRestoreNeeded = true;
   let varnishRestartedAfterMaintenance = false;
+  let magentoStepsError: Error | null = null;
+  const cronServiceName = `${stackName}_cron`;
   try {
     if (!upgradeNeeded) {
       log('setup:upgrade not required; cache already flushed before status check');
@@ -4623,10 +4663,8 @@ async function processDeployment(recordPath: string) {
       // The cron container runs `php bin/magento cron:run` in a loop which loads
       // the full Magento DI container (~135MB+ per invocation) even in maintenance
       // mode, and can OOM-kill the container on memory-constrained nodes.
-      const cronServiceName = `${stackName}_cron`;
       try {
         await scaleDownServices([cronServiceName], log);
-        cronScaledDown = true;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         log(`warning: failed to scale down cron: ${message}; continuing`);
@@ -4730,8 +4768,20 @@ async function processDeployment(recordPath: string) {
       };
       writeJsonFileBestEffort(recordPath, recordMeta);
     }
+  } catch (error) {
+    magentoStepsError = error instanceof Error ? error : new Error(String(error));
+    throw error;
   } finally {
-    dbContainerId = await setSearchEngine(stackName, dbContainerId, envVars.MYSQL_DATABASE || 'magento', searchEngine);
+    try {
+      dbContainerId = await setSearchEngine(stackName, dbContainerId, envVars.MYSQL_DATABASE || 'magento', searchEngine);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (magentoStepsError) {
+        log(`warning: failed to restore search engine config after deploy error: ${message}`);
+      } else {
+        throw error;
+      }
+    }
     if (maintenanceEnabled) {
       let maintenanceDisabled = false;
       try {
@@ -4757,9 +4807,8 @@ async function processDeployment(recordPath: string) {
         }
       }
     }
-    if (cronScaledDown) {
+    if (cronRestoreNeeded) {
       try {
-        const cronServiceName = `${stackName}_cron`;
         const result = await runCommandCaptureWithStatus('docker', [
           'service', 'scale', `${cronServiceName}=1`,
         ]);
@@ -5167,6 +5216,7 @@ export const __testing = {
   resolveFrontendRuntimePolicy,
   resolveSkipServiceBuildIfPresent,
   buildNginxPhpUpstreamEnv,
+  filterReleaseCohortServicesForGate,
   buildProxySqlQueryRulesSql,
   buildProxySqlRuleReconcileScript,
   shouldReuseAppImagesForCloudSwarmRef,
