@@ -1,28 +1,21 @@
 {
-  "version": "0.4.70",
+  "version": "0.4.71",
   "date": "2026-03-01",
-  "summary": "Workload-aware MariaDB tuning: table caches, join/sort buffers, InnoDB log buffer, buffer pool instances",
+  "summary": "Deploy reliability: tolerate zero-replica cohort services and pass explicit admin replicas",
   "requires": {
     "cloud-swarm": ">=1.0.27"
   },
   "changes": [
     {
-      "id": "workload-aware-db-tuning",
-      "description": "Config advisor now derives table_definition_cache, table_open_cache, join_buffer_size, sort_buffer_size, innodb_log_buffer_size, and innodb_buffer_pool_instances from live MariaDB status counters (mysqltuner-style). Includes diagnostic evidence and notes in config change payloads.",
+      "id": "release-cohort-zero-replica-skip",
+      "description": "Release cohort gating now skips task-readiness waits for services explicitly scaled to 0 replicas when their service spec already points at the expected image tag, preventing false deploy failures on intentionally suspended services.",
       "phase": "migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
     },
     {
-      "id": "db-tuning-baseline-capture",
-      "description": "Baseline capture now reads the six new tunable variables from running containers and cloud-swarm defaults, ensuring the tuning service preserves existing values when no workload data triggers a change.",
-      "phase": "migrate",
-      "downtimeMinutes": 0,
-      "scope": "environment"
-    },
-    {
-      "id": "db-status-collection-expansion",
-      "description": "Database inspection now collects additional SHOW GLOBAL STATUS counters (Open_tables, Opened_tables, Table_open_cache_hits/misses, Select_full_join, Sort_merge_passes, Sort_rows, Innodb_log_waits, Created_tmp_disk/tables) and SHOW GLOBAL VARIABLES for the new tunable parameters.",
+      "id": "admin-replica-env-explicit",
+      "description": "Deploys now pass an explicit MZ_PHP_FPM_ADMIN_REPLICAS value alongside cron suspension so admin PHP-FPM replica counts stay independent from cron replica overrides.",
       "phase": "migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
