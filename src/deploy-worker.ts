@@ -3049,6 +3049,25 @@ async function listServiceTasksWithImages(serviceName: string): Promise<ServiceT
     .filter((task) => task.id !== '' && task.name !== '');
 }
 
+async function inspectServiceDesiredReplicas(serviceName: string): Promise<number | null> {
+  const result = await runCommandCaptureWithStatus('docker', [
+    'service',
+    'inspect',
+    serviceName,
+    '--format',
+    '{{if .Spec.Mode.Replicated}}{{.Spec.Mode.Replicated.Replicas}}{{else}}global{{end}}',
+  ]);
+  if (result.code !== 0) {
+    return null;
+  }
+  const value = (result.stdout || '').trim();
+  if (!value || value === 'global') {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? parsed : null;
+}
+
 async function waitForAllDesiredServiceTasksRunning(
   serviceName: string,
   log: (message: string) => void,
@@ -3133,6 +3152,14 @@ function summarizeReleaseServiceState(tasks: ServiceTaskRow[], expectedTag: stri
   };
 }
 
+function shouldSkipReleaseCohortTaskReadiness(
+  desiredReplicas: number | null,
+  specTag: string,
+  expectedTag: string,
+): boolean {
+  return desiredReplicas === 0 && specTag === expectedTag;
+}
+
 function filterReleaseCohortServicesForGate(services: string[]): string[] {
   return services.filter((name) => !name.endsWith('_cron'));
 }
@@ -3195,12 +3222,14 @@ async function waitForReleaseCohort(expectedTag: string, services: string[], log
     for (const serviceName of services) {
       const image = await inspectServiceImage(serviceName);
       const specTag = image ? parseImageReference(image).tag : '';
+      const desiredReplicas = await inspectServiceDesiredReplicas(serviceName);
       const updateStatus = await inspectServiceUpdateStatus(serviceName);
       const state = (updateStatus?.state || '').toLowerCase();
       const tasks = await listServiceTasksWithImages(serviceName);
       const taskSummary = summarizeReleaseServiceState(tasks, expectedTag);
       snapshot[serviceName] = {
         spec_tag: specTag || null,
+        desired_replicas: desiredReplicas,
         update_status: updateStatus,
         tasks: {
           desired_running: taskSummary.desired_running,
@@ -3209,6 +3238,10 @@ async function waitForReleaseCohort(expectedTag: string, services: string[], log
           issues: taskSummary.issues,
         },
       };
+
+      if (shouldSkipReleaseCohortTaskReadiness(desiredReplicas, specTag, expectedTag)) {
+        continue;
+      }
 
       const updatePaused = state.includes('pause');
       const updateRolledBack = state.includes('rollback');
@@ -4109,6 +4142,7 @@ async function processDeployment(recordPath: string) {
     MZ_VARNISH_REPLICAS: '1',
     MZ_NGINX_REPLICAS: String(frontendReplicaCount),
     MZ_PHP_FPM_REPLICAS: String(frontendReplicaCount),
+    MZ_PHP_FPM_ADMIN_REPLICAS: '1',
     MZ_CRON_REPLICAS: '0',
     MZ_VARNISH_MAX_REPLICAS_PER_NODE: '0',
     MZ_NGINX_MAX_REPLICAS_PER_NODE: String(frontendRuntimePolicy.max_replicas_per_node),
@@ -5217,6 +5251,7 @@ export const __testing = {
   resolveSkipServiceBuildIfPresent,
   buildNginxPhpUpstreamEnv,
   filterReleaseCohortServicesForGate,
+  shouldSkipReleaseCohortTaskReadiness,
   buildProxySqlQueryRulesSql,
   buildProxySqlRuleReconcileScript,
   shouldReuseAppImagesForCloudSwarmRef,
