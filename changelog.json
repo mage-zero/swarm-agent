@@ -1,21 +1,21 @@
 {
-  "version": "0.4.68",
+  "version": "0.4.69",
   "date": "2026-03-01",
-  "summary": "Keep cron out of the pre-upgrade deploy path",
+  "summary": "Encode multiline swarm-job payloads for enforced command policy",
   "requires": {
     "cloud-swarm": ">=1.0.22"
   },
   "changes": [
     {
-      "id": "exclude-cron-from-pre-upgrade-gate",
-      "description": "Release-cohort gating now excludes the Magento cron service, so deploys no longer wait for new cron tasks to converge before `setup:upgrade` and `app:config:import` run.",
+      "id": "encode-multiline-runbook-job-scripts",
+      "description": "Swarm replicated-job helpers now rewrite multiline `sh -c`/`sh -lc` payloads into single-line base64-decoded wrappers before `docker service create`, so support runbooks continue to work under the enforced command policy.",
       "phase": "migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
     },
     {
-      "id": "recover-db-container-during-upgrade-retry",
-      "description": "If `setup:upgrade` loses the MariaDB container during deploy retries, the worker now forces a database service restart before retrying instead of leaving the deploy stranded on `Timed out waiting for database container`.",
+      "id": "restore-scd-db-snapshot-runbook",
+      "description": "Magento SCD DB snapshot generation no longer fails on manager nodes with `argv contains unsafe characters` when the exporter script is passed through the shared swarm-job helper.",
       "phase": "migrate",
       "downtimeMinutes": 0,
       "scope": "environment"

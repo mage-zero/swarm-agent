@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { buildJobName, envServiceName, pickNetworkName, pickSecretName, stripDigestFromImageRef, summarizeServiceTasks } from '../src/swarm.js';
+import {
+  buildJobName,
+  envServiceName,
+  normalizeSwarmJobCommand,
+  pickNetworkName,
+  pickSecretName,
+  stripDigestFromImageRef,
+  summarizeServiceTasks,
+} from '../src/swarm.js';
 
 describe('swarm helpers', () => {
   it('builds stack-qualified service names', () => {
@@ -86,5 +94,22 @@ describe('swarm helpers', () => {
     expect(
       stripDigestFromImageRef('registry:5000/mz-proxysql@sha256:9c56786f48c3a1adcca9e210456c24e399de167d52085d3706050bf4f04e4cdb')
     ).toBe('registry:5000/mz-proxysql@sha256:9c56786f48c3a1adcca9e210456c24e399de167d52085d3706050bf4f04e4cdb');
+  });
+
+  it('encodes multiline sh -lc payloads into a single argv-safe command', () => {
+    const normalized = normalizeSwarmJobCommand(['sh', '-lc', 'echo one\necho two']);
+    expect(normalized[0]).toBe('sh');
+    expect(normalized[1]).toBe('-lc');
+    expect(normalized[2]).toContain("printf '%s' '");
+    expect(normalized[2]).toContain('| base64 -d | sh');
+    expect(normalized[2]).not.toContain('\n');
+  });
+
+  it('encodes multiline payloads when sh is provided via entrypoint', () => {
+    const normalized = normalizeSwarmJobCommand(['-lc', 'echo one\necho two'], 'sh');
+    expect(normalized[0]).toBe('-lc');
+    expect(normalized[1]).toContain("printf '%s' '");
+    expect(normalized[1]).toContain('| base64 -d | sh');
+    expect(normalized[1]).not.toContain('\n');
   });
 });

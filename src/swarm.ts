@@ -375,6 +375,34 @@ export function buildJobName(prefix: string, environmentId: number): string {
   return raw.replace(/[^a-z0-9-]/g, '-').slice(0, 63);
 }
 
+function encodeShellScriptForArgv(script: string): string {
+  const encoded = Buffer.from(script, 'utf8').toString('base64');
+  return `printf '%s' '${encoded}' | base64 -d | sh`;
+}
+
+export function normalizeSwarmJobCommand(command: string[], entrypoint?: string): string[] {
+  if (!Array.isArray(command) || command.length < 2) return command;
+
+  const normalizedEntrypoint = String(entrypoint || '').trim();
+  if (normalizedEntrypoint === 'sh') {
+    const shellFlag = String(command[0] || '');
+    const script = String(command[1] || '');
+    if ((shellFlag === '-c' || shellFlag === '-lc') && /[\r\n]/.test(script)) {
+      return [shellFlag, encodeShellScriptForArgv(script)];
+    }
+    return command;
+  }
+
+  const shell = String(command[0] || '');
+  const shellFlag = String(command[1] || '');
+  const script = String(command[2] || '');
+  if (shell === 'sh' && (shellFlag === '-c' || shellFlag === '-lc') && /[\r\n]/.test(script)) {
+    return ['sh', shellFlag, encodeShellScriptForArgv(script)];
+  }
+
+  return command;
+}
+
 export async function waitForServiceRunning(serviceFullName: string, timeoutMs = 180_000): Promise<{ ok: boolean; state?: string; note?: string }> {
   const startedAt = Date.now();
   let lastState = '';
@@ -411,6 +439,7 @@ export async function waitForServiceNotRunning(serviceFullName: string, timeoutM
 export async function runSwarmJob(options: SwarmJobOptions): Promise<SwarmJobResult> {
   const timeoutMs = options.timeout_ms ?? 5 * 60_000;
   const jobImage = stripDigestFromImageRef(options.image) || options.image;
+  const command = normalizeSwarmJobCommand(options.command, options.entrypoint);
   const args: string[] = [
     'service',
     'create',
@@ -451,7 +480,7 @@ export async function runSwarmJob(options: SwarmJobOptions): Promise<SwarmJobRes
     args.push('--entrypoint', options.entrypoint);
   }
 
-  args.push(jobImage, ...options.command);
+  args.push(jobImage, ...command);
 
   const created = await runCommand('docker', args, 30_000);
   if (created.code !== 0) {
