@@ -235,6 +235,30 @@ export function buildConfigEnv(configChanges: PlannerConfigChange[]): Record<str
               setEnv('MZ_DB_QUERY_CACHE_SIZE', '0');
             }
             break;
+          case 'table_definition_cache':
+            setEnv('MZ_DB_TABLE_DEFINITION_CACHE', String(rawValue));
+            break;
+          case 'table_open_cache':
+            setEnv('MZ_DB_TABLE_OPEN_CACHE', String(rawValue));
+            break;
+          case 'join_buffer_size':
+            if (Number(rawValue) > 0) {
+              setEnv('MZ_DB_JOIN_BUFFER_SIZE', formatMemoryBytes(Number(rawValue)));
+            }
+            break;
+          case 'sort_buffer_size':
+            if (Number(rawValue) > 0) {
+              setEnv('MZ_DB_SORT_BUFFER_SIZE', formatMemoryBytes(Number(rawValue)));
+            }
+            break;
+          case 'innodb_log_buffer_size':
+            if (Number(rawValue) > 0) {
+              setEnv('MZ_DB_INNODB_LOG_BUFFER_SIZE', formatMemoryBytes(Number(rawValue)));
+            }
+            break;
+          case 'innodb_buffer_pool_instances':
+            setEnv('MZ_DB_INNODB_BUFFER_POOL_INSTANCES', String(rawValue));
+            break;
           default:
             break;
         }

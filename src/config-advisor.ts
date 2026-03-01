@@ -58,15 +58,34 @@ function buildPhpConfigChanges(
   };
 }
 
+const KIB = 1024;
+
+function metricNum(app: Record<string, InspectionMetricValue> | undefined, key: string): number | null {
+  if (!app) {
+    return null;
+  }
+  const v = app[key];
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+function roundUp100(n: number): number {
+  return Math.ceil(n / 100) * 100;
+}
+
 function buildDatabaseConfigChanges(
   service: string,
   memoryLimit: number,
   evidence?: Record<string, number | string>,
+  appMetrics?: Record<string, InspectionMetricValue>,
 ): PlannerConfigChange | null {
   if (!Number.isFinite(memoryLimit) || memoryLimit <= 0) {
     return null;
   }
 
+  const notes: string[] = [];
+  const ev: Record<string, number | string> = { ...evidence };
+
+  // --- Existing memory-based derivations ---
   const bufferPool = clamp(Math.floor(memoryLimit * 0.6), 256 * MIB, memoryLimit * 0.75);
   const logFile = clamp(Math.floor(bufferPool / 8), 64 * MIB, 512 * MIB);
 
@@ -83,6 +102,109 @@ function buildDatabaseConfigChanges(
     queryCache = 32 * MIB;
   }
 
+  notes.push('Derived from database container memory limit and baseline heuristics.');
+
+  // --- Workload-aware derivations (mysqltuner-style) ---
+
+  // InnoDB buffer pool hit rate
+  const bpReads = metricNum(appMetrics, 'Innodb_buffer_pool_reads');
+  const bpReadRequests = metricNum(appMetrics, 'Innodb_buffer_pool_read_requests');
+  if (bpReads !== null && bpReadRequests !== null && bpReadRequests > 0) {
+    const hitRate = 1 - bpReads / bpReadRequests;
+    ev.buffer_pool_hit_rate = Math.round(hitRate * 10000) / 100;
+    if (hitRate >= 0.99) {
+      notes.push(`InnoDB buffer pool hit rate ${ev.buffer_pool_hit_rate}% (healthy).`);
+    } else {
+      notes.push(`InnoDB buffer pool hit rate ${ev.buffer_pool_hit_rate}% (low); buffer pool sized at 60% of memory limit.`);
+    }
+  }
+
+  // table_definition_cache
+  const openTables = metricNum(appMetrics, 'Open_tables');
+  const curTableDefCache = metricNum(appMetrics, 'table_definition_cache');
+  let tableDefCache: number;
+  if (openTables !== null && curTableDefCache !== null && openTables > curTableDefCache * 0.9) {
+    tableDefCache = clamp(roundUp100(Math.ceil(openTables * 1.2)), 400, 4000);
+    notes.push(`table_definition_cache ${curTableDefCache} < ${openTables} open tables; raised to ${tableDefCache}.`);
+  } else if (openTables !== null) {
+    tableDefCache = clamp(Math.max(curTableDefCache ?? 0, roundUp100(Math.ceil(openTables * 1.2)), 1000), 400, 4000);
+  } else {
+    tableDefCache = clamp(Math.max(curTableDefCache ?? 0, 1000), 400, 4000);
+  }
+
+  // table_open_cache
+  const openedTables = metricNum(appMetrics, 'Opened_tables');
+  const uptime = metricNum(appMetrics, 'Uptime');
+  const cacheHits = metricNum(appMetrics, 'Table_open_cache_hits');
+  const cacheMisses = metricNum(appMetrics, 'Table_open_cache_misses');
+  let tableOpenCache: number;
+  if (openedTables !== null && uptime !== null && uptime > 0 && openedTables / uptime > 5 / 3600 && openTables !== null) {
+    tableOpenCache = clamp(roundUp100(Math.ceil(openTables * 1.5)), 400, 8000);
+    notes.push(`High table open rate (${Math.round(openedTables / uptime * 3600)}/hr); raised table_open_cache to ${tableOpenCache}.`);
+  } else {
+    tableOpenCache = clamp(Math.max(openTables ?? 0, 2000), 400, 8000);
+  }
+  if (cacheHits !== null && cacheMisses !== null && (cacheHits + cacheMisses) > 0) {
+    ev.table_cache_hit_rate = Math.round(cacheHits / (cacheHits + cacheMisses) * 10000) / 100;
+  }
+
+  // join_buffer_size
+  const selectFullJoin = metricNum(appMetrics, 'Select_full_join');
+  const questions = metricNum(appMetrics, 'Questions');
+  let joinBuffer: number;
+  if (selectFullJoin !== null && selectFullJoin > 0) {
+    ev.joins_without_index = selectFullJoin;
+    if (questions !== null && questions > 0 && selectFullJoin / questions > 0.01) {
+      joinBuffer = 2 * MIB;
+      notes.push(`${selectFullJoin} joins without indexes (${Math.round(selectFullJoin / questions * 10000) / 100}% of queries); raised join_buffer_size to 2M.`);
+    } else {
+      joinBuffer = 1 * MIB;
+      notes.push(`${selectFullJoin} joins without indexes; raised join_buffer_size to 1M.`);
+    }
+  } else {
+    joinBuffer = 256 * KIB;
+  }
+  joinBuffer = clamp(joinBuffer, 256 * KIB, 4 * MIB);
+
+  // sort_buffer_size
+  const sortMergePasses = metricNum(appMetrics, 'Sort_merge_passes');
+  const sortRows = metricNum(appMetrics, 'Sort_rows');
+  let sortBuffer: number;
+  if (sortMergePasses !== null && sortRows !== null && sortRows > 0 && sortMergePasses / sortRows > 0.01) {
+    sortBuffer = 2 * MIB;
+    ev.sort_merge_pass_rate = Math.round(sortMergePasses / sortRows * 10000) / 100;
+    notes.push(`Sort merge pass rate ${ev.sort_merge_pass_rate}%; raised sort_buffer_size to 2M.`);
+  } else {
+    sortBuffer = 512 * KIB;
+  }
+  sortBuffer = clamp(sortBuffer, 256 * KIB, 4 * MIB);
+
+  // innodb_log_buffer_size
+  const logWaits = metricNum(appMetrics, 'Innodb_log_waits');
+  let logBuffer: number;
+  if (logWaits !== null && logWaits > 0) {
+    logBuffer = 32 * MIB;
+    notes.push(`${logWaits} InnoDB log waits; raised innodb_log_buffer_size to 32M.`);
+  } else {
+    logBuffer = 16 * MIB;
+  }
+  logBuffer = clamp(logBuffer, 8 * MIB, 64 * MIB);
+
+  // innodb_buffer_pool_instances
+  let poolInstances: number;
+  if (bufferPool >= GIB) {
+    poolInstances = clamp(Math.min(8, Math.floor(bufferPool / (128 * MIB))), 1, 8);
+  } else {
+    poolInstances = 1;
+  }
+
+  // tmp tables on disk ratio (evidence only)
+  const tmpDisk = metricNum(appMetrics, 'Created_tmp_disk_tables');
+  const tmpTotal = metricNum(appMetrics, 'Created_tmp_tables');
+  if (tmpDisk !== null && tmpTotal !== null && tmpTotal > 0) {
+    ev.tmp_tables_disk_pct = Math.round(tmpDisk / tmpTotal * 10000) / 100;
+  }
+
   return {
     service,
     changes: {
@@ -93,9 +215,15 @@ function buildDatabaseConfigChanges(
       'max_heap_table_size': roundToMiB(tmpTable),
       'thread_cache_size': threadCache,
       'query_cache_size': queryCache,
+      'table_definition_cache': tableDefCache,
+      'table_open_cache': tableOpenCache,
+      'join_buffer_size': joinBuffer,
+      'sort_buffer_size': sortBuffer,
+      'innodb_log_buffer_size': logBuffer,
+      'innodb_buffer_pool_instances': poolInstances,
     },
-    notes: ['Derived from database container memory limit and baseline heuristics.'],
-    evidence,
+    notes,
+    evidence: ev,
   };
 }
 
@@ -140,7 +268,13 @@ export function buildConfigChanges(
     if (!resource) {
       continue;
     }
-    const change = buildDatabaseConfigChanges(service, resource.limits.memory_bytes, inspectionMap.get(service));
+    const appMetrics = inspection.services.find((e) => e.service === service)?.app;
+    const change = buildDatabaseConfigChanges(
+      service,
+      resource.limits.memory_bytes,
+      inspectionMap.get(service),
+      appMetrics as Record<string, InspectionMetricValue> | undefined,
+    );
     if (change) {
       changes.push(change);
     }
@@ -226,6 +360,12 @@ function buildBaselineFromDatabaseApp(
     'max_heap_table_size',
     'thread_cache_size',
     'query_cache_size',
+    'table_definition_cache',
+    'table_open_cache',
+    'join_buffer_size',
+    'sort_buffer_size',
+    'innodb_log_buffer_size',
+    'innodb_buffer_pool_instances',
   ];
   const changes: Record<string, number | string> = {};
   for (const key of keys) {

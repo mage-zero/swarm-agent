@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { buildConfigBaseline, buildConfigChanges } from '../src/config-advisor.js';
 import type { PlannerConfigChange, PlannerInspectionPayload, PlannerResources } from '../src/planner-types.js';
 
+const KIB = 1024;
 const MIB = 1024 * 1024;
 const GIB = 1024 * MIB;
 
@@ -49,6 +50,16 @@ describe('config advisor', () => {
     expect(Number(db?.changes['max_connections'])).toBe(200);
     expect(Number(db?.changes['thread_cache_size'])).toBe(20);
     expect(Number(db?.changes['query_cache_size'])).toBe(64 * MIB);
+
+    // New workload-aware variables should have sensible defaults without app metrics
+    expect(Number(db?.changes['table_definition_cache'])).toBe(1000);
+    expect(Number(db?.changes['table_open_cache'])).toBe(2000);
+    expect(Number(db?.changes['join_buffer_size'])).toBe(256 * KIB);
+    expect(Number(db?.changes['sort_buffer_size'])).toBe(512 * KIB);
+    expect(Number(db?.changes['innodb_log_buffer_size'])).toBe(16 * MIB);
+    // 2G buffer pool -> min(8, floor(1.2G / 128M)) = 8 but pool is ~1.2G so floor(1.2G/128M) = 9 -> capped at 8
+    expect(Number(db?.changes['innodb_buffer_pool_instances'])).toBeGreaterThanOrEqual(1);
+    expect(Number(db?.changes['innodb_buffer_pool_instances'])).toBeLessThanOrEqual(8);
   });
 
   it('merges baseline with inspection values taking precedence', () => {
@@ -211,5 +222,120 @@ describe('config advisor', () => {
     expect(primary?.changes['max_connections']).toBe(150);
     expect(replica?.changes['query_cache_size']).toBe(64 * MIB);
     expect(replica?.changes['max_connections']).toBe(600);
+  });
+
+  it('derives workload-aware DB config from app metrics', () => {
+    const inspection: PlannerInspectionPayload = {
+      generated_at: '2026-02-26T00:00:00.000Z',
+      services: [
+        {
+          name: 'db',
+          service: 'database',
+          container_ids: [],
+          replicas: 1,
+          docker: { cpu_percent: 30, memory_bytes: 600 * MIB, memory_limit_bytes: 2 * GIB, memory_percent: 29, pids: 40 },
+          app: {
+            // Status counters
+            Innodb_buffer_pool_reads: 20000,
+            Innodb_buffer_pool_read_requests: 3000000,
+            Innodb_log_waits: 5,
+            Innodb_log_writes: 18000,
+            Select_full_join: 4769,
+            Questions: 133000,
+            Uptime: 20000,
+            Open_tables: 955,
+            Opened_tables: 60000,
+            Table_open_cache_hits: 44000,
+            Table_open_cache_misses: 20000,
+            Created_tmp_disk_tables: 5000,
+            Created_tmp_tables: 37000,
+            Sort_merge_passes: 10,
+            Sort_rows: 5000,
+            // Current variable values
+            table_definition_cache: 400,
+            table_open_cache: 512,
+            join_buffer_size: 256 * KIB,
+            sort_buffer_size: 512 * KIB,
+            innodb_log_buffer_size: 8 * MIB,
+            innodb_buffer_pool_instances: 1,
+          },
+        },
+      ],
+    };
+    const resources: PlannerResources = {
+      services: {
+        database: {
+          limits: { cpu_cores: 2, memory_bytes: 2 * GIB },
+          reservations: { cpu_cores: 1, memory_bytes: GIB },
+        },
+      },
+    };
+
+    const changes = buildConfigChanges(inspection, resources);
+    const db = changes.find((entry) => entry.service === 'database');
+    expect(db).toBeTruthy();
+
+    // table_definition_cache: 400 < 955 * 0.9 -> raised to ceil(955 * 1.2) rounded up to 100 = 1200
+    expect(Number(db?.changes['table_definition_cache'])).toBe(1200);
+
+    // table_open_cache: Opened_tables/Uptime = 60000/20000 = 3/s >> 5/3600
+    // -> ceil(955 * 1.5) rounded to 100 = 1500
+    expect(Number(db?.changes['table_open_cache'])).toBe(1500);
+
+    // join_buffer_size: Select_full_join=4769 > 0, 4769/133000=0.036 > 0.01 -> 2M
+    expect(Number(db?.changes['join_buffer_size'])).toBe(2 * MIB);
+
+    // innodb_log_buffer_size: Innodb_log_waits=5 > 0 -> 32M
+    expect(Number(db?.changes['innodb_log_buffer_size'])).toBe(32 * MIB);
+
+    // innodb_buffer_pool_instances: buffer pool ~1.2G >= 1G -> min(8, floor(1.2G/128M))
+    expect(Number(db?.changes['innodb_buffer_pool_instances'])).toBeGreaterThanOrEqual(1);
+    expect(Number(db?.changes['innodb_buffer_pool_instances'])).toBeLessThanOrEqual(8);
+
+    // Evidence should include diagnostic ratios
+    expect(db?.evidence).toBeTruthy();
+    expect(Number(db?.evidence?.buffer_pool_hit_rate)).toBeGreaterThan(99);
+    expect(Number(db?.evidence?.joins_without_index)).toBe(4769);
+    expect(Number(db?.evidence?.table_cache_hit_rate)).toBeGreaterThan(0);
+    expect(Number(db?.evidence?.tmp_tables_disk_pct)).toBeGreaterThan(0);
+
+    // Notes should contain diagnostic messages
+    expect(db?.notes?.some((n) => n.includes('table_definition_cache'))).toBe(true);
+    expect(db?.notes?.some((n) => n.includes('joins without indexes'))).toBe(true);
+    expect(db?.notes?.some((n) => n.includes('InnoDB log waits'))).toBe(true);
+  });
+
+  it('captures new DB variables in baseline from app metrics', () => {
+    const inspection: PlannerInspectionPayload = {
+      generated_at: '2026-02-26T00:00:00.000Z',
+      services: [
+        {
+          name: 'db',
+          service: 'database',
+          container_ids: [],
+          replicas: 1,
+          app: {
+            innodb_buffer_pool_size: 512 * MIB,
+            max_connections: 150,
+            table_definition_cache: 400,
+            table_open_cache: 2000,
+            join_buffer_size: 256 * KIB,
+            sort_buffer_size: 512 * KIB,
+            innodb_log_buffer_size: 16 * MIB,
+            innodb_buffer_pool_instances: 1,
+          },
+        },
+      ],
+    };
+
+    const baseline = buildConfigBaseline(inspection);
+    const db = baseline.find((entry) => entry.service === 'database');
+    expect(db).toBeTruthy();
+    expect(db?.changes['table_definition_cache']).toBe(400);
+    expect(db?.changes['table_open_cache']).toBe(2000);
+    expect(db?.changes['join_buffer_size']).toBe(256 * KIB);
+    expect(db?.changes['sort_buffer_size']).toBe(512 * KIB);
+    expect(db?.changes['innodb_log_buffer_size']).toBe(16 * MIB);
+    expect(db?.changes['innodb_buffer_pool_instances']).toBe(1);
   });
 });

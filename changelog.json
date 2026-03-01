@@ -1,21 +1,28 @@
 {
-  "version": "0.4.69",
+  "version": "0.4.70",
   "date": "2026-03-01",
-  "summary": "Encode multiline swarm-job payloads for enforced command policy",
+  "summary": "Workload-aware MariaDB tuning: table caches, join/sort buffers, InnoDB log buffer, buffer pool instances",
   "requires": {
-    "cloud-swarm": ">=1.0.22"
+    "cloud-swarm": ">=1.0.27"
   },
   "changes": [
     {
-      "id": "encode-multiline-runbook-job-scripts",
-      "description": "Swarm replicated-job helpers now rewrite multiline `sh -c`/`sh -lc` payloads into single-line base64-decoded wrappers before `docker service create`, so support runbooks continue to work under the enforced command policy.",
+      "id": "workload-aware-db-tuning",
+      "description": "Config advisor now derives table_definition_cache, table_open_cache, join_buffer_size, sort_buffer_size, innodb_log_buffer_size, and innodb_buffer_pool_instances from live MariaDB status counters (mysqltuner-style). Includes diagnostic evidence and notes in config change payloads.",
       "phase": "migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
     },
     {
-      "id": "restore-scd-db-snapshot-runbook",
-      "description": "Magento SCD DB snapshot generation no longer fails on manager nodes with `argv contains unsafe characters` when the exporter script is passed through the shared swarm-job helper.",
+      "id": "db-tuning-baseline-capture",
+      "description": "Baseline capture now reads the six new tunable variables from running containers and cloud-swarm defaults, ensuring the tuning service preserves existing values when no workload data triggers a change.",
+      "phase": "migrate",
+      "downtimeMinutes": 0,
+      "scope": "environment"
+    },
+    {
+      "id": "db-status-collection-expansion",
+      "description": "Database inspection now collects additional SHOW GLOBAL STATUS counters (Open_tables, Opened_tables, Table_open_cache_hits/misses, Select_full_join, Sort_merge_passes, Sort_rows, Innodb_log_waits, Created_tmp_disk/tables) and SHOW GLOBAL VARIABLES for the new tunable parameters.",
       "phase": "migrate",
       "downtimeMinutes": 0,
       "scope": "environment"

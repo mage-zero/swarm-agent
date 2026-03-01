@@ -1651,6 +1651,30 @@ function extractConfigBaselineFromSwarmServices(services: any[]): PlannerConfigC
       if (queryCache !== null) {
         serviceChanges['query_cache_size'] = queryCache;
       }
+      const tableDefCache = parseEnvNumber(env.MZ_DB_TABLE_DEFINITION_CACHE);
+      if (tableDefCache !== null) {
+        serviceChanges['table_definition_cache'] = tableDefCache;
+      }
+      const tableOpenCache = parseEnvNumber(env.MZ_DB_TABLE_OPEN_CACHE);
+      if (tableOpenCache !== null) {
+        serviceChanges['table_open_cache'] = tableOpenCache;
+      }
+      const joinBuffer = parseMemoryBytesFromEnv(env.MZ_DB_JOIN_BUFFER_SIZE);
+      if (joinBuffer !== null) {
+        serviceChanges['join_buffer_size'] = joinBuffer;
+      }
+      const sortBuffer = parseMemoryBytesFromEnv(env.MZ_DB_SORT_BUFFER_SIZE);
+      if (sortBuffer !== null) {
+        serviceChanges['sort_buffer_size'] = sortBuffer;
+      }
+      const logBuffer = parseMemoryBytesFromEnv(env.MZ_DB_INNODB_LOG_BUFFER_SIZE);
+      if (logBuffer !== null) {
+        serviceChanges['innodb_log_buffer_size'] = logBuffer;
+      }
+      const poolInstances = parseEnvNumber(env.MZ_DB_INNODB_BUFFER_POOL_INSTANCES);
+      if (poolInstances !== null) {
+        serviceChanges['innodb_buffer_pool_instances'] = poolInstances;
+      }
     }
 
     if (Object.keys(serviceChanges).length > 0) {
@@ -1782,6 +1806,30 @@ function extractConfigBaselineFromCloudSwarm(): PlannerConfigChange[] {
   if (queryCache !== null) {
     dbChanges['query_cache_size'] = queryCache;
   }
+  const tableDefCache = parseEnvNumber(dbConf['table_definition_cache']);
+  if (tableDefCache !== null) {
+    dbChanges['table_definition_cache'] = tableDefCache;
+  }
+  const tableOpenCache = parseEnvNumber(dbConf['table_open_cache']);
+  if (tableOpenCache !== null) {
+    dbChanges['table_open_cache'] = tableOpenCache;
+  }
+  const joinBuffer = parseMemoryBytesFromEnv(dbConf['join_buffer_size']);
+  if (joinBuffer !== null) {
+    dbChanges['join_buffer_size'] = joinBuffer;
+  }
+  const sortBuffer = parseMemoryBytesFromEnv(dbConf['sort_buffer_size']);
+  if (sortBuffer !== null) {
+    dbChanges['sort_buffer_size'] = sortBuffer;
+  }
+  const logBuffer = parseMemoryBytesFromEnv(dbConf['innodb_log_buffer_size']);
+  if (logBuffer !== null) {
+    dbChanges['innodb_log_buffer_size'] = logBuffer;
+  }
+  const poolInstances = parseEnvNumber(dbConf['innodb_buffer_pool_instances']);
+  if (poolInstances !== null) {
+    dbChanges['innodb_buffer_pool_instances'] = poolInstances;
+  }
   if (Object.keys(dbChanges).length > 0) {
     changes.push({
       service: 'database',
@@ -1851,7 +1899,18 @@ const INSPECTION_COMMANDS: Record<string, InspectionCommand> = {
     command: [
       'sh',
       '-lc',
-      'MYSQL_PWD="$(cat /run/secrets/db_root_password 2>/dev/null || true)"; if [ -z "$MYSQL_PWD" ]; then exit 0; fi; export MYSQL_PWD; mysql -uroot -N -B -e "SHOW GLOBAL STATUS WHERE Variable_name IN (\'Threads_connected\',\'Threads_running\',\'Slow_queries\',\'Questions\',\'Uptime\',\'Connections\'); SHOW GLOBAL VARIABLES WHERE Variable_name IN (\'innodb_buffer_pool_size\',\'innodb_log_file_size\',\'max_connections\',\'tmp_table_size\',\'max_heap_table_size\',\'thread_cache_size\',\'query_cache_size\');"',
+      'MYSQL_PWD="$(cat /run/secrets/db_root_password 2>/dev/null || true)"; if [ -z "$MYSQL_PWD" ]; then exit 0; fi; export MYSQL_PWD; mysql -uroot -N -B -e "'
+        + "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected','Threads_running','Slow_queries','Questions','Uptime','Connections',"
+        + "'Innodb_buffer_pool_reads','Innodb_buffer_pool_read_requests','Innodb_log_waits','Innodb_log_writes',"
+        + "'Select_full_join','Select_range_check','Created_tmp_disk_tables','Created_tmp_tables',"
+        + "'Sort_merge_passes','Sort_rows','Open_tables','Opened_tables',"
+        + "'Table_open_cache_hits','Table_open_cache_misses','Threads_created',"
+        + "'Binlog_cache_disk_use','Binlog_cache_use','Qcache_hits','Qcache_inserts','Qcache_lowmem_prunes');"
+        + " SHOW GLOBAL VARIABLES WHERE Variable_name IN ('innodb_buffer_pool_size','innodb_log_file_size','max_connections',"
+        + "'tmp_table_size','max_heap_table_size','thread_cache_size','query_cache_size',"
+        + "'table_definition_cache','table_open_cache','join_buffer_size','sort_buffer_size',"
+        + "'innodb_log_buffer_size','innodb_buffer_pool_instances','innodb_io_capacity');"
+        + '"',
     ],
     parser: parseMysqlMetrics,
   },
@@ -1860,7 +1919,18 @@ const INSPECTION_COMMANDS: Record<string, InspectionCommand> = {
     command: [
       'sh',
       '-lc',
-      'MYSQL_PWD="$(cat /run/secrets/db_root_password 2>/dev/null || true)"; if [ -z "$MYSQL_PWD" ]; then exit 0; fi; export MYSQL_PWD; mysql -uroot -N -B -e "SHOW GLOBAL STATUS WHERE Variable_name IN (\'Threads_connected\',\'Threads_running\',\'Slow_queries\',\'Questions\',\'Uptime\',\'Connections\'); SHOW GLOBAL VARIABLES WHERE Variable_name IN (\'innodb_buffer_pool_size\',\'innodb_log_file_size\',\'max_connections\',\'tmp_table_size\',\'max_heap_table_size\',\'thread_cache_size\',\'query_cache_size\');"',
+      'MYSQL_PWD="$(cat /run/secrets/db_root_password 2>/dev/null || true)"; if [ -z "$MYSQL_PWD" ]; then exit 0; fi; export MYSQL_PWD; mysql -uroot -N -B -e "'
+        + "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected','Threads_running','Slow_queries','Questions','Uptime','Connections',"
+        + "'Innodb_buffer_pool_reads','Innodb_buffer_pool_read_requests','Innodb_log_waits','Innodb_log_writes',"
+        + "'Select_full_join','Select_range_check','Created_tmp_disk_tables','Created_tmp_tables',"
+        + "'Sort_merge_passes','Sort_rows','Open_tables','Opened_tables',"
+        + "'Table_open_cache_hits','Table_open_cache_misses','Threads_created',"
+        + "'Binlog_cache_disk_use','Binlog_cache_use','Qcache_hits','Qcache_inserts','Qcache_lowmem_prunes');"
+        + " SHOW GLOBAL VARIABLES WHERE Variable_name IN ('innodb_buffer_pool_size','innodb_log_file_size','max_connections',"
+        + "'tmp_table_size','max_heap_table_size','thread_cache_size','query_cache_size',"
+        + "'table_definition_cache','table_open_cache','join_buffer_size','sort_buffer_size',"
+        + "'innodb_log_buffer_size','innodb_buffer_pool_instances','innodb_io_capacity');"
+        + '"',
     ],
     parser: parseMysqlMetrics,
   },
