@@ -1,17 +1,18 @@
 {
-  "version": "0.4.78",
+  "version": "0.4.79",
   "date": "2026-03-02",
-  "summary": "Fix container CPU/memory metrics on cgroups v2 hosts",
+  "summary": "Pressure-aware tuning with OpenSearch container metrics",
   "requires": {
     "cloud-swarm": ">=1.0.28"
   },
   "changes": [
     {
-      "id": "rebuild-metricbeat-cgroupv2-fix",
-      "description": "Replace metricbeat's per-container autodiscover docker module with a single static module. On cgroups v2 hosts, the autodiscover containers.ids filter was ineffective — each module instance collected metrics for ALL containers, producing duplicate events with blended values. The static module correctly tags per-container CPU/memory/network/diskio metrics.",
-      "phase": "post_migrate",
-      "downtimeMinutes": 0,
-      "scope": "stack"
+      "id": "config-advisor-pressure-aware",
+      "description": "Config-advisor now reads container memory pressure (docker stats ratio or OpenSearch p95) to scale down buffer pool, max_connections, tmp_table_size, and PHP max_children under high memory usage. Host-level cap prevents total buffer pool from exceeding 65% of VPS memory."
+    },
+    {
+      "id": "opensearch-container-metrics",
+      "description": "Tuning pipeline queries OpenSearch for 6-hour per-service container CPU and memory aggregates (avg, max, p95, pct above 80%) from Metricbeat data. These enrich the AI tuning payload and replace hourly docker stats spot-checks for pressure detection when available."
     }
   ]
 }

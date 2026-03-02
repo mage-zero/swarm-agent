@@ -994,7 +994,10 @@ export function buildCandidateProfile(
   }
 
   const placements = buildPlacementHints(inspection, tunedResources, capacity.nodes || []);
-  const configChanges = buildConfigChanges(inspection, tunedResources);
+  const configChanges = buildConfigChanges(inspection, tunedResources, {
+    memory_bytes: totalMem,
+    cpu_cores: totalCpu,
+  });
 
   const profile: PlannerTuningProfile = {
     id: `candidate-${inspection.generated_at}`,

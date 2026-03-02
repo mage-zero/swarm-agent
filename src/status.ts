@@ -2468,6 +2468,83 @@ async function collectMonitoringMetrics(): Promise<Record<string, Record<string,
         }
       }
     } catch { /* Metricbeat data may not exist yet */ }
+
+    // Query Metricbeat for per-service container CPU + memory aggregates (tuning window)
+    const containerQuery = JSON.stringify({
+      size: 0,
+      query: {
+        bool: {
+          must: [
+            { range: { '@timestamp': { gte: 'now-6h' } } },
+            { terms: { 'event.dataset': ['docker.cpu', 'docker.memory'] } },
+          ],
+        },
+      },
+      aggs: {
+        by_service: {
+          terms: { field: 'docker.container.labels.com_docker_swarm_service_name.keyword', size: 50 },
+          aggs: {
+            cpu: {
+              filter: { term: { 'event.dataset': 'docker.cpu' } },
+              aggs: {
+                avg: { avg: { field: 'docker.cpu.total.norm.pct' } },
+                max: { max: { field: 'docker.cpu.total.norm.pct' } },
+                p95: { percentiles: { field: 'docker.cpu.total.norm.pct', percents: [95] } },
+                pct_above_80: { range: { field: 'docker.cpu.total.norm.pct', ranges: [{ from: 0.8 }] } },
+                total_count: { value_count: { field: 'docker.cpu.total.norm.pct' } },
+              },
+            },
+            memory: {
+              filter: { term: { 'event.dataset': 'docker.memory' } },
+              aggs: {
+                avg: { avg: { field: 'docker.memory.usage.pct' } },
+                max: { max: { field: 'docker.memory.usage.pct' } },
+                p95: { percentiles: { field: 'docker.memory.usage.pct', percents: [95] } },
+                pct_above_80: { range: { field: 'docker.memory.usage.pct', ranges: [{ from: 0.8 }] } },
+                total_count: { value_count: { field: 'docker.memory.usage.pct' } },
+              },
+            },
+          },
+        },
+      },
+    });
+    const containerCmd = ['sh', '-c', `curl -sf 'http://localhost:9200/mz-metrics-*/_search' -H 'Content-Type: application/json' -d '${containerQuery.replace(/'/g, "'\\''")}'`];
+    try {
+      const containerResult = await execContainerCommand(containerId, containerCmd, 15000);
+      if (containerResult.exitCode === 0 && containerResult.stdout) {
+        const parsed = JSON.parse(containerResult.stdout);
+        const buckets = parsed?.aggregations?.by_service?.buckets ?? [];
+        for (const bucket of buckets) {
+          const fullName = String(bucket.key ?? '');
+          if (!fullName) continue;
+          const { service: shortName } = parseEnvironmentServiceName(fullName);
+          if (!shortName) continue;
+          if (!result[shortName]) result[shortName] = {};
+
+          const cpu = bucket.cpu;
+          const mem = bucket.memory;
+          const cpuTotal = cpu?.total_count?.value ?? 0;
+          const memTotal = mem?.total_count?.value ?? 0;
+
+          const safeNum = (v: unknown): number | null =>
+            typeof v === 'number' && Number.isFinite(v) ? v : null;
+
+          result[shortName]['os_cpu_avg_pct'] = safeNum(cpu?.avg?.value);
+          result[shortName]['os_cpu_max_pct'] = safeNum(cpu?.max?.value);
+          result[shortName]['os_cpu_p95_pct'] = safeNum(cpu?.p95?.values?.['95.0']);
+          result[shortName]['os_cpu_pct_above_80'] = cpuTotal > 0
+            ? safeNum((cpu?.pct_above_80?.buckets?.[0]?.doc_count ?? 0) / cpuTotal)
+            : null;
+          result[shortName]['os_memory_avg_pct'] = safeNum(mem?.avg?.value);
+          result[shortName]['os_memory_max_pct'] = safeNum(mem?.max?.value);
+          result[shortName]['os_memory_p95_pct'] = safeNum(mem?.p95?.values?.['95.0']);
+          result[shortName]['os_memory_pct_above_80'] = memTotal > 0
+            ? safeNum((mem?.pct_above_80?.buckets?.[0]?.doc_count ?? 0) / memTotal)
+            : null;
+          result[shortName]['os_sample_count'] = Math.max(cpuTotal, memTotal) || null;
+        }
+      }
+    } catch { /* Container metrics data may not exist yet */ }
   } catch {
     // Monitoring stack may not be deployed yet; this is non-fatal
   }
@@ -2511,6 +2588,11 @@ async function buildInspectionForTuning(): Promise<PlannerInspectionPayload> {
         const apmData = monitoringMetrics[apmKey];
         if (apmData) {
           service.app = { ...(service.app || {}), ...apmData };
+        }
+        // Match container-level metrics by short service name (e.g. "database", "php-fpm")
+        const containerData = monitoringMetrics[service.service];
+        if (containerData) {
+          service.app = { ...(service.app || {}), ...containerData };
         }
       }
       // Attach host-level metrics to a synthetic service entry

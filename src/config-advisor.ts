@@ -28,8 +28,23 @@ function buildPhpConfigChanges(
     return null;
   }
 
+  const notes: string[] = [];
+
+  // Memory pressure from docker stats
+  const memoryPressure = typeof evidence?.memory_limit_ratio === 'number'
+    && Number.isFinite(evidence.memory_limit_ratio as number)
+    ? evidence.memory_limit_ratio as number
+    : 0;
+
+  // Scale usable fraction down from 80% when container memory usage > 80%
+  let usableRatio = 0.8;
+  if (memoryPressure > 0.80) {
+    usableRatio = Math.max(0.55, 0.80 - (memoryPressure - 0.80) * 1.5);
+    notes.push(`Memory pressure ${Math.round(memoryPressure * 100)}%; reduced usable ratio to ${Math.round(usableRatio * 100)}%.`);
+  }
+
   const perChild = 256 * MIB;
-  const usable = memoryLimit * 0.8;
+  const usable = memoryLimit * usableRatio;
   const maxChildren = clamp(Math.floor(usable / perChild), 2, 32);
   const phpMemoryLimit = clamp(Math.floor((memoryLimit / Math.max(1, maxChildren)) * 0.8), 256 * MIB, 1024 * MIB);
 
@@ -40,6 +55,8 @@ function buildPhpConfigChanges(
   const startServers = clamp(Math.floor(maxChildren / 2), 2, maxChildren);
   const minSpare = clamp(Math.floor(maxChildren / 4), 1, maxChildren);
   const maxSpare = clamp(Math.floor(maxChildren / 2), 2, maxChildren);
+
+  notes.push('Derived from PHP container memory limit and conservative per-worker sizing.');
 
   return {
     service,
@@ -53,7 +70,7 @@ function buildPhpConfigChanges(
       'fpm.pm.min_spare_servers': minSpare,
       'fpm.pm.max_spare_servers': maxSpare,
     },
-    notes: ['Derived from PHP container memory limit and conservative per-worker sizing.'],
+    notes,
     evidence,
   };
 }
@@ -85,14 +102,37 @@ function buildDatabaseConfigChanges(
   const notes: string[] = [];
   const ev: Record<string, number | string> = { ...evidence };
 
-  // --- Existing memory-based derivations ---
-  const bufferPool = clamp(Math.floor(memoryLimit * 0.6), 256 * MIB, memoryLimit * 0.75);
+  // --- Memory pressure from docker stats ---
+  const memoryPressure = typeof evidence?.memory_limit_ratio === 'number'
+    && Number.isFinite(evidence.memory_limit_ratio as number)
+    ? evidence.memory_limit_ratio as number
+    : 0;
+
+  // --- Memory-based derivations (pressure-aware) ---
+  // Scale buffer pool down from 60% when container memory usage > 85%
+  let bufferPoolRatio = 0.60;
+  if (memoryPressure > 0.85) {
+    bufferPoolRatio = Math.max(0.40, 0.60 - (memoryPressure - 0.85) * 2);
+    notes.push(`Memory pressure ${Math.round(memoryPressure * 100)}%; reduced buffer pool to ${Math.round(bufferPoolRatio * 100)}% of limit.`);
+  }
+  const bufferPool = clamp(Math.floor(memoryLimit * bufferPoolRatio), 256 * MIB, memoryLimit * 0.75);
   const logFile = clamp(Math.floor(bufferPool / 8), 64 * MIB, 512 * MIB);
 
   const memGiB = memoryLimit / GIB;
-  const maxConnections = clamp(Math.round(100 + memGiB * 50), 100, 600);
+  let maxConnections = clamp(Math.round(100 + memGiB * 50), 100, 600);
+  if (memoryPressure > 0.85) {
+    const reduced = clamp(Math.round(maxConnections * (1 - (memoryPressure - 0.85))), 100, maxConnections);
+    if (reduced < maxConnections) {
+      maxConnections = reduced;
+      notes.push(`Reduced max_connections to ${maxConnections} due to memory pressure.`);
+    }
+  }
 
-  const tmpTable = clamp(Math.floor(memoryLimit * 0.05), 32 * MIB, 256 * MIB);
+  // Scale tmp_table_size down from 5% to 3% under pressure
+  const tmpTableRatio = memoryPressure > 0.85
+    ? Math.max(0.03, 0.05 - (memoryPressure - 0.85) * 0.2)
+    : 0.05;
+  const tmpTable = clamp(Math.floor(memoryLimit * tmpTableRatio), 32 * MIB, 256 * MIB);
   const threadCache = clamp(Math.round(maxConnections / 10), 16, 128);
 
   let queryCache = 0;
@@ -230,6 +270,7 @@ function buildDatabaseConfigChanges(
 export function buildConfigChanges(
   inspection: PlannerInspectionPayload,
   resources: PlannerResources,
+  hostCapacity?: { memory_bytes: number; cpu_cores: number },
 ): PlannerConfigChange[] {
   const changes: PlannerConfigChange[] = [];
   const inspectionMap = new Map<string, Record<string, number | string>>();
@@ -246,6 +287,18 @@ export function buildConfigChanges(
       evidence.memory_limit_ratio = entry.docker.memory_limit_bytes > 0
         ? entry.docker.memory_bytes / entry.docker.memory_limit_bytes
         : 0;
+    }
+    // Prefer OpenSearch p95 memory over docker stats average when available
+    const osMemP95 = entry.app?.os_memory_p95_pct;
+    if (typeof osMemP95 === 'number' && Number.isFinite(osMemP95)) {
+      evidence.memory_limit_ratio = osMemP95;
+      evidence.memory_source = 'opensearch_p95';
+    } else {
+      evidence.memory_source = 'docker_stats_avg';
+    }
+    const osCpuP95 = entry.app?.os_cpu_p95_pct;
+    if (typeof osCpuP95 === 'number' && Number.isFinite(osCpuP95)) {
+      evidence.cpu_p95_pct = osCpuP95;
     }
     inspectionMap.set(entry.service, evidence);
   }
@@ -277,6 +330,42 @@ export function buildConfigChanges(
     );
     if (change) {
       changes.push(change);
+    }
+  }
+
+  // Host-level cap: if total buffer pool across all DB services exceeds 65% of host memory,
+  // scale each buffer pool proportionally to fit
+  if (hostCapacity && hostCapacity.memory_bytes > 0) {
+    const hostBudget = hostCapacity.memory_bytes * 0.65;
+    const replicaMap = new Map<string, number>();
+    for (const entry of inspection.services) {
+      replicaMap.set(entry.service, Math.max(1, entry.replicas || 0));
+    }
+
+    let totalBufferPool = 0;
+    const dbChanges: PlannerConfigChange[] = [];
+    for (const change of changes) {
+      if (dbServices.includes(change.service) && typeof change.changes['innodb_buffer_pool_size'] === 'number') {
+        const replicas = replicaMap.get(change.service) || 1;
+        totalBufferPool += (change.changes['innodb_buffer_pool_size'] as number) * replicas;
+        dbChanges.push(change);
+      }
+    }
+
+    if (totalBufferPool > hostBudget && dbChanges.length > 0) {
+      const scaleFactor = hostBudget / totalBufferPool;
+      for (const change of dbChanges) {
+        const original = change.changes['innodb_buffer_pool_size'] as number;
+        const scaled = roundToMiB(Math.floor(original * scaleFactor));
+        if (scaled < original) {
+          change.changes['innodb_buffer_pool_size'] = scaled;
+          change.changes['innodb_log_file_size'] = roundToMiB(clamp(Math.floor(scaled / 8), 64 * MIB, 512 * MIB));
+          if (!change.notes) {
+            change.notes = [];
+          }
+          change.notes.push(`Buffer pool scaled to ${Math.round(scaleFactor * 100)}% (host memory cap).`);
+        }
+      }
     }
   }
 
