@@ -1,5 +1,5 @@
 {
-  "version": "0.4.77",
+  "version": "0.4.78",
   "date": "2026-03-02",
   "summary": "Fix container CPU/memory metrics on cgroups v2 hosts",
   "requires": {
@@ -9,9 +9,9 @@
     {
       "id": "rebuild-metricbeat-cgroupv2-fix",
       "description": "Replace metricbeat's per-container autodiscover docker module with a single static module. On cgroups v2 hosts, the autodiscover containers.ids filter was ineffective — each module instance collected metrics for ALL containers, producing duplicate events with blended values. The static module correctly tags per-container CPU/memory/network/diskio metrics.",
-      "phase": "deploy",
+      "phase": "post_migrate",
       "downtimeMinutes": 0,
-      "scope": "agent"
+      "scope": "stack"
     }
   ]
 }
