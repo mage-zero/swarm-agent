@@ -3517,16 +3517,66 @@ async function ensureDatabaseContainerReady(
   return containerId;
 }
 
+/**
+ * Drop all auto-generated mview triggers (trg_*) before setup:upgrade.
+ *
+ * Magento's Indexer recurring schema scripts rebuild these triggers on every
+ * setup:upgrade run.  However, when the trigger body has changed (e.g. a new
+ * module adds mview subscriptions), Magento sometimes fails to DROP the old
+ * trigger before issuing CREATE, producing "Trigger already exists" (1359).
+ * Pre-emptively dropping them is safe because:
+ *   1. They are always recreated by setup:upgrade recurring scripts.
+ *   2. Cron is already scaled to 0 at this point so no indexer writes happen.
+ *   3. Maintenance mode is enabled so no storefront writes happen.
+ */
+async function dropMviewTriggersBeforeUpgrade(
+  dbContainerId: string,
+  dbName: string,
+  log: (message: string) => void,
+) {
+  const safeDbName = assertSafeIdentifier(dbName, 'database name').replace(/`/g, '``');
+  // Generate DROP statements for all trg_* triggers and pipe them back to mariadb.
+  // DDL statements (DROP TRIGGER) can't be used with PREPARE/EXECUTE, so we use
+  // a subshell pipeline: query → generate DROP statements → execute them.
+  const script = [
+    `mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -N -D ${safeDbName}`,
+    `-e "SELECT CONCAT('DROP TRIGGER IF EXISTS \\\`', trigger_name, '\\\`;')`,
+    `FROM information_schema.triggers`,
+    `WHERE trigger_schema='${safeDbName}' AND trigger_name LIKE 'trg\\\\_%';"`,
+    `| mariadb -uroot -p"$(cat /run/secrets/db_root_password)" -D ${safeDbName}`,
+  ].join(' ');
+  try {
+    const result = await runCommandCaptureWithStatus('docker', [
+      'exec', dbContainerId, 'sh', '-c', script,
+    ]);
+    if (result.code !== 0) {
+      log(`warning: failed to drop mview triggers (exit ${result.code}): ${(result.stderr || '').trim()}`);
+    } else {
+      log('dropped mview triggers (trg_*) before setup:upgrade');
+    }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    log(`warning: failed to drop mview triggers: ${msg}`);
+  }
+}
+
 async function runSetupUpgradeWithRetry(
   containerId: string,
   stackName: string,
   log: (message: string) => void,
+  dbContainerId?: string,
+  dbName?: string,
 ) {
   const maxAttempts = 3;
   let lastError: Error | null = null;
   let adminContainerId = containerId;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
+      // Drop auto-generated mview triggers before each attempt to prevent
+      // "Trigger already exists" errors from Magento's recurring schema scripts.
+      if (dbContainerId && dbName) {
+        await dropMviewTriggersBeforeUpgrade(dbContainerId, dbName, log);
+      }
       adminContainerId = await ensureMagentoEnvWrapperWithRetry(adminContainerId, stackName, log);
       const result = await runMagentoCommandWithStatus(
         adminContainerId,
@@ -3552,6 +3602,7 @@ async function runSetupUpgradeWithRetry(
         || message.includes('Connection to Redis')
         || message.includes('redis-cache')
         || message.includes('Lock wait timeout')
+        || message.includes('already exists')
       ) {
         lastError = error instanceof Error ? error : new Error(message);
         log(`setup:upgrade attempt ${attempt} failed: ${message}`);
@@ -4733,7 +4784,7 @@ async function processDeployment(recordPath: string) {
       };
       writeJsonFileBestEffort(recordPath, recordMeta);
 
-      const upgradeResult = await runSetupUpgradeWithRetry(adminContainerId, stackName, log);
+      const upgradeResult = await runSetupUpgradeWithRetry(adminContainerId, stackName, log, dbContainerId, envVars.MYSQL_DATABASE || 'magento');
       upgradeWarning = upgradeResult.warning;
       if (upgradeWarning && upgradeResult.message) {
         console.warn(`${logPrefix} setup:upgrade warning: ${upgradeResult.message}`);

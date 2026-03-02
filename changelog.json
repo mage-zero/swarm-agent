@@ -1,18 +1,11 @@
 {
-  "version": "0.4.75",
+  "version": "0.4.76",
   "date": "2026-03-02",
-  "summary": "Smoke check resilience: try multiple container types for exec probes + external hostname fallback",
+  "summary": "Drop mview triggers before setup:upgrade to prevent 'already exists' errors",
   "changes": [
     {
-      "id": "smoke-check-multi-container-probe",
-      "description": "Smoke checks now try php-fpm, nginx, php-fpm-admin, and cron containers when looking for a local container to exec into. Previously only tried php-fpm, which could miss if that service wasn't scheduled on the agent's node.",
-      "phase": "deploy",
-      "downtimeMinutes": 0,
-      "scope": "agent"
-    },
-    {
-      "id": "smoke-check-external-fallback",
-      "description": "When all internal overlay-network probes fail after the 3-minute retry window, the smoke check now tries an external HTTPS probe against the environment hostname. If the site responds 2xx/3xx externally, the deploy is marked healthy. This prevents false failures from Docker overlay DNS issues.",
+      "id": "drop-mview-triggers-before-upgrade",
+      "description": "Before each setup:upgrade attempt, drop all auto-generated mview triggers (trg_*). Magento's recurring schema scripts rebuild these on every run, but sometimes fail to DROP before CREATE when trigger bodies change (e.g. new module adds mview subscriptions), producing error 1359 'Trigger already exists'. Pre-emptive drop is safe because triggers are always recreated and cron/storefront writes are disabled during deploy.",
       "phase": "deploy",
       "downtimeMinutes": 0,
       "scope": "agent"
