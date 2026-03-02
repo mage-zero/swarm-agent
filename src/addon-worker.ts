@@ -376,6 +376,10 @@ async function deployAddon(record: DeploymentRecord, deploymentId: string) {
   const dbHost = stackServiceName(environmentId, 'proxysql');
   const rabbitHost = stackServiceName(environmentId, 'rabbitmq');
 
+  const containerLabels = [
+    `com.docker.stack.namespace=${stackName}`,
+  ];
+
   const baseLabels = [
     `com.docker.stack.namespace=${stackName}`,
     'mz.addon=true',
@@ -442,6 +446,7 @@ async function deployAddon(record: DeploymentRecord, deploymentId: string) {
       '--reserve-memory',
       formatMemoryBytes(resources.reservations.memory_bytes),
       ...baseLabels.flatMap((item) => ['--label', item]),
+      ...containerLabels.flatMap((item) => ['--container-label', item]),
       ...networks.flatMap((n) => ['--network', n]),
       '--secret',
       `source=${dbSecretName},target=db_password`,
@@ -466,6 +471,7 @@ async function deployAddon(record: DeploymentRecord, deploymentId: string) {
       '--reserve-memory',
       formatMemoryBytes(resources.reservations.memory_bytes),
       ...baseLabels.flatMap((item) => ['--label-add', item]),
+      ...containerLabels.flatMap((item) => ['--container-label-add', item]),
       serviceName,
     ], { timeoutMs: 120_000 });
   }

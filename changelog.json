@@ -1,11 +1,11 @@
 {
-  "version": "0.4.80",
+  "version": "0.4.81",
   "date": "2026-03-02",
-  "summary": "Configurable networks for bespoke addon services",
+  "summary": "Add container labels to addon services for Metricbeat discovery",
   "changes": [
     {
-      "id": "addon-configurable-networks",
-      "description": "Addon deploy payload now accepts an optional networks array to control which Docker overlay networks the service is attached to. Defaults to mz-backend + mz-infrastructure when omitted (backward compatible)."
+      "id": "addon-container-labels",
+      "description": "Addon services now set com.docker.stack.namespace as a container label (--container-label) in addition to the service label. This allows Metricbeat to discover and collect metrics from addon containers."
     }
   ]
 }
