@@ -31,6 +31,7 @@ type AddonDeployPayload = {
   slug?: string;
   artifact_key?: string;
   image_tag?: string;
+  networks?: string[];
 };
 
 function readNodeFile(name: string) {
@@ -188,6 +189,7 @@ export async function handleDeployAddon(c: { req: { raw: Request; header: (name:
     slug,
     artifact_key: artifactKey,
     image_tag: body?.image_tag ? String(body.image_tag).trim() : undefined,
+    networks: Array.isArray(body?.networks) ? body.networks.filter((n): n is string => typeof n === 'string') : undefined,
   }, deploymentId);
 
   return {

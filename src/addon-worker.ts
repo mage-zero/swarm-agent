@@ -13,6 +13,7 @@ type AddonDeployPayload = {
   slug?: string;
   artifact_key?: string;
   image_tag?: string;
+  networks?: string[];
 };
 
 type DeploymentRecord = {
@@ -322,6 +323,11 @@ async function deployAddon(record: DeploymentRecord, deploymentId: string) {
     throw new Error('Invalid addon deployment record payload');
   }
 
+  const DEFAULT_ADDON_NETWORKS = ['mz-backend', 'mz-infrastructure'];
+  const networks = Array.isArray(payload.networks) && payload.networks.length > 0
+    ? payload.networks.filter((n): n is string => typeof n === 'string')
+    : DEFAULT_ADDON_NETWORKS;
+
   const resources = resolveAddonResourceSpec(slug);
 
   const imageTag = (payload.image_tag || deploymentId).toString().trim().slice(0, 64) || deploymentId.slice(0, 12);
@@ -436,10 +442,7 @@ async function deployAddon(record: DeploymentRecord, deploymentId: string) {
       '--reserve-memory',
       formatMemoryBytes(resources.reservations.memory_bytes),
       ...baseLabels.flatMap((item) => ['--label', item]),
-      '--network',
-      'mz-backend',
-      '--network',
-      'mz-infrastructure',
+      ...networks.flatMap((n) => ['--network', n]),
       '--secret',
       `source=${dbSecretName},target=db_password`,
       '--secret',

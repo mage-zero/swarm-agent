@@ -1,18 +1,11 @@
 {
-  "version": "0.4.79",
+  "version": "0.4.80",
   "date": "2026-03-02",
-  "summary": "Pressure-aware tuning with OpenSearch container metrics",
-  "requires": {
-    "cloud-swarm": ">=1.0.28"
-  },
+  "summary": "Configurable networks for bespoke addon services",
   "changes": [
     {
-      "id": "config-advisor-pressure-aware",
-      "description": "Config-advisor now reads container memory pressure (docker stats ratio or OpenSearch p95) to scale down buffer pool, max_connections, tmp_table_size, and PHP max_children under high memory usage. Host-level cap prevents total buffer pool from exceeding 65% of VPS memory."
-    },
-    {
-      "id": "opensearch-container-metrics",
-      "description": "Tuning pipeline queries OpenSearch for 6-hour per-service container CPU and memory aggregates (avg, max, p95, pct above 80%) from Metricbeat data. These enrich the AI tuning payload and replace hourly docker stats spot-checks for pressure detection when available."
+      "id": "addon-configurable-networks",
+      "description": "Addon deploy payload now accepts an optional networks array to control which Docker overlay networks the service is attached to. Defaults to mz-backend + mz-infrastructure when omitted (backward compatible)."
     }
   ]
 }
