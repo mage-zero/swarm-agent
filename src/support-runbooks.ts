@@ -1283,6 +1283,22 @@ function normalizeScdDbRedactValuePatterns(input: unknown): string[] {
   return valid.length ? valid : Array.from(DEFAULT_SCD_DB_REDACT_VALUE_PATTERNS);
 }
 
+/** Validate and deduplicate extra data tables requested by module compat patches. */
+function normalizeExtraDataTables(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  const coreSet = new Set<string>(SCD_DB_SNAPSHOT_TABLES);
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const raw of input) {
+    const name = String(raw ?? '').trim();
+    if (!name || !/^[A-Za-z0-9_]+$/.test(name)) continue;
+    if (coreSet.has(name) || seen.has(name)) continue;
+    seen.add(name);
+    result.push(name);
+  }
+  return result;
+}
+
 function parseScdDbSnapshotPayload(logs: string): ScdDbSnapshotPayload | null {
   const startIdx = logs.indexOf(SCD_DB_SNAPSHOT_PAYLOAD_BEGIN);
   if (startIdx === -1) return null;
@@ -1308,11 +1324,13 @@ function buildScdDbSnapshotExporterScript(environmentId: number, input: Record<s
   const profile = String(input.profile ?? SCD_DB_SNAPSHOT_PROFILE).trim() || SCD_DB_SNAPSHOT_PROFILE;
   const redactPathPatterns = normalizeScdDbRedactPathPatterns(input.redact_path_patterns);
   const redactValuePatterns = normalizeScdDbRedactValuePatterns(input.redact_value_patterns);
+  const extraDataTables = normalizeExtraDataTables(input.extra_data_tables);
   const config = {
     profile,
     environment_id: environmentId,
     tables: Array.from(SCD_DB_SNAPSHOT_TABLES),
     optional_tables: Array.from(SCD_DB_SNAPSHOT_OPTIONAL_TABLES),
+    extra_data_tables: extraDataTables,
     redact_path_patterns: redactPathPatterns,
     redact_value_patterns: redactValuePatterns,
     payload_begin: SCD_DB_SNAPSHOT_PAYLOAD_BEGIN,
@@ -1435,6 +1453,42 @@ function buildScdDbSnapshotExporterScript(environmentId: number, input: Record<s
     "  $rowCounts[$table] = $count;",
     "  $included[] = $table;",
     "}",
+    "// Extra data tables requested by module compat patches (optional, with data)",
+    "$extraDataTables = array_values(array_filter(array_map('strval', (array)($cfg['extra_data_tables'] ?? []))));",
+    "$extraIncluded = [];",
+    "foreach ($extraDataTables as $et) {",
+    "  if (!preg_match('/^[A-Za-z0-9_]+$/', $et)) continue;",
+    "  if (!$tableExists($et)) { $skipped[] = $et; continue; }",
+    "  $cr = $pdo->query('SHOW CREATE TABLE `'.$et.'`')->fetch(PDO::FETCH_ASSOC);",
+    "  if (!is_array($cr) || !isset($cr['Create Table'])) continue;",
+    "  $lines[] = 'DROP TABLE IF EXISTS `'.$et.'`;';",
+    "  $lines[] = rtrim((string)$cr['Create Table']) . ';';",
+    "  $stmt = $pdo->query('SELECT * FROM `'.$et.'`');",
+    "  $count = 0;",
+    "  while (($row = $stmt->fetch(PDO::FETCH_ASSOC)) !== false) {",
+    "    $cols = []; $vals = [];",
+    "    foreach ($row as $col => $val) {",
+    "      $cols[] = '`' . str_replace('`', '``', (string)$col) . '`';",
+    "      $vals[] = $sqlValue($val);",
+    "    }",
+    "    $lines[] = 'INSERT INTO `'.$et.'` (' . implode(', ', $cols) . ') VALUES (' . implode(', ', $vals) . ');';",
+    "    $count++;",
+    "  }",
+    "  $rowCounts[$et] = $count;",
+    "  $extraIncluded[] = $et;",
+    "}",
+    "// Structure-only dump for all other tables so CI has full schema",
+    "$dataTableSet = array_flip(array_merge($tables, $extraIncluded));",
+    "$schemaOnly = [];",
+    "$allTables = $pdo->query(\"SELECT TABLE_NAME FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' ORDER BY TABLE_NAME\")->fetchAll(PDO::FETCH_COLUMN);",
+    "foreach ($allTables as $t) {",
+    "  if (isset($dataTableSet[$t])) continue;",
+    "  if (!preg_match('/^[A-Za-z0-9_]+$/', $t)) continue;",
+    "  $cr = $pdo->query('SHOW CREATE TABLE `'.$t.'`')->fetch(PDO::FETCH_ASSOC);",
+    "  if (!is_array($cr) || !isset($cr['Create Table'])) continue;",
+    "  $lines[] = 'CREATE TABLE IF NOT EXISTS ' . substr(rtrim((string)$cr['Create Table']), strlen('CREATE TABLE ')) . ';';",
+    "  $schemaOnly[] = $t;",
+    "}",
     "$lines[] = 'SET FOREIGN_KEY_CHECKS=1;';",
     "$sql = implode(PHP_EOL, $lines) . PHP_EOL;",
     "$gz = gzencode($sql, 9);",
@@ -1445,6 +1499,8 @@ function buildScdDbSnapshotExporterScript(environmentId: number, input: Record<s
     "  'generated_at' => gmdate('c'),",
     "  'root_path' => $root,",
     "  'included_tables' => array_values($included),",
+    "  'extra_data_tables' => array_values($extraIncluded),",
+    "  'schema_only_tables' => array_values($schemaOnly),",
     "  'skipped_tables' => array_values($skipped),",
     "  'row_counts' => $rowCounts,",
     "  'redaction' => [",
@@ -5343,6 +5399,7 @@ export const __testing = {
   parseScdDbSnapshotPayload,
   normalizeScdDbRedactPathPatterns,
   normalizeScdDbRedactValuePatterns,
+  normalizeExtraDataTables,
   buildScdDbSnapshotExporterScript,
   parseNodeResourceStats,
   hasCapacityPlacementSignal,

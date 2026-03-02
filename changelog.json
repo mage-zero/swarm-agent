@@ -1,21 +1,18 @@
 {
-  "version": "0.4.71",
-  "date": "2026-03-01",
-  "summary": "Deploy reliability: tolerate zero-replica cohort services and pass explicit admin replicas",
-  "requires": {
-    "cloud-swarm": ">=1.0.27"
-  },
+  "version": "0.4.72",
+  "date": "2026-03-02",
+  "summary": "SCD snapshot includes full DB schema and supports extra data tables from module compat patches",
   "changes": [
     {
-      "id": "release-cohort-zero-replica-skip",
-      "description": "Release cohort gating now skips task-readiness waits for services explicitly scaled to 0 replicas when their service spec already points at the expected image tag, preventing false deploy failures on intentionally suspended services.",
+      "id": "scd-snapshot-full-schema",
+      "description": "The SCD DB snapshot exporter now includes CREATE TABLE IF NOT EXISTS statements for all tables beyond the 6 core data tables. This gives CI builds a complete database schema so Magento CLI bootstraps correctly with install/date set.",
       "phase": "migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
     },
     {
-      "id": "admin-replica-env-explicit",
-      "description": "Deploys now pass an explicit MZ_PHP_FPM_ADMIN_REPLICAS value alongside cron suspension so admin PHP-FPM replica counts stay independent from cron replica overrides.",
+      "id": "scd-snapshot-extra-data-tables",
+      "description": "Module compat patches can now declare snapshot_tables to request additional tables with data in the SCD snapshot. The build workflow collects these from all patches and passes them as extra_data_tables to the snapshot API. Tables are optional (skipped if missing) and validated for safe table names.",
       "phase": "migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
