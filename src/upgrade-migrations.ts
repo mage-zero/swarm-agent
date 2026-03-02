@@ -1371,3 +1371,43 @@ registerMigration('sync-magento-datadog-tracing-env', async (ctx) => {
     );
   }
 });
+
+registerMigration('rebuild-metricbeat-cgroupv2-fix', async (ctx) => {
+  await ensureCloudSwarmRepo(ctx.cloudSwarmDir);
+
+  // Rebuild metricbeat image with static docker module (fixes cgroups v2)
+  const scriptPath = path.join(ctx.cloudSwarmDir, 'scripts', 'build-monitoring.sh');
+  if (!fs.existsSync(scriptPath)) {
+    throw new Error(`build-monitoring.sh not found at ${scriptPath}`);
+  }
+  const env = await buildMonitoringEnv(ctx.cloudSwarmDir);
+  const build = await runCommand('bash', [scriptPath], 600_000, {
+    cwd: ctx.cloudSwarmDir,
+    env,
+  });
+  if (build.code !== 0) {
+    throw new Error(`build-monitoring.sh failed (exit ${build.code}): ${build.stderr}`);
+  }
+
+  // Redeploy monitoring stack to pick up new metricbeat image
+  const stacksDir = path.join(ctx.cloudSwarmDir, 'stacks');
+  const baseFile = path.join(stacksDir, 'monitoring-base.yml');
+  const overrideFile = path.join(stacksDir, 'monitoring.yml');
+  if (!fs.existsSync(baseFile) || !fs.existsSync(overrideFile)) {
+    throw new Error(`Monitoring stack files not found in ${stacksDir}`);
+  }
+  const deploy = await runCommand('docker', [
+    'stack', 'deploy',
+    '--with-registry-auth',
+    '-c', baseFile,
+    '-c', overrideFile,
+    'mz-monitoring',
+  ], 120_000, {
+    cwd: ctx.cloudSwarmDir,
+    env,
+  });
+  if (deploy.code !== 0) {
+    throw new Error(`Monitoring stack deploy failed (exit ${deploy.code}): ${deploy.stderr}`);
+  }
+  console.log('upgrade.migration.rebuild_metricbeat_cgroupv2_fix: rebuilt and redeployed monitoring stack');
+});

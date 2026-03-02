@@ -1,11 +1,14 @@
 {
-  "version": "0.4.76",
+  "version": "0.4.77",
   "date": "2026-03-02",
-  "summary": "Drop mview triggers before setup:upgrade to prevent 'already exists' errors",
+  "summary": "Fix container CPU/memory metrics on cgroups v2 hosts",
+  "requires": {
+    "cloud-swarm": ">=1.0.28"
+  },
   "changes": [
     {
-      "id": "drop-mview-triggers-before-upgrade",
-      "description": "Before each setup:upgrade attempt, drop all auto-generated mview triggers (trg_*). Magento's recurring schema scripts rebuild these on every run, but sometimes fail to DROP before CREATE when trigger bodies change (e.g. new module adds mview subscriptions), producing error 1359 'Trigger already exists'. Pre-emptive drop is safe because triggers are always recreated and cron/storefront writes are disabled during deploy.",
+      "id": "rebuild-metricbeat-cgroupv2-fix",
+      "description": "Replace metricbeat's per-container autodiscover docker module with a single static module. On cgroups v2 hosts, the autodiscover containers.ids filter was ineffective — each module instance collected metrics for ALL containers, producing duplicate events with blended values. The static module correctly tags per-container CPU/memory/network/diskio metrics.",
       "phase": "deploy",
       "downtimeMinutes": 0,
       "scope": "agent"
