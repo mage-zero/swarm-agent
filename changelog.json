@@ -1,18 +1,11 @@
 {
-  "version": "0.4.73",
+  "version": "0.4.74",
   "date": "2026-03-02",
-  "summary": "SCD snapshot includes full DB schema and supports extra data tables from module compat patches",
+  "summary": "SCD snapshot includes eav_entity_type as core data table for di:compile compatibility",
   "changes": [
     {
-      "id": "scd-snapshot-full-schema",
-      "description": "The SCD DB snapshot exporter now includes CREATE TABLE IF NOT EXISTS statements for all tables beyond the 6 core data tables. This gives CI builds a complete database schema so Magento CLI bootstraps correctly with install/date set.",
-      "phase": "migrate",
-      "downtimeMinutes": 0,
-      "scope": "environment"
-    },
-    {
-      "id": "scd-snapshot-extra-data-tables",
-      "description": "Module compat patches can now declare snapshot_tables to request additional tables with data in the SCD snapshot. The build workflow collects these from all patches and passes them as extra_data_tables to the snapshot API. Tables are optional (skipped if missing) and validated for safe table names.",
+      "id": "scd-snapshot-eav-entity-type",
+      "description": "Added eav_entity_type to the core SCD snapshot data tables. The structure-only dump created this table empty, but Magento's di:compile queries it during plugin list generation and fails with 'Invalid entity_type specified: catalog_product' when it has no rows.",
       "phase": "migrate",
       "downtimeMinutes": 0,
       "scope": "environment"
