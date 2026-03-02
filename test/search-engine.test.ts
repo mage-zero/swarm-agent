@@ -238,17 +238,17 @@ describe('resolveFrontendRuntimePolicy', () => {
     });
   });
 
-  it('uses stop-first with one-per-node spread for HA replicas', () => {
+  it('uses start-first with unconstrained placement for HA replicas', () => {
     expect(resolveFrontendRuntimePolicy(2)).toEqual({
       replicas: 2,
-      max_replicas_per_node: 1,
-      update_order: 'stop-first',
+      max_replicas_per_node: 0,
+      update_order: 'start-first',
       restart_condition: 'any',
     });
     expect(resolveFrontendRuntimePolicy(4)).toEqual({
       replicas: 4,
-      max_replicas_per_node: 1,
-      update_order: 'stop-first',
+      max_replicas_per_node: 0,
+      update_order: 'start-first',
       restart_condition: 'any',
     });
   });

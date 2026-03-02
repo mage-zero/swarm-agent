@@ -101,10 +101,13 @@ export function resolveFrontendRuntimePolicy(targetReplicas: number): FrontendRu
   const replicas = Math.max(1, Math.round(Number(targetReplicas) || 1));
   return {
     replicas,
-    // Keep single replica unconstrained so start-first can overlap briefly.
-    max_replicas_per_node: replicas > 1 ? 1 : 0,
-    // With one-per-node spread, start-first can deadlock when all nodes are occupied.
-    update_order: replicas > 1 ? 'stop-first' : 'start-first',
+    // Unconstrained per-node placement. Docker's default spread scheduling distributes
+    // replicas across nodes. A hard max_replicas_per_node=1 causes start-first deadlocks
+    // when all nodes already have a task (can't schedule the replacement alongside the old).
+    max_replicas_per_node: 0,
+    // start-first: new task starts before old stops, avoiding downtime during rolling updates.
+    // With max_replicas_per_node=0, no deadlock risk.
+    update_order: 'start-first',
     restart_condition: 'any',
   };
 }
