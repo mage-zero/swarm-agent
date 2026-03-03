@@ -7,7 +7,7 @@ import { buildCapacityPayload, buildPlannerPayload, isSwarmManager, readConfig }
 import { parseListObjectsV2Xml } from './r2-list.js';
 import { getDbBackupZstdLevel } from './backup-utils.js';
 import { buildJobName, envServiceName, inspectServiceSpec, listServiceTasks, runSwarmJob } from './swarm.js';
-import { bootstrapMonitoringDashboards } from './monitoring-dashboards.js';
+import { bootstrapMonitoringDashboardsWithRetry } from './monitoring-dashboards.js';
 import { resolveDatadogTraceEnv } from './lib/apm-tracing.js';
 import {
   classifyDeployError,
@@ -1945,29 +1945,25 @@ async function ensureCloudflaredMonitoringNetwork(log: (msg: string) => void): P
 }
 
 async function ensureMonitoringDashboards(log: (msg: string) => void): Promise<void> {
-  let lastError = '';
-  for (let attempt = 1; attempt <= MONITORING_DASHBOARDS_BOOTSTRAP_RETRIES; attempt += 1) {
-    try {
-      const result = await bootstrapMonitoringDashboards();
-      log(
-        `monitoring dashboards ready (${result.dashboard_ids.join(', ')}, objects=${result.upserted_objects})`
-      );
-      return;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      lastError = message;
-      if (attempt >= MONITORING_DASHBOARDS_BOOTSTRAP_RETRIES) {
-        break;
-      }
-      log(`monitoring dashboards bootstrap retry ${attempt}: ${message}`);
-      await new Promise((resolve) => setTimeout(resolve, MONITORING_DASHBOARDS_BOOTSTRAP_DELAY_MS));
+  try {
+    const result = await bootstrapMonitoringDashboardsWithRetry({
+      attempts: MONITORING_DASHBOARDS_BOOTSTRAP_RETRIES,
+      delayMs: MONITORING_DASHBOARDS_BOOTSTRAP_DELAY_MS,
+      onRetry: (attempt, message) => {
+        log(`monitoring dashboards bootstrap retry ${attempt}: ${message}`);
+      },
+    });
+    log(
+      `monitoring dashboards ready (${result.dashboard_ids.join(', ')}, objects=${result.upserted_objects})`
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const finalMessage = `monitoring dashboards bootstrap failed: ${message || 'unknown error'}`;
+    if (MONITORING_DASHBOARDS_REQUIRED) {
+      throw new Error(finalMessage);
     }
+    log(`${finalMessage}; continuing deploy`);
   }
-  const message = `monitoring dashboards bootstrap failed: ${lastError || 'unknown error'}`;
-  if (MONITORING_DASHBOARDS_REQUIRED) {
-    throw new Error(message);
-  }
-  log(`${message}; continuing deploy`);
 }
 
 /**

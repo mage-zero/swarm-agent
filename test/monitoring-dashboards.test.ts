@@ -60,6 +60,23 @@ describe('monitoring-dashboards helpers', () => {
     expect(dashboard?.attributes?.title).toBe('3) Varnish');
   });
 
+  it('restores useful default time ranges for shared dashboards', () => {
+    const objects = __testing.buildSavedObjects();
+    const ops = objects.find((object) => object.type === 'dashboard' && object.id === 'mz-dashboard-ops');
+    const containers = objects.find((object) => object.type === 'dashboard' && object.id === 'mz-dashboard-magento-containers');
+    const varnish = objects.find((object) => object.type === 'dashboard' && object.id === 'mz-dashboard-varnish');
+
+    expect(ops?.attributes?.timeRestore).toBe(true);
+    expect(ops?.attributes?.timeFrom).toBe('now-24h');
+    expect(ops?.attributes?.timeTo).toBe('now');
+    expect(containers?.attributes?.timeRestore).toBe(true);
+    expect(containers?.attributes?.timeFrom).toBe('now-24h');
+    expect(containers?.attributes?.timeTo).toBe('now');
+    expect(varnish?.attributes?.timeRestore).toBe(true);
+    expect(varnish?.attributes?.timeFrom).toBe('now-7d');
+    expect(varnish?.attributes?.timeTo).toBe('now');
+  });
+
   it('uses the corrected CPU dataset and preserves zero values in container CPU charts', () => {
     const objects = __testing.buildSavedObjects();
     const cpuByService = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-container-cpu-by-service');

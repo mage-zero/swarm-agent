@@ -536,6 +536,44 @@ export function approveCapacityChangeProfile(profileId: string) {
   } as const;
 }
 
+export function disapproveCapacityChangeProfile(profileId: string) {
+  const stored = loadCapacityChangeProfiles();
+  const approvedProfiles = pruneCapacityProfiles([...(stored?.approved || [])], Date.now());
+  if (approvedProfiles.length === 0) {
+    return { status: 404, body: { error: 'No approved profile available' } } as const;
+  }
+
+  const disapprovedProfile = approvedProfiles.find((profile) => profile.id === profileId);
+  if (!disapprovedProfile) {
+    return { status: 404, body: { error: 'Approved profile not found' } } as const;
+  }
+
+  const remainingProfiles = approvedProfiles
+    .filter((profile) => profile.id !== profileId)
+    .sort((a, b) => Date.parse(a.updated_at) - Date.parse(b.updated_at));
+
+  const now = new Date().toISOString();
+  const baseProfile = stored?.base || createBaseProfile(0, 0, 0, now);
+  const activeProfileId = remainingProfiles.length > 0
+    ? remainingProfiles[remainingProfiles.length - 1].id
+    : baseProfile.id;
+
+  saveCapacityChangeProfiles({
+    base: baseProfile,
+    recommended: stored?.recommended,
+    approved: remainingProfiles,
+    last_recommended_at: stored?.last_recommended_at,
+  });
+
+  return {
+    status: 200,
+    body: {
+      disapproved_profile: disapprovedProfile,
+      active_profile_id: activeProfileId,
+    },
+  } as const;
+}
+
 export function buildCapacityChangePayload(params: {
   capacity: {
     generated_at: string;

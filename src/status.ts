@@ -15,7 +15,12 @@ import type {
   PlannerTuningPayload,
   PlannerTuningProfile,
 } from './planner-types.js';
-import { approveCapacityChangeProfile, buildCapacityChangePayload, fetchVpsCatalog } from './capacity-change.js';
+import {
+  approveCapacityChangeProfile,
+  buildCapacityChangePayload,
+  disapproveCapacityChangeProfile,
+  fetchVpsCatalog,
+} from './capacity-change.js';
 import { buildNodeHeaders, buildSignature } from './node-hmac.js';
 import {
   applyAiAdjustments,
@@ -129,7 +134,7 @@ type PlannerPayload = {
   capacity_change: PlannerCapacityChangePayload;
 };
 
-type TuningApprovalRequest = {
+type TuningProfileMutationRequest = {
   profile_id?: string;
   profile_type?: string;
 };
@@ -146,6 +151,10 @@ export type TuningApprovalResponse =
       recommended_updated_at?: string;
     };
   };
+
+export type TuningDisapprovalResponse =
+  | { status: 200; body: { disapproved_profile: Record<string, unknown>; active_profile_id: string } }
+  | { status: 404; body: { error: string } };
 
 type InspectionHistoryEntry = {
   captured_at: string;
@@ -2911,13 +2920,28 @@ export async function handleTuningApprovalRequest(request: Request) {
     return { status: 401, body: { error: 'Unauthorized' } } as const;
   }
 
-  const body = await request.json().catch(() => ({})) as TuningApprovalRequest;
+  const body = await request.json().catch(() => ({})) as TuningProfileMutationRequest;
   const expectedId = typeof body?.profile_id === 'string' ? body.profile_id.trim() : '';
   if (!expectedId) {
     return { status: 400, body: { error: 'Missing profile_id' } } as const;
   }
   const profileType = typeof body?.profile_type === 'string' ? body.profile_type.trim() : 'tuning';
   return approveTuningProfile(expectedId, profileType);
+}
+
+export async function handleTuningDisapprovalRequest(request: Request) {
+  const authorized = await validateNodeRequest(request);
+  if (!authorized) {
+    return { status: 401, body: { error: 'Unauthorized' } } as const;
+  }
+
+  const body = await request.json().catch(() => ({})) as TuningProfileMutationRequest;
+  const profileId = typeof body?.profile_id === 'string' ? body.profile_id.trim() : '';
+  if (!profileId) {
+    return { status: 400, body: { error: 'Missing profile_id' } } as const;
+  }
+  const profileType = typeof body?.profile_type === 'string' ? body.profile_type.trim() : 'tuning';
+  return disapproveTuningProfile(profileId, profileType);
 }
 
 export function approveTuningProfile(expectedId: string, profileType = 'tuning'): TuningApprovalResponse {
@@ -2975,6 +2999,47 @@ export function approveTuningProfile(expectedId: string, profileType = 'tuning')
     body: {
       approved_profile: approvedProfile,
       active_profile_id: approvedProfile.id,
+    },
+  } as const;
+}
+
+export function disapproveTuningProfile(profileId: string, profileType = 'tuning'): TuningDisapprovalResponse {
+  if (profileType === 'capacity_change') {
+    return disapproveCapacityChangeProfile(profileId);
+  }
+
+  const stored = loadTuningProfiles();
+  const approvedProfiles = pruneApprovedProfiles(stored?.approved || [], Date.now());
+  if (approvedProfiles.length === 0) {
+    return { status: 404, body: { error: 'No approved profile available' } } as const;
+  }
+
+  const disapprovedProfile = approvedProfiles.find((profile) => profile.id === profileId);
+  if (!disapprovedProfile) {
+    return { status: 404, body: { error: 'Approved profile not found' } } as const;
+  }
+
+  const remainingProfiles = approvedProfiles.filter((profile) => profile.id !== profileId);
+  const now = new Date().toISOString();
+  const baseProfile = stored?.base || createBaseProfile(buildPlannerResourceDefaults(), now);
+  const nextActiveProfile = [...remainingProfiles].sort((a, b) => {
+    const aTime = Date.parse(a.updated_at || a.created_at || '') || 0;
+    const bTime = Date.parse(b.updated_at || b.created_at || '') || 0;
+    return bTime - aTime;
+  })[0] || baseProfile;
+
+  saveTuningProfiles({
+    base: baseProfile,
+    recommended: stored?.recommended,
+    approved: remainingProfiles,
+    last_recommended_at: stored?.last_recommended_at,
+  });
+
+  return {
+    status: 200,
+    body: {
+      disapproved_profile: disapprovedProfile,
+      active_profile_id: nextActiveProfile.id,
     },
   } as const;
 }

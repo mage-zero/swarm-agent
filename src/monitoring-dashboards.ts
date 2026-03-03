@@ -8,6 +8,19 @@ const DASHBOARDS_BASE_URL = 'http://127.0.0.1:5601';
 const OPENSEARCH_BASE_URL = 'http://opensearch:9200';
 const DASHBOARDS_READY_TIMEOUT_MS = Number(process.env.MZ_DASHBOARDS_READY_TIMEOUT_MS || 180_000);
 const DASHBOARDS_READY_POLL_MS = Number(process.env.MZ_DASHBOARDS_READY_POLL_MS || 3_000);
+const dashboardsBootstrapRetriesParsed = Number(process.env.MZ_MONITORING_DASHBOARDS_BOOTSTRAP_RETRIES);
+const DASHBOARDS_BOOTSTRAP_RETRIES = Number.isFinite(dashboardsBootstrapRetriesParsed)
+  && dashboardsBootstrapRetriesParsed > 0
+  ? Math.floor(dashboardsBootstrapRetriesParsed)
+  : 3;
+const dashboardsBootstrapDelayParsed = Number(process.env.MZ_MONITORING_DASHBOARDS_BOOTSTRAP_DELAY_MS);
+const DASHBOARDS_BOOTSTRAP_DELAY_MS = Number.isFinite(dashboardsBootstrapDelayParsed)
+  && dashboardsBootstrapDelayParsed > 0
+  ? Math.max(1_000, dashboardsBootstrapDelayParsed)
+  : 5_000;
+const DASHBOARD_DEFAULT_TIME_TO = 'now';
+const DASHBOARD_DEFAULT_TIME_FROM = 'now-24h';
+const VARNISH_DASHBOARD_DEFAULT_TIME_FROM = 'now-7d';
 
 const DATA_VIEW_LOGS_ID = 'mz-data-logs';
 const DATA_VIEW_METRICS_ID = 'mz-data-metrics';
@@ -63,6 +76,12 @@ type BootstrapResult = {
   dashboard_ids: string[];
   upserted_objects: number;
   container_id: string;
+};
+
+type BootstrapRetryOptions = {
+  attempts?: number;
+  delayMs?: number;
+  onRetry?: (attempt: number, message: string) => void;
 };
 
 function readNodeFile(filename: string): string {
@@ -307,6 +326,22 @@ async function deleteSavedObjectIfExists(
     throw new Error(
       `Failed to delete ${objectType}/${objectId}: ${response.status} ${response.body}`.trim(),
     );
+  }
+}
+
+async function verifySavedObjectExists(containerId: string, object: SavedObject): Promise<void> {
+  const path = `/api/saved_objects/${encodeURIComponent(object.type)}/${encodeURIComponent(object.id)}`;
+  const response = await dashboardsRequest(containerId, 'GET', path);
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(
+      `Saved object ${object.type}/${object.id} missing after bootstrap: ${response.status} ${response.body}`.trim(),
+    );
+  }
+}
+
+async function verifySavedObjects(containerId: string, objects: SavedObject[]): Promise<void> {
+  for (const object of objects) {
+    await verifySavedObjectExists(containerId, object);
   }
 }
 
@@ -1644,7 +1679,9 @@ function buildSavedObjects(): SavedObject[] {
           hidePanelTitles: false,
         }),
         version: 1,
-        timeRestore: false,
+        timeRestore: true,
+        timeFrom: DASHBOARD_DEFAULT_TIME_FROM,
+        timeTo: DASHBOARD_DEFAULT_TIME_TO,
         kibanaSavedObjectMeta: {
           searchSourceJSON: JSON.stringify({
             query: { language: 'kuery', query: '' },
@@ -1669,7 +1706,9 @@ function buildSavedObjects(): SavedObject[] {
           hidePanelTitles: false,
         }),
         version: 1,
-        timeRestore: false,
+        timeRestore: true,
+        timeFrom: DASHBOARD_DEFAULT_TIME_FROM,
+        timeTo: DASHBOARD_DEFAULT_TIME_TO,
         kibanaSavedObjectMeta: {
           searchSourceJSON: JSON.stringify({
             query: { language: 'kuery', query: '' },
@@ -1694,7 +1733,9 @@ function buildSavedObjects(): SavedObject[] {
           hidePanelTitles: false,
         }),
         version: 1,
-        timeRestore: false,
+        timeRestore: true,
+        timeFrom: VARNISH_DASHBOARD_DEFAULT_TIME_FROM,
+        timeTo: DASHBOARD_DEFAULT_TIME_TO,
         kibanaSavedObjectMeta: {
           searchSourceJSON: JSON.stringify({
             query: { language: 'kuery', query: 'event.dataset.keyword : "varnish.access"' },
@@ -1719,6 +1760,7 @@ export async function bootstrapMonitoringDashboards(): Promise<BootstrapResult> 
     for (const object of objects) {
       await upsertSavedObject(containerId, object);
     }
+    await verifySavedObjects(containerId, objects);
     return objects.length;
   };
 
@@ -1742,6 +1784,39 @@ export async function bootstrapMonitoringDashboards(): Promise<BootstrapResult> 
   };
 }
 
+export async function bootstrapMonitoringDashboardsWithRetry(
+  options: BootstrapRetryOptions = {},
+): Promise<BootstrapResult> {
+  const attempts = Number.isFinite(options.attempts) && Number(options.attempts) > 0
+    ? Math.max(1, Math.floor(Number(options.attempts)))
+    : DASHBOARDS_BOOTSTRAP_RETRIES;
+  const delayMs = Number.isFinite(options.delayMs) && Number(options.delayMs) > 0
+    ? Math.max(0, Math.floor(Number(options.delayMs)))
+    : DASHBOARDS_BOOTSTRAP_DELAY_MS;
+  let lastError: unknown = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await bootstrapMonitoringDashboards();
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) {
+        break;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      options.onRetry?.(attempt, message);
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+
+  if (lastError instanceof Error) {
+    throw lastError;
+  }
+  throw new Error('Monitoring dashboards bootstrap failed');
+}
+
 export async function handleMonitoringDashboardsBootstrap(
   request: Request,
 ): Promise<{ status: number; body: Record<string, unknown> }> {
@@ -1751,7 +1826,7 @@ export async function handleMonitoringDashboardsBootstrap(
   }
 
   try {
-    const result = await bootstrapMonitoringDashboards();
+    const result = await bootstrapMonitoringDashboardsWithRetry();
     return {
       status: 200,
       body: {

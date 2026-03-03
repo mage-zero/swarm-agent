@@ -35,6 +35,14 @@ function makeTuningProfile(id: string) {
   };
 }
 
+function makeApprovedTuningProfile(id: string, updatedAt = '2026-02-19T00:00:00.000Z') {
+  return {
+    ...makeTuningProfile(id),
+    status: 'approved',
+    updated_at: updatedAt,
+  };
+}
+
 async function importStatusModule(paths: { tuningPath: string; capacityPath: string }) {
   process.env.MZ_TUNING_PROFILE_PATH = paths.tuningPath;
   process.env.MZ_CAPACITY_CHANGE_PATH = paths.capacityPath;
@@ -131,5 +139,112 @@ describe('approveTuningProfile', () => {
     expect(body.active_profile_id).toMatch(/^approved-/);
     expect(body.approved_profile?.status).toBe('approved');
     expect(body.approved_profile?.change).toBe('increase');
+  });
+});
+
+describe('disapproveTuningProfile', () => {
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+    vi.restoreAllMocks();
+    for (const dir of tempDirs.splice(0, tempDirs.length)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('returns 404 when no approved tuning profile exists', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mz-status-disapprove-'));
+    tempDirs.push(tempDir);
+    const tuningPath = path.join(tempDir, 'tuning-profiles.json');
+    const capacityPath = path.join(tempDir, 'capacity-change.json');
+    writeJson(tuningPath, {
+      base: makeTuningProfile('base'),
+      approved: [],
+    });
+
+    const status = await importStatusModule({ tuningPath, capacityPath });
+    const result = status.disapproveTuningProfile('approved-123', 'tuning');
+
+    expect(result.status).toBe(404);
+    expect((result.body as { error?: string }).error).toMatch(/No approved profile available/i);
+  });
+
+  it('removes the selected approved tuning profile and restores the previous active profile', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mz-status-disapprove-'));
+    tempDirs.push(tempDir);
+    const tuningPath = path.join(tempDir, 'tuning-profiles.json');
+    const capacityPath = path.join(tempDir, 'capacity-change.json');
+    writeJson(tuningPath, {
+      base: makeTuningProfile('base'),
+      recommended: makeTuningProfile('recommended-abc'),
+      approved: [
+        makeApprovedTuningProfile('approved-older', '2026-02-18T00:00:00.000Z'),
+        makeApprovedTuningProfile('approved-latest', '2026-02-19T00:00:00.000Z'),
+      ],
+    });
+
+    const status = await importStatusModule({ tuningPath, capacityPath });
+    const result = status.disapproveTuningProfile('approved-latest', 'tuning');
+
+    expect(result.status).toBe(200);
+    const body = result.body as { active_profile_id?: string; disapproved_profile?: { id?: string } };
+    expect(body.disapproved_profile?.id).toBe('approved-latest');
+    expect(body.active_profile_id).toBe('approved-older');
+
+    const stored = JSON.parse(fs.readFileSync(tuningPath, 'utf8')) as { approved?: Array<{ id?: string }> };
+    expect(stored.approved?.map((profile) => profile.id)).toEqual(['approved-older']);
+  });
+
+  it('uses capacity_change disapproval path when profile_type is capacity_change', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mz-status-disapprove-'));
+    tempDirs.push(tempDir);
+    const tuningPath = path.join(tempDir, 'tuning-profiles.json');
+    const capacityPath = path.join(tempDir, 'capacity-change.json');
+
+    writeJson(tuningPath, {
+      base: makeTuningProfile('base'),
+      approved: [],
+    });
+    writeJson(capacityPath, {
+      base: {
+        id: 'base',
+        status: 'base',
+        strategy: 'current-capacity',
+        change: 'none',
+        created_at: '2026-02-19T00:00:00.000Z',
+        updated_at: '2026-02-19T00:00:00.000Z',
+        capacity: { cpu_cores: 4, memory_bytes: 8 * GIB, node_count: 2 },
+      },
+      recommended: {
+        id: 'cap-recommended-1',
+        status: 'recommended',
+        strategy: 'capacity-increase',
+        change: 'increase',
+        created_at: '2026-02-19T00:00:00.000Z',
+        updated_at: '2026-02-19T00:00:00.000Z',
+        capacity: { cpu_cores: 4, memory_bytes: 8 * GIB, node_count: 2 },
+        required: { cpu_cores: 2, memory_bytes: 4 * GIB },
+        ready: true,
+      },
+      approved: [{
+        id: 'approved-cap-1',
+        status: 'approved',
+        strategy: 'capacity-increase',
+        change: 'increase',
+        created_at: '2026-02-19T00:00:00.000Z',
+        updated_at: '2026-02-19T00:00:00.000Z',
+        capacity: { cpu_cores: 4, memory_bytes: 8 * GIB, node_count: 2 },
+        required: { cpu_cores: 2, memory_bytes: 4 * GIB },
+        ready: true,
+      }],
+    });
+
+    const status = await importStatusModule({ tuningPath, capacityPath });
+    const result = status.disapproveTuningProfile('approved-cap-1', 'capacity_change');
+
+    expect(result.status).toBe(200);
+    const body = result.body as { active_profile_id?: string; disapproved_profile?: { status?: string; change?: string } };
+    expect(body.active_profile_id).toBe('base');
+    expect(body.disapproved_profile?.status).toBe('approved');
+    expect(body.disapproved_profile?.change).toBe('increase');
   });
 });

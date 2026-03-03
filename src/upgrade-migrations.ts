@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { runCommand } from './exec.js';
 import { buildNodeHeaders } from './node-hmac.js';
-import { bootstrapMonitoringDashboards } from './monitoring-dashboards.js';
+import { bootstrapMonitoringDashboardsWithRetry } from './monitoring-dashboards.js';
 import { resolveDatadogTraceEnv } from './lib/apm-tracing.js';
 import { buildProxySqlQueryRulesSql, PROXYSQL_MANAGED_QUERY_RULES } from './lib/proxysql.js';
 import { buildCapacityPayload } from './status.js';
@@ -955,7 +955,7 @@ registerMigration('setup-dashboards-dns', async (ctx) => {
 
 registerMigration('bootstrap-monitoring-dashboards', async () => {
   try {
-    const result = await bootstrapMonitoringDashboards();
+    const result = await bootstrapMonitoringDashboardsWithRetry();
     console.log(
       `upgrade.migration.bootstrap_monitoring_dashboards: dashboards=${result.dashboard_ids.join(',')} objects=${result.upserted_objects}`
     );
@@ -1013,6 +1013,18 @@ registerMigration('refresh-monitoring-host-metadata', async (ctx) => {
 
 registerMigration('refresh-monitoring-host-metadata-v2', async (ctx) => {
   await executeMigration('refresh-monitoring-host-metadata', ctx);
+});
+
+registerMigration('refresh-monitoring-dashboard-schema-v2', async (ctx) => {
+  const stack = await fetchStackSnapshot(ctx);
+  const stackType = String(stack.stack_type || '').trim();
+  if (!isMonitoringEligibleStackType(stackType)) {
+    console.log(`upgrade.migration.refresh_monitoring_dashboard_schema_v2: skipped for stack_type=${stackType || 'unknown'}`);
+    return;
+  }
+
+  await executeMigration('recover-monitoring-dashboards', ctx);
+  console.log('upgrade.migration.refresh_monitoring_dashboard_schema_v2: complete');
 });
 
 registerMigration('rebalance-frontend-ha-replicas', async (ctx) => {

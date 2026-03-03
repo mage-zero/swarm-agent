@@ -1,14 +1,14 @@
 {
-  "version": "0.4.83",
+  "version": "0.4.84",
   "date": "2026-03-03",
-  "summary": "Refresh only the monitoring services needed for the CPU metrics and Dashboards fixes",
+  "summary": "Repair monitoring dashboard bootstrap so future provisions, deploys, and agent upgrades converge on the full dashboard set with sensible default time windows",
   "requires": {
     "cloud-swarm": ">=1.0.31"
   },
   "changes": [
     {
-      "id": "refresh-monitoring-observability-assets",
-      "description": "Rebuild and redeploy only the monitoring stack services affected by the observability fixes: opensearch-monitoring/opensearch-init, opensearch-dashboards, filebeat, metricbeat, and any monitoring services with updated stack config such as data-prepper. This avoids rebuilding unrelated application services.",
+      "id": "refresh-monitoring-dashboard-schema-v2",
+      "description": "Re-run the monitoring dashboard recovery/bootstrap flow on stack upgrade so newly added saved objects, retries, and default time windows are applied even on older stacks that were provisioned before the latest dashboards existed.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "stack"

@@ -11,6 +11,7 @@ import {
   handleJoinTokenRequest,
   handleNodeRemovalRequest,
   handleTuningApprovalRequest,
+  handleTuningDisapprovalRequest,
 } from './status.js';
 import { handleMeshJoinRequest } from './mesh.js';
 import { handleDeployLogsBundle } from './deploy-logs.js';
@@ -64,6 +65,12 @@ export const createApp = () => {
   app.post('/v1/tuning/approve', async (c) => {
     const request = c.req.raw ?? (c.req as unknown as Request);
     const result = await handleTuningApprovalRequest(request);
+    return c.json(result.body, result.status as ContentfulStatusCode);
+  });
+
+  app.post('/v1/tuning/disapprove', async (c) => {
+    const request = c.req.raw ?? (c.req as unknown as Request);
+    const result = await handleTuningDisapprovalRequest(request);
     return c.json(result.body, result.status as ContentfulStatusCode);
   });
 
