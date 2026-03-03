@@ -84,6 +84,24 @@ type BootstrapRetryOptions = {
   onRetry?: (attempt: number, message: string) => void;
 };
 
+function buildDashboardContextQuery(mustClauses: Array<Record<string, unknown>>): Record<string, unknown> {
+  return {
+    bool: {
+      must: [
+        '%dashboard_context-must_clause%',
+        { range: { '@timestamp': { '%timefilter%': true } } },
+        ...mustClauses,
+      ],
+      filter: [
+        '%dashboard_context-filter_clause%',
+      ],
+      must_not: [
+        '%dashboard_context-must_not_clause%',
+      ],
+    },
+  };
+}
+
 function readNodeFile(filename: string): string {
   try {
     return fs.readFileSync(`${NODE_DIR}/${filename}`, 'utf8').trim();
@@ -956,18 +974,12 @@ function buildSavedObjects(): SavedObject[] {
     title: 'Varnish 200 / 503 Trend',
     data: {
       url: {
-        '%context%': true,
-        '%timefield%': '@timestamp',
         index: 'mz-logs-*',
         body: {
           size: 0,
-          query: {
-            bool: {
-              must: [
-                { term: { 'event.dataset.keyword': 'varnish.access' } },
-              ],
-            },
-          },
+          query: buildDashboardContextQuery([
+            { term: { 'event.dataset.keyword': 'varnish.access' } },
+          ]),
           aggs: {
             timeline: {
               date_histogram: {
@@ -1015,19 +1027,13 @@ function buildSavedObjects(): SavedObject[] {
     title: 'Varnish Cache Hit Rate Trend',
     data: {
       url: {
-        '%context%': true,
-        '%timefield%': '@timestamp',
         index: 'mz-logs-*',
         body: {
           size: 0,
-          query: {
-            bool: {
-              must: [
-                { term: { 'event.dataset.keyword': 'varnish.access' } },
-                { exists: { field: 'varnish.hitmiss.keyword' } },
-              ],
-            },
-          },
+          query: buildDashboardContextQuery([
+            { term: { 'event.dataset.keyword': 'varnish.access' } },
+            { exists: { field: 'varnish.hitmiss.keyword' } },
+          ]),
           aggs: {
             timeline: {
               date_histogram: {
@@ -1078,19 +1084,13 @@ function buildSavedObjects(): SavedObject[] {
     title: 'Varnish Handling Breakdown',
     data: {
       url: {
-        '%context%': true,
-        '%timefield%': '@timestamp',
         index: 'mz-logs-*',
         body: {
           size: 0,
-          query: {
-            bool: {
-              must: [
-                { term: { 'event.dataset.keyword': 'varnish.access' } },
-                { exists: { field: 'varnish.handling.keyword' } },
-              ],
-            },
-          },
+          query: buildDashboardContextQuery([
+            { term: { 'event.dataset.keyword': 'varnish.access' } },
+            { exists: { field: 'varnish.handling.keyword' } },
+          ]),
           aggs: {
             handling: {
               terms: {
@@ -1124,19 +1124,13 @@ function buildSavedObjects(): SavedObject[] {
     title: 'Varnish Request Duration Trend',
     data: {
       url: {
-        '%context%': true,
-        '%timefield%': '@timestamp',
         index: 'mz-logs-*',
         body: {
           size: 0,
-          query: {
-            bool: {
-              must: [
-                { term: { 'event.dataset.keyword': 'varnish.access' } },
-                { exists: { field: 'varnish.duration_us' } },
-              ],
-            },
-          },
+          query: buildDashboardContextQuery([
+            { term: { 'event.dataset.keyword': 'varnish.access' } },
+            { exists: { field: 'varnish.duration_us' } },
+          ]),
           aggs: {
             timeline: {
               date_histogram: {
@@ -1847,6 +1841,7 @@ export async function handleMonitoringDashboardsBootstrap(
 }
 
 export const __testing = {
+  buildDashboardContextQuery,
   parseDashboardsApiOutput,
   isDashboardsReady,
   isReadOnlyAllowDeleteBlockError,

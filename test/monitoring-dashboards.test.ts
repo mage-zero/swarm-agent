@@ -77,6 +77,31 @@ describe('monitoring-dashboards helpers', () => {
     expect(varnish?.attributes?.timeTo).toBe('now');
   });
 
+  it('uses dashboard-context placeholders in varnish Vega queries', () => {
+    const objects = __testing.buildSavedObjects();
+    const statusTrend = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-varnish-status-trend');
+    const spec = JSON.parse(
+      String((JSON.parse(String(statusTrend?.attributes?.visState || '{}'))?.params?.spec) || '{}'),
+    ) as Record<string, unknown>;
+
+    const data = (spec.data && typeof spec.data === 'object') ? (spec.data as Record<string, unknown>) : {};
+    const url = (data.url && typeof data.url === 'object') ? (data.url as Record<string, unknown>) : {};
+    const body = (url.body && typeof url.body === 'object') ? (url.body as Record<string, unknown>) : {};
+    const query = (body.query && typeof body.query === 'object') ? (body.query as Record<string, unknown>) : {};
+    const bool = (query.bool && typeof query.bool === 'object') ? (query.bool as Record<string, unknown>) : {};
+    const must = Array.isArray(bool.must) ? bool.must : [];
+    const filter = Array.isArray(bool.filter) ? bool.filter : [];
+    const mustNot = Array.isArray(bool.must_not) ? bool.must_not : [];
+
+    expect(url['%context%']).toBeUndefined();
+    expect(url['%timefield%']).toBeUndefined();
+    expect(must).toContain('%dashboard_context-must_clause%');
+    expect(filter).toContain('%dashboard_context-filter_clause%');
+    expect(mustNot).toContain('%dashboard_context-must_not_clause%');
+    expect(JSON.stringify(must)).toContain('%timefilter%');
+    expect(JSON.stringify(must)).toContain('varnish.access');
+  });
+
   it('uses the corrected CPU dataset and preserves zero values in container CPU charts', () => {
     const objects = __testing.buildSavedObjects();
     const cpuByService = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-container-cpu-by-service');
