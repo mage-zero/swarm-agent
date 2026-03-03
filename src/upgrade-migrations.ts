@@ -1039,6 +1039,18 @@ registerMigration('refresh-monitoring-dashboard-schema-v3', async (ctx) => {
   console.log('upgrade.migration.refresh_monitoring_dashboard_schema_v3: complete');
 });
 
+registerMigration('refresh-monitoring-cpu-schema-v1', async (ctx) => {
+  const stack = await fetchStackSnapshot(ctx);
+  const stackType = String(stack.stack_type || '').trim();
+  if (!isMonitoringEligibleStackType(stackType)) {
+    console.log(`upgrade.migration.refresh_monitoring_cpu_schema_v1: skipped for stack_type=${stackType || 'unknown'}`);
+    return;
+  }
+
+  await executeMigration('refresh-monitoring-host-metadata', ctx);
+  console.log('upgrade.migration.refresh_monitoring_cpu_schema_v1: complete');
+});
+
 registerMigration('rebalance-frontend-ha-replicas', async (ctx) => {
   const environmentId = Number(ctx.environmentId || 0);
   if (!Number.isFinite(environmentId) || environmentId <= 0) {

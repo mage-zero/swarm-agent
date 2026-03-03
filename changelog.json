@@ -1,14 +1,14 @@
 {
-  "version": "0.4.85",
+  "version": "0.4.86",
   "date": "2026-03-03",
-  "summary": "Repair varnish dashboard Vega queries and re-bootstrap monitoring dashboards on upgrade so existing stacks pick up the fix automatically",
+  "summary": "Repair container CPU monitoring mappings so upgraded stacks emit and query corrected CPU metrics immediately",
   "requires": {
-    "cloud-swarm": ">=1.0.31"
+    "cloud-swarm": ">=1.0.34"
   },
   "changes": [
     {
-      "id": "refresh-monitoring-dashboard-schema-v3",
-      "description": "Re-run the monitoring dashboard recovery/bootstrap flow on stack upgrade so existing stacks replace the invalid varnish Vega queries with the dashboard-context form and pick up the latest saved objects.",
+      "id": "refresh-monitoring-cpu-schema-v1",
+      "description": "Rebuild and redeploy the monitoring stack on upgrade so the custom container CPU exporter writes the corrected float-mapped CPU field, and re-bootstrap dashboards so container CPU panels and tuning queries read the repaired metrics immediately.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "stack"

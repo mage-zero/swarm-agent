@@ -102,7 +102,7 @@ describe('monitoring-dashboards helpers', () => {
     expect(JSON.stringify(must)).toContain('varnish.access');
   });
 
-  it('uses the corrected CPU dataset and preserves zero values in container CPU charts', () => {
+  it('uses the corrected CPU dataset field and preserves zero values in container CPU charts', () => {
     const objects = __testing.buildSavedObjects();
     const cpuByService = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-container-cpu-by-service');
     const cpuTrend = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-container-cpu-trend');
@@ -121,6 +121,8 @@ describe('monitoring-dashboards helpers', () => {
 
     expect(JSON.stringify(byServiceMust)).toContain('mz.docker.cpu');
     expect(JSON.stringify(trendMust)).toContain('mz.docker.cpu');
+    expect(JSON.stringify(byServiceMust)).toContain('mz.docker.cpu.total.norm.pct');
+    expect(JSON.stringify(trendMust)).toContain('mz.docker.cpu.total.norm.pct');
     expect(JSON.stringify(byServiceTransform)).toContain('isValid(datum.cpu_avg)');
     expect(JSON.stringify(trendTransform)).toContain('isValid(datum.point.cpu_avg)');
   });

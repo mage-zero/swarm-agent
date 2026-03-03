@@ -38,6 +38,8 @@ import {
   type AiTuningProfile,
 } from './tuning.js';
 
+const CORRECTED_DOCKER_CPU_NORM_PCT_FIELD = 'mz.docker.cpu.total.norm.pct';
+
 export type StatusConfig = {
   stack_id?: number;
   stack_domain?: string;
@@ -2496,11 +2498,11 @@ async function collectMonitoringMetrics(): Promise<Record<string, Record<string,
             cpu: {
               filter: { term: { 'event.dataset': 'mz.docker.cpu' } },
               aggs: {
-                avg: { avg: { field: 'docker.cpu.total.norm.pct' } },
-                max: { max: { field: 'docker.cpu.total.norm.pct' } },
-                p95: { percentiles: { field: 'docker.cpu.total.norm.pct', percents: [95] } },
-                pct_above_80: { range: { field: 'docker.cpu.total.norm.pct', ranges: [{ from: 0.8 }] } },
-                total_count: { value_count: { field: 'docker.cpu.total.norm.pct' } },
+                avg: { avg: { field: CORRECTED_DOCKER_CPU_NORM_PCT_FIELD } },
+                max: { max: { field: CORRECTED_DOCKER_CPU_NORM_PCT_FIELD } },
+                p95: { percentiles: { field: CORRECTED_DOCKER_CPU_NORM_PCT_FIELD, percents: [95] } },
+                pct_above_80: { range: { field: CORRECTED_DOCKER_CPU_NORM_PCT_FIELD, ranges: [{ from: 0.8 }] } },
+                total_count: { value_count: { field: CORRECTED_DOCKER_CPU_NORM_PCT_FIELD } },
               },
             },
             memory: {

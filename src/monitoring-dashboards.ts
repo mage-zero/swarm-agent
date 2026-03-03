@@ -21,6 +21,7 @@ const DASHBOARDS_BOOTSTRAP_DELAY_MS = Number.isFinite(dashboardsBootstrapDelayPa
 const DASHBOARD_DEFAULT_TIME_TO = 'now';
 const DASHBOARD_DEFAULT_TIME_FROM = 'now-24h';
 const VARNISH_DASHBOARD_DEFAULT_TIME_FROM = 'now-7d';
+const CORRECTED_DOCKER_CPU_NORM_PCT_FIELD = 'mz.docker.cpu.total.norm.pct';
 
 const DATA_VIEW_LOGS_ID = 'mz-data-logs';
 const DATA_VIEW_METRICS_ID = 'mz-data-metrics';
@@ -734,7 +735,7 @@ function buildSavedObjects(): SavedObject[] {
                     { prefix: { 'container.name.keyword': 'mz-env-' } },
                     { prefix: { 'host.name.keyword': 'vmi' } },
                     { exists: { field: 'docker.container.labels.com_docker_swarm_service_name.keyword' } },
-                    { exists: { field: 'docker.cpu.total.norm.pct' } },
+                    { exists: { field: CORRECTED_DOCKER_CPU_NORM_PCT_FIELD } },
                   ],
                 },
               },
@@ -746,7 +747,7 @@ function buildSavedObjects(): SavedObject[] {
                     order: { cpu_avg: 'desc' },
                   },
                   aggs: {
-                    cpu_avg: { avg: { field: 'docker.cpu.total.norm.pct' } },
+                    cpu_avg: { avg: { field: CORRECTED_DOCKER_CPU_NORM_PCT_FIELD } },
                   },
                 },
               },
@@ -846,7 +847,7 @@ function buildSavedObjects(): SavedObject[] {
                     { prefix: { 'container.name.keyword': 'mz-env-' } },
                     { prefix: { 'host.name.keyword': 'vmi' } },
                     { exists: { field: 'docker.container.labels.com_docker_swarm_service_name.keyword' } },
-                    { exists: { field: 'docker.cpu.total.norm.pct' } },
+                    { exists: { field: CORRECTED_DOCKER_CPU_NORM_PCT_FIELD } },
                   ],
                 },
               },
@@ -858,7 +859,7 @@ function buildSavedObjects(): SavedObject[] {
                     order: { cpu_avg: 'desc' },
                   },
                   aggs: {
-                    cpu_avg: { avg: { field: 'docker.cpu.total.norm.pct' } },
+                    cpu_avg: { avg: { field: CORRECTED_DOCKER_CPU_NORM_PCT_FIELD } },
                     timeline: {
                       date_histogram: {
                         field: '@timestamp',
@@ -866,7 +867,7 @@ function buildSavedObjects(): SavedObject[] {
                         min_doc_count: 0,
                       },
                       aggs: {
-                        cpu_avg: { avg: { field: 'docker.cpu.total.norm.pct' } },
+                        cpu_avg: { avg: { field: CORRECTED_DOCKER_CPU_NORM_PCT_FIELD } },
                       },
                     },
                   },
@@ -1355,7 +1356,7 @@ function buildSavedObjects(): SavedObject[] {
           'host.name',
           'docker.container.labels.com_docker_swarm_service_name',
           'container.name',
-          'docker.cpu.total.norm.pct',
+          CORRECTED_DOCKER_CPU_NORM_PCT_FIELD,
           'docker.memory.usage.pct',
         ],
         sort: [['@timestamp', 'desc']],
