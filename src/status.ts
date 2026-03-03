@@ -2476,7 +2476,7 @@ async function collectMonitoringMetrics(): Promise<Record<string, Record<string,
         bool: {
           must: [
             { range: { '@timestamp': { gte: 'now-6h' } } },
-            { terms: { 'event.dataset': ['docker.cpu', 'docker.memory'] } },
+            { terms: { 'event.dataset': ['mz.docker.cpu', 'docker.memory'] } },
           ],
         },
       },
@@ -2485,7 +2485,7 @@ async function collectMonitoringMetrics(): Promise<Record<string, Record<string,
           terms: { field: 'docker.container.labels.com_docker_swarm_service_name.keyword', size: 50 },
           aggs: {
             cpu: {
-              filter: { term: { 'event.dataset': 'docker.cpu' } },
+              filter: { term: { 'event.dataset': 'mz.docker.cpu' } },
               aggs: {
                 avg: { avg: { field: 'docker.cpu.total.norm.pct' } },
                 max: { max: { field: 'docker.cpu.total.norm.pct' } },

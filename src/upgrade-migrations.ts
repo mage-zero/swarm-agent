@@ -1411,3 +1411,75 @@ registerMigration('rebuild-metricbeat-cgroupv2-fix', async (ctx) => {
   }
   console.log('upgrade.migration.rebuild_metricbeat_cgroupv2_fix: rebuilt and redeployed monitoring stack');
 });
+
+registerMigration('refresh-monitoring-observability-assets', async (ctx) => {
+  const stack = await fetchStackSnapshot(ctx);
+  const stackType = String(stack.stack_type || '').trim();
+  if (!isMonitoringEligibleStackType(stackType)) {
+    console.log(`upgrade.migration.refresh_monitoring_observability_assets: skipped for stack_type=${stackType || 'unknown'}`);
+    return;
+  }
+
+  console.log('upgrade.migration.refresh_monitoring_observability_assets: rebuilding and redeploying monitoring stack');
+  await executeMigration('build-monitoring-images', ctx);
+  await executeMigration('deploy-monitoring-stack', ctx);
+  await executeMigration('connect-cloudflared-to-monitoring', ctx);
+  await executeMigration('bootstrap-monitoring-dashboards', ctx);
+  console.log('upgrade.migration.refresh_monitoring_observability_assets: complete');
+});
+
+registerMigration('rebuild-base-service-images', async (ctx) => {
+  await ensureCloudSwarmRepo(ctx.cloudSwarmDir);
+  const scriptPath = path.join(ctx.cloudSwarmDir, 'scripts', 'build-services.sh');
+  if (!fs.existsSync(scriptPath)) {
+    throw new Error(`build-services.sh not found at ${scriptPath}`);
+  }
+  const env = await buildMonitoringEnv(ctx.cloudSwarmDir);
+  const result = await runCommand('bash', [scriptPath], 600_000, {
+    cwd: ctx.cloudSwarmDir,
+    env,
+  });
+  if (result.code !== 0) {
+    throw new Error(`build-services.sh failed (exit ${result.code}): ${result.stderr}`);
+  }
+  console.log('upgrade.migration.rebuild_base_service_images: complete');
+});
+
+registerMigration('rollout-varnish-observability-image', async (ctx) => {
+  const environmentId = Number(ctx.environmentId || 0);
+  if (!Number.isFinite(environmentId) || environmentId <= 0) {
+    console.warn('upgrade.migration.rollout_varnish_observability_image: missing environmentId; skipping');
+    return;
+  }
+
+  const env = await buildMonitoringEnv(ctx.cloudSwarmDir);
+  const registryHost = String(env.REGISTRY_PULL_HOST || env.REGISTRY_HOST || '127.0.0.1').trim() || '127.0.0.1';
+  const registryPort = String(env.REGISTRY_PORT || '5000').trim() || '5000';
+  const varnishVersion = String(env.VARNISH_VERSION || '').trim();
+  if (!varnishVersion) {
+    throw new Error('Missing VARNISH_VERSION in cloud-swarm config/versions.env');
+  }
+
+  const serviceName = envServiceName(environmentId, 'varnish');
+  const imageRef = `${registryHost}:${registryPort}/mz-varnish:${varnishVersion}`;
+  const update = await runCommand(
+    'docker',
+    ['service', 'update', '--image', imageRef, '--force', serviceName],
+    120_000,
+  );
+  if (update.code !== 0) {
+    const combined = `${update.stdout || ''}\n${update.stderr || ''}`;
+    if (isNoSuchServiceOutput(combined)) {
+      console.log(`upgrade.migration.rollout_varnish_observability_image: env=${environmentId} ${serviceName} skipped (missing)`);
+      return;
+    }
+    if (isNoopServiceUpdateOutput(combined)) {
+      console.log(`upgrade.migration.rollout_varnish_observability_image: env=${environmentId} ${serviceName} skipped (nothing to update)`);
+      return;
+    }
+    throw new Error(
+      `Failed to rollout ${serviceName} with ${imageRef}: ${combined.trim() || `exit ${update.code}`}`,
+    );
+  }
+  console.log(`upgrade.migration.rollout_varnish_observability_image: env=${environmentId} updated to ${imageRef}`);
+});

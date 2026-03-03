@@ -16,6 +16,7 @@ const DATA_VIEW_METRICS_COMPAT_ID = 'mz-metrics-pattern';
 const SEARCH_LOGS_ID = 'mz-search-logs';
 const SEARCH_METRICS_ID = 'mz-search-host-metrics';
 const SEARCH_DOCKER_METRICS_ID = 'mz-search-docker-metrics';
+const SEARCH_VARNISH_LOGS_ID = 'mz-search-varnish-logs';
 const VIS_VPS_RESOURCE_COCKPIT_ID = 'mz-vis-vps-resource-cockpit';
 const VIS_VPS_ROOT_TREND_ID = 'mz-vis-vps-root-trend';
 const VIS_VPS_CPU_BY_HOST_ID = 'mz-vis-vps-cpu-by-host';
@@ -26,8 +27,13 @@ const VIS_CONTAINER_CPU_BY_SERVICE_ID = 'mz-vis-container-cpu-by-service';
 const VIS_CONTAINER_MEM_BY_SERVICE_ID = 'mz-vis-container-mem-by-service';
 const VIS_CONTAINER_CPU_TREND_ID = 'mz-vis-container-cpu-trend';
 const VIS_CONTAINER_MEM_TREND_ID = 'mz-vis-container-mem-trend';
+const VIS_VARNISH_STATUS_TREND_ID = 'mz-vis-varnish-status-trend';
+const VIS_VARNISH_HIT_RATE_TREND_ID = 'mz-vis-varnish-hit-rate-trend';
+const VIS_VARNISH_HANDLING_BREAKDOWN_ID = 'mz-vis-varnish-handling-breakdown';
+const VIS_VARNISH_LATENCY_TREND_ID = 'mz-vis-varnish-latency-trend';
 const DASHBOARD_OPS_ID = 'mz-dashboard-ops';
 const DASHBOARD_MAGENTO_CONTAINERS_ID = 'mz-dashboard-magento-containers';
+const DASHBOARD_VARNISH_ID = 'mz-dashboard-varnish';
 const DEPRECATED_SAVED_OBJECTS: Array<{ type: SavedObject['type']; id: string }> = [
   { type: 'visualization', id: 'mz-vis-host-tophosts' },
   { type: 'visualization', id: 'mz-vis-container-active-by-service' },
@@ -326,6 +332,12 @@ function buildSavedObjects(): SavedObject[] {
     filter: [],
   });
 
+  const varnishLogsSearchSource = JSON.stringify({
+    index: DATA_VIEW_LOGS_ID,
+    query: { language: 'kuery', query: 'event.dataset.keyword : "varnish.access"' },
+    filter: [],
+  });
+
   const vpsCpuByHostSpec = {
     $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
     title: 'VPS CPU by Host (avg in time range)',
@@ -367,7 +379,7 @@ function buildSavedObjects(): SavedObject[] {
     },
     transform: [
       { calculate: 'datum.key', as: 'host_label' },
-      { calculate: 'datum.cpu_avg && datum.cpu_avg.value ? datum.cpu_avg.value * 100 : 0', as: 'cpu_pct' },
+      { calculate: 'isValid(datum.cpu_avg) && isValid(datum.cpu_avg.value) ? datum.cpu_avg.value * 100 : 0', as: 'cpu_pct' },
     ],
     mark: { type: 'bar' },
     encoding: {
@@ -421,7 +433,7 @@ function buildSavedObjects(): SavedObject[] {
     },
     transform: [
       { calculate: 'datum.key', as: 'host_label' },
-      { calculate: 'datum.mem_avg && datum.mem_avg.value ? datum.mem_avg.value * 100 : 0', as: 'mem_pct' },
+      { calculate: 'isValid(datum.mem_avg) && isValid(datum.mem_avg.value) ? datum.mem_avg.value * 100 : 0', as: 'mem_pct' },
     ],
     mark: { type: 'bar' },
     encoding: {
@@ -665,7 +677,7 @@ function buildSavedObjects(): SavedObject[] {
               filter: {
                 bool: {
                   must: [
-                    { term: { 'event.dataset.keyword': 'docker.cpu' } },
+                    { term: { 'event.dataset.keyword': 'mz.docker.cpu' } },
                     { prefix: { 'container.name.keyword': 'mz-env-' } },
                     { prefix: { 'host.name.keyword': 'vmi' } },
                     { exists: { field: 'docker.container.labels.com_docker_swarm_service_name.keyword' } },
@@ -693,7 +705,7 @@ function buildSavedObjects(): SavedObject[] {
     },
     transform: [
       { calculate: 'replace(datum.key, /^mz-env-[0-9]+_/, "")', as: 'service_label' },
-      { calculate: 'datum.cpu_avg && datum.cpu_avg.value ? datum.cpu_avg.value * 100 : 0', as: 'cpu_pct' },
+      { calculate: 'isValid(datum.cpu_avg) && isValid(datum.cpu_avg.value) ? datum.cpu_avg.value * 100 : 0', as: 'cpu_pct' },
     ],
     mark: { type: 'bar' },
     encoding: {
@@ -749,7 +761,7 @@ function buildSavedObjects(): SavedObject[] {
     },
     transform: [
       { calculate: 'replace(datum.key, /^mz-env-[0-9]+_/, "")', as: 'service_label' },
-      { calculate: 'datum.mem_avg && datum.mem_avg.value ? datum.mem_avg.value * 100 : 0', as: 'mem_pct' },
+      { calculate: 'isValid(datum.mem_avg) && isValid(datum.mem_avg.value) ? datum.mem_avg.value * 100 : 0', as: 'mem_pct' },
     ],
     mark: { type: 'bar' },
     encoding: {
@@ -777,7 +789,7 @@ function buildSavedObjects(): SavedObject[] {
               filter: {
                 bool: {
                   must: [
-                    { term: { 'event.dataset.keyword': 'docker.cpu' } },
+                    { term: { 'event.dataset.keyword': 'mz.docker.cpu' } },
                     { prefix: { 'container.name.keyword': 'mz-env-' } },
                     { prefix: { 'host.name.keyword': 'vmi' } },
                     { exists: { field: 'docker.container.labels.com_docker_swarm_service_name.keyword' } },
@@ -817,7 +829,7 @@ function buildSavedObjects(): SavedObject[] {
       { flatten: ['timeline.buckets'], as: ['point'] },
       { calculate: 'replace(datum.key, /^mz-env-[0-9]+_/, "")', as: 'service_label' },
       { calculate: 'toDate(datum.point.key_as_string)', as: 'timestamp' },
-      { calculate: 'datum.point.cpu_avg && datum.point.cpu_avg.value ? datum.point.cpu_avg.value * 100 : null', as: 'cpu_pct' },
+      { calculate: 'isValid(datum.point.cpu_avg) && isValid(datum.point.cpu_avg.value) ? datum.point.cpu_avg.value * 100 : 0', as: 'cpu_pct' },
       { filter: 'isValid(datum.cpu_pct)' },
     ],
     mark: { type: 'line', point: false },
@@ -888,7 +900,7 @@ function buildSavedObjects(): SavedObject[] {
       { flatten: ['timeline.buckets'], as: ['point'] },
       { calculate: 'replace(datum.key, /^mz-env-[0-9]+_/, "")', as: 'service_label' },
       { calculate: 'toDate(datum.point.key_as_string)', as: 'timestamp' },
-      { calculate: 'datum.point.mem_avg && datum.point.mem_avg.value ? datum.point.mem_avg.value * 100 : null', as: 'mem_pct' },
+      { calculate: 'isValid(datum.point.mem_avg) && isValid(datum.point.mem_avg.value) ? datum.point.mem_avg.value * 100 : 0', as: 'mem_pct' },
       { filter: 'isValid(datum.mem_pct)' },
     ],
     mark: { type: 'line', point: false },
@@ -900,6 +912,238 @@ function buildSavedObjects(): SavedObject[] {
         { field: 'timestamp', type: 'temporal', title: 'Time' },
         { field: 'service_label', type: 'nominal', title: 'Service' },
         { field: 'mem_pct', type: 'quantitative', title: 'Memory %', format: '.2f' },
+      ],
+    },
+  };
+
+  const varnishStatusTrendSpec = {
+    $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
+    title: 'Varnish 200 / 503 Trend',
+    data: {
+      url: {
+        '%context%': true,
+        '%timefield%': '@timestamp',
+        index: 'mz-logs-*',
+        body: {
+          size: 0,
+          query: {
+            bool: {
+              must: [
+                { term: { 'event.dataset.keyword': 'varnish.access' } },
+              ],
+            },
+          },
+          aggs: {
+            timeline: {
+              date_histogram: {
+                field: '@timestamp',
+                fixed_interval: '1m',
+                min_doc_count: 0,
+              },
+              aggs: {
+                status_200: { filter: { term: { 'varnish.status': 200 } } },
+                status_503: { filter: { term: { 'varnish.status': 503 } } },
+              },
+            },
+          },
+        },
+      },
+      format: { property: 'aggregations.timeline.buckets' },
+    },
+    transform: [
+      { calculate: 'toDate(datum.key_as_string)', as: 'timestamp' },
+      { calculate: 'datum.status_200.doc_count', as: 'status_200' },
+      { calculate: 'datum.status_503.doc_count', as: 'status_503' },
+      { fold: ['status_200', 'status_503'], as: ['series', 'requests'] },
+      { calculate: "datum.series === 'status_200' ? 'HTTP 200' : 'HTTP 503'", as: 'series_label' },
+    ],
+    mark: { type: 'line', point: false },
+    encoding: {
+      x: { field: 'timestamp', type: 'temporal', title: 'Time' },
+      y: { field: 'requests', type: 'quantitative', title: 'Requests' },
+      color: {
+        field: 'series_label',
+        type: 'nominal',
+        title: 'Series',
+        scale: { domain: ['HTTP 200', 'HTTP 503'], range: ['#166534', '#dc2626'] },
+      },
+      tooltip: [
+        { field: 'timestamp', type: 'temporal', title: 'Time' },
+        { field: 'series_label', type: 'nominal', title: 'Series' },
+        { field: 'requests', type: 'quantitative', title: 'Requests' },
+      ],
+    },
+  };
+
+  const varnishHitRateTrendSpec = {
+    $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
+    title: 'Varnish Cache Hit Rate Trend',
+    data: {
+      url: {
+        '%context%': true,
+        '%timefield%': '@timestamp',
+        index: 'mz-logs-*',
+        body: {
+          size: 0,
+          query: {
+            bool: {
+              must: [
+                { term: { 'event.dataset.keyword': 'varnish.access' } },
+                { exists: { field: 'varnish.hitmiss.keyword' } },
+              ],
+            },
+          },
+          aggs: {
+            timeline: {
+              date_histogram: {
+                field: '@timestamp',
+                fixed_interval: '1m',
+                min_doc_count: 0,
+              },
+              aggs: {
+                hits: { filter: { term: { 'varnish.hitmiss.keyword': 'hit' } } },
+                misses: { filter: { term: { 'varnish.hitmiss.keyword': 'miss' } } },
+              },
+            },
+          },
+        },
+      },
+      format: { property: 'aggregations.timeline.buckets' },
+    },
+    transform: [
+      { calculate: 'toDate(datum.key_as_string)', as: 'timestamp' },
+      { calculate: 'datum.hits.doc_count', as: 'hits' },
+      { calculate: 'datum.misses.doc_count', as: 'misses' },
+      {
+        calculate: '(datum.hits + datum.misses) > 0 ? (datum.hits / (datum.hits + datum.misses)) * 100 : null',
+        as: 'hit_rate_pct',
+      },
+      { filter: 'isValid(datum.hit_rate_pct)' },
+    ],
+    mark: { type: 'line', point: false, color: '#2563eb' },
+    encoding: {
+      x: { field: 'timestamp', type: 'temporal', title: 'Time' },
+      y: {
+        field: 'hit_rate_pct',
+        type: 'quantitative',
+        title: 'Hit rate %',
+        scale: { domain: [0, 100] },
+      },
+      tooltip: [
+        { field: 'timestamp', type: 'temporal', title: 'Time' },
+        { field: 'hits', type: 'quantitative', title: 'Hits' },
+        { field: 'misses', type: 'quantitative', title: 'Misses' },
+        { field: 'hit_rate_pct', type: 'quantitative', title: 'Hit rate %', format: '.2f' },
+      ],
+    },
+  };
+
+  const varnishHandlingBreakdownSpec = {
+    $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
+    title: 'Varnish Handling Breakdown',
+    data: {
+      url: {
+        '%context%': true,
+        '%timefield%': '@timestamp',
+        index: 'mz-logs-*',
+        body: {
+          size: 0,
+          query: {
+            bool: {
+              must: [
+                { term: { 'event.dataset.keyword': 'varnish.access' } },
+                { exists: { field: 'varnish.handling.keyword' } },
+              ],
+            },
+          },
+          aggs: {
+            handling: {
+              terms: {
+                field: 'varnish.handling.keyword',
+                size: 10,
+                order: { _count: 'desc' },
+              },
+            },
+          },
+        },
+      },
+      format: { property: 'aggregations.handling.buckets' },
+    },
+    transform: [
+      { calculate: 'upper(datum.key)', as: 'handling_label' },
+      { calculate: 'datum.doc_count', as: 'requests' },
+    ],
+    mark: { type: 'bar' },
+    encoding: {
+      y: { field: 'handling_label', type: 'nominal', sort: '-x', title: 'Handling' },
+      x: { field: 'requests', type: 'quantitative', title: 'Requests' },
+      tooltip: [
+        { field: 'handling_label', type: 'nominal', title: 'Handling' },
+        { field: 'requests', type: 'quantitative', title: 'Requests' },
+      ],
+    },
+  };
+
+  const varnishLatencyTrendSpec = {
+    $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
+    title: 'Varnish Request Duration Trend',
+    data: {
+      url: {
+        '%context%': true,
+        '%timefield%': '@timestamp',
+        index: 'mz-logs-*',
+        body: {
+          size: 0,
+          query: {
+            bool: {
+              must: [
+                { term: { 'event.dataset.keyword': 'varnish.access' } },
+                { exists: { field: 'varnish.duration_us' } },
+              ],
+            },
+          },
+          aggs: {
+            timeline: {
+              date_histogram: {
+                field: '@timestamp',
+                fixed_interval: '1m',
+                min_doc_count: 0,
+              },
+              aggs: {
+                avg_duration: { avg: { field: 'varnish.duration_us' } },
+                p95_duration: { percentiles: { field: 'varnish.duration_us', percents: [95] } },
+              },
+            },
+          },
+        },
+      },
+      format: { property: 'aggregations.timeline.buckets' },
+    },
+    transform: [
+      { calculate: 'toDate(datum.key_as_string)', as: 'timestamp' },
+      { calculate: 'isValid(datum.avg_duration.value) ? datum.avg_duration.value / 1000 : null', as: 'avg_ms' },
+      {
+        calculate: "isValid(datum.p95_duration.values['95.0']) ? datum.p95_duration.values['95.0'] / 1000 : null",
+        as: 'p95_ms',
+      },
+      { fold: ['avg_ms', 'p95_ms'], as: ['series', 'latency_ms'] },
+      { filter: 'isValid(datum.latency_ms)' },
+      { calculate: "datum.series === 'avg_ms' ? 'Avg ms' : 'P95 ms'", as: 'series_label' },
+    ],
+    mark: { type: 'line', point: false },
+    encoding: {
+      x: { field: 'timestamp', type: 'temporal', title: 'Time' },
+      y: { field: 'latency_ms', type: 'quantitative', title: 'Latency ms' },
+      color: {
+        field: 'series_label',
+        type: 'nominal',
+        title: 'Series',
+        scale: { domain: ['Avg ms', 'P95 ms'], range: ['#0f766e', '#f59e0b'] },
+      },
+      tooltip: [
+        { field: 'timestamp', type: 'temporal', title: 'Time' },
+        { field: 'series_label', type: 'nominal', title: 'Series' },
+        { field: 'latency_ms', type: 'quantitative', title: 'Latency ms', format: '.2f' },
       ],
     },
   };
@@ -969,6 +1213,41 @@ function buildSavedObjects(): SavedObject[] {
       gridData: { x: 24, y: 14, w: 24, h: 15, i: '4' },
       type: 'visualization',
       id: VIS_CONTAINER_MEM_TREND_ID,
+      embeddableConfig: {},
+      version: '8.0.0',
+    },
+  ]);
+
+  const varnishDashboardPanels = JSON.stringify([
+    {
+      panelIndex: '1',
+      gridData: { x: 0, y: 0, w: 24, h: 14, i: '1' },
+      type: 'visualization',
+      id: VIS_VARNISH_STATUS_TREND_ID,
+      embeddableConfig: {},
+      version: '8.0.0',
+    },
+    {
+      panelIndex: '2',
+      gridData: { x: 24, y: 0, w: 24, h: 14, i: '2' },
+      type: 'visualization',
+      id: VIS_VARNISH_HIT_RATE_TREND_ID,
+      embeddableConfig: {},
+      version: '8.0.0',
+    },
+    {
+      panelIndex: '3',
+      gridData: { x: 0, y: 14, w: 24, h: 15, i: '3' },
+      type: 'visualization',
+      id: VIS_VARNISH_HANDLING_BREAKDOWN_ID,
+      embeddableConfig: {},
+      version: '8.0.0',
+    },
+    {
+      panelIndex: '4',
+      gridData: { x: 24, y: 14, w: 24, h: 15, i: '4' },
+      type: 'visualization',
+      id: VIS_VARNISH_LATENCY_TREND_ID,
       embeddableConfig: {},
       version: '8.0.0',
     },
@@ -1053,6 +1332,28 @@ function buildSavedObjects(): SavedObject[] {
         sort: [['@timestamp', 'desc']],
         kibanaSavedObjectMeta: {
           searchSourceJSON: dockerMetricsSearchSource,
+        },
+      },
+    },
+    {
+      type: 'search',
+      id: SEARCH_VARNISH_LOGS_ID,
+      attributes: {
+        title: 'Varnish Access Logs',
+        columns: [
+          '@timestamp',
+          'mz.env_id',
+          'varnish.host',
+          'varnish.method',
+          'varnish.url',
+          'varnish.status',
+          'varnish.handling',
+          'varnish.hitmiss',
+          'varnish.duration_us',
+        ],
+        sort: [['@timestamp', 'desc']],
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: varnishLogsSearchSource,
         },
       },
     },
@@ -1255,6 +1556,82 @@ function buildSavedObjects(): SavedObject[] {
       },
     },
     {
+      type: 'visualization',
+      id: VIS_VARNISH_STATUS_TREND_ID,
+      attributes: {
+        title: 'Varnish 200 / 503 Trend',
+        visState: JSON.stringify({
+          title: 'Varnish 200 / 503 Trend',
+          type: 'vega',
+          aggs: [],
+          params: { spec: JSON.stringify(varnishStatusTrendSpec) },
+        }),
+        uiStateJSON: '{}',
+        description: '',
+        version: 1,
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: varnishLogsSearchSource,
+        },
+      },
+    },
+    {
+      type: 'visualization',
+      id: VIS_VARNISH_HIT_RATE_TREND_ID,
+      attributes: {
+        title: 'Varnish Cache Hit Rate Trend (%)',
+        visState: JSON.stringify({
+          title: 'Varnish Cache Hit Rate Trend (%)',
+          type: 'vega',
+          aggs: [],
+          params: { spec: JSON.stringify(varnishHitRateTrendSpec) },
+        }),
+        uiStateJSON: '{}',
+        description: '',
+        version: 1,
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: varnishLogsSearchSource,
+        },
+      },
+    },
+    {
+      type: 'visualization',
+      id: VIS_VARNISH_HANDLING_BREAKDOWN_ID,
+      attributes: {
+        title: 'Varnish Handling Breakdown',
+        visState: JSON.stringify({
+          title: 'Varnish Handling Breakdown',
+          type: 'vega',
+          aggs: [],
+          params: { spec: JSON.stringify(varnishHandlingBreakdownSpec) },
+        }),
+        uiStateJSON: '{}',
+        description: '',
+        version: 1,
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: varnishLogsSearchSource,
+        },
+      },
+    },
+    {
+      type: 'visualization',
+      id: VIS_VARNISH_LATENCY_TREND_ID,
+      attributes: {
+        title: 'Varnish Request Duration Trend (ms)',
+        visState: JSON.stringify({
+          title: 'Varnish Request Duration Trend (ms)',
+          type: 'vega',
+          aggs: [],
+          params: { spec: JSON.stringify(varnishLatencyTrendSpec) },
+        }),
+        uiStateJSON: '{}',
+        description: '',
+        version: 1,
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: varnishLogsSearchSource,
+        },
+      },
+    },
+    {
       type: 'dashboard',
       id: DASHBOARD_OPS_ID,
       attributes: {
@@ -1301,6 +1678,31 @@ function buildSavedObjects(): SavedObject[] {
         },
       },
     },
+    {
+      type: 'dashboard',
+      id: DASHBOARD_VARNISH_ID,
+      attributes: {
+        title: '3) Varnish',
+        hits: 0,
+        description: 'Varnish access health, cache efficiency, and request timing.',
+        panelsJSON: varnishDashboardPanels,
+        optionsJSON: JSON.stringify({
+          useMargins: true,
+          syncColors: false,
+          syncCursor: true,
+          syncTooltips: false,
+          hidePanelTitles: false,
+        }),
+        version: 1,
+        timeRestore: false,
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: JSON.stringify({
+            query: { language: 'kuery', query: 'event.dataset.keyword : "varnish.access"' },
+            filter: [],
+          }),
+        },
+      },
+    },
   ];
 }
 
@@ -1334,7 +1736,7 @@ export async function bootstrapMonitoringDashboards(): Promise<BootstrapResult> 
 
   return {
     dashboard_id: DASHBOARD_OPS_ID,
-    dashboard_ids: [DASHBOARD_OPS_ID, DASHBOARD_MAGENTO_CONTAINERS_ID],
+    dashboard_ids: [DASHBOARD_OPS_ID, DASHBOARD_MAGENTO_CONTAINERS_ID, DASHBOARD_VARNISH_ID],
     upserted_objects: upsertedObjects,
     container_id: containerId,
   };

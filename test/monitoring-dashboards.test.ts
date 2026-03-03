@@ -47,4 +47,39 @@ describe('monitoring-dashboards helpers', () => {
       parsed: { status: { overall: { state: 'red' } } },
     })).toBe(false);
   });
+
+  it('includes a dedicated varnish dashboard and access visualizations', () => {
+    const objects = __testing.buildSavedObjects();
+    const dashboard = objects.find((object) => object.type === 'dashboard' && object.id === 'mz-dashboard-varnish');
+    const statusTrend = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-varnish-status-trend');
+    const hitRateTrend = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-varnish-hit-rate-trend');
+
+    expect(dashboard).toBeTruthy();
+    expect(statusTrend).toBeTruthy();
+    expect(hitRateTrend).toBeTruthy();
+    expect(dashboard?.attributes?.title).toBe('3) Varnish');
+  });
+
+  it('uses the corrected CPU dataset and preserves zero values in container CPU charts', () => {
+    const objects = __testing.buildSavedObjects();
+    const cpuByService = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-container-cpu-by-service');
+    const cpuTrend = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-container-cpu-trend');
+
+    const cpuByServiceSpec = JSON.parse(
+      String((JSON.parse(String(cpuByService?.attributes?.visState || '{}'))?.params?.spec) || '{}'),
+    ) as Record<string, unknown>;
+    const cpuTrendSpec = JSON.parse(
+      String((JSON.parse(String(cpuTrend?.attributes?.visState || '{}'))?.params?.spec) || '{}'),
+    ) as Record<string, unknown>;
+
+    const byServiceMust = (((((cpuByServiceSpec.data as Record<string, unknown>)?.url as Record<string, unknown>)?.body as Record<string, unknown>)?.aggs as Record<string, unknown>)?.filtered as Record<string, unknown>)?.filter as Record<string, unknown>;
+    const trendMust = (((((cpuTrendSpec.data as Record<string, unknown>)?.url as Record<string, unknown>)?.body as Record<string, unknown>)?.aggs as Record<string, unknown>)?.filtered as Record<string, unknown>)?.filter as Record<string, unknown>;
+    const byServiceTransform = Array.isArray(cpuByServiceSpec.transform) ? cpuByServiceSpec.transform : [];
+    const trendTransform = Array.isArray(cpuTrendSpec.transform) ? cpuTrendSpec.transform : [];
+
+    expect(JSON.stringify(byServiceMust)).toContain('mz.docker.cpu');
+    expect(JSON.stringify(trendMust)).toContain('mz.docker.cpu');
+    expect(JSON.stringify(byServiceTransform)).toContain('isValid(datum.cpu_avg)');
+    expect(JSON.stringify(trendTransform)).toContain('isValid(datum.point.cpu_avg)');
+  });
 });
