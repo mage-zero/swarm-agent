@@ -1,31 +1,17 @@
 {
-  "version": "0.4.82",
+  "version": "0.4.83",
   "date": "2026-03-03",
-  "summary": "Refresh monitoring assets and roll out Varnish observability updates",
+  "summary": "Refresh only the monitoring services needed for the CPU metrics and Dashboards fixes",
   "requires": {
-    "cloud-swarm": ">=1.0.29"
+    "cloud-swarm": ">=1.0.31"
   },
   "changes": [
     {
       "id": "refresh-monitoring-observability-assets",
-      "description": "Rebuild and redeploy the monitoring stack so the updated Filebeat and Metricbeat images go live, then re-bootstrap OpenSearch Dashboards so the corrected container CPU charts and new Varnish dashboard are available.",
+      "description": "Rebuild and redeploy only the monitoring stack services affected by the observability fixes: opensearch-monitoring/opensearch-init, opensearch-dashboards, filebeat, metricbeat, and any monitoring services with updated stack config such as data-prepper. This avoids rebuilding unrelated application services.",
       "phase": "post_migrate",
       "downtimeMinutes": 0,
       "scope": "stack"
-    },
-    {
-      "id": "rebuild-base-service-images",
-      "description": "Rebuild shared cloud-swarm service images so the updated Varnish runtime image is published to the local registry before environment services are refreshed.",
-      "phase": "post_migrate",
-      "downtimeMinutes": 0,
-      "scope": "stack"
-    },
-    {
-      "id": "rollout-varnish-observability-image",
-      "description": "Force each environment's Varnish service to refresh against the rebuilt mz-varnish image so structured access logging is enabled without waiting for a normal deploy.",
-      "phase": "post_migrate",
-      "downtimeMinutes": 0,
-      "scope": "environment"
     }
   ]
 }
