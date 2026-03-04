@@ -457,13 +457,27 @@ export async function runSwarmJob(options: SwarmJobOptions): Promise<SwarmJobRes
     const firstWord = parseTaskStateWord(tasks[0]?.current_state || '');
     return { state: firstWord || 'unknown', terminal: false, details };
   };
-  const removeService = async (): Promise<void> => {
+  const summarizeLegacyPsLines = (lines: string[]): { state: string; terminal: boolean; details: string[] } => {
+    if (!lines.length) {
+      return { state: 'unknown', terminal: false, details: [] };
+    }
+    const details = lines.slice(0, 5);
+    const [stateRaw] = (lines[0] || '').split('|');
+    const stateWord = (stateRaw || '').trim().split(/\s+/)[0] || 'unknown';
+    return {
+      state: stateWord,
+      terminal: terminalStateWords.has(stateWord),
+      details,
+    };
+  };
+  const removeService = async (waitForGone = false): Promise<void> => {
     const rm = await runCommand('docker', ['service', 'rm', options.name], 12_000);
-    if (rm.code !== 0) return;
+    if (rm.code !== 0 || !waitForGone) return;
     const startedAt = Date.now();
-    while (Date.now() - startedAt < 15_000) {
+    while (Date.now() - startedAt < 5_000) {
       const inspect = await runCommand('docker', ['service', 'inspect', options.name], 12_000);
-      if (inspect.code !== 0) break;
+      const inspectOut = inspect.stdout.trim();
+      if (inspect.code !== 0 || inspectOut === '' || inspectOut === '[]' || inspectOut === '<no value>' || inspectOut === 'null') break;
       await sleep(500);
     }
   };
@@ -522,7 +536,7 @@ export async function runSwarmJob(options: SwarmJobOptions): Promise<SwarmJobRes
     const createError = `${created.stderr}\n${created.stdout}`.trim();
     const conflict = /already exists|already in use|name conflicts/i.test(createError);
     if (conflict) {
-      await removeService();
+      await removeService(true);
       await sleep(400);
       created = await createJob();
     }
@@ -554,6 +568,19 @@ export async function runSwarmJob(options: SwarmJobOptions): Promise<SwarmJobRes
         if (summary.terminal) {
           break;
         }
+      } else {
+        const ps = await runCommand('docker', ['service', 'ps', options.name, '--no-trunc', '--format', '{{.CurrentState}}|{{.Error}}'], 12_000);
+        const lines = ps.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+        if (lines.length) {
+          const summary = summarizeLegacyPsLines(lines);
+          details.splice(0, details.length, ...summary.details);
+          if (summary.state) {
+            finalState = summary.state;
+          }
+          if (summary.terminal) {
+            break;
+          }
+        }
       }
       await sleep(500);
     }
@@ -565,7 +592,7 @@ export async function runSwarmJob(options: SwarmJobOptions): Promise<SwarmJobRes
     const logResult = await runCommand('docker', ['service', 'logs', options.name, '--raw', '--no-task-ids'], 30_000);
     logs = (logResult.stdout || logResult.stderr || '').trim();
   } finally {
-    await removeService();
+    await removeService(false);
   }
 
   const ok = finalState === 'Complete';
