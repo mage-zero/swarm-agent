@@ -1,17 +1,17 @@
 {
-  "version": "0.4.86",
-  "date": "2026-03-03",
-  "summary": "Repair container CPU monitoring mappings so upgraded stacks emit and query corrected CPU metrics immediately",
+  "version": "0.4.87",
+  "date": "2026-03-04",
+  "summary": "Add deploy-window-aware stabilization so environments self-heal after deploys without colliding with active rollout work",
   "requires": {
     "cloud-swarm": ">=1.0.34"
   },
   "changes": [
     {
-      "id": "refresh-monitoring-cpu-schema-v1",
-      "description": "Rebuild and redeploy the monitoring stack on upgrade so the custom container CPU exporter writes the corrected float-mapped CPU field, and re-bootstrap dashboards so container CPU panels and tuning queries read the repaired metrics immediately.",
-      "phase": "post_migrate",
+      "id": "stabilization-controller-v1",
+      "description": "Start a continuous stabilization worker that tracks deploy leases, pauses remediation during deploy windows, and runs post-deploy checks/repairs (replication, ProxySQL, smoke, and Varnish) via runbooks, while exposing stabilization state for support status consumers.",
+      "phase": "post_deploy",
       "downtimeMinutes": 0,
-      "scope": "stack"
+      "scope": "environment"
     }
   ]
 }
