@@ -246,6 +246,11 @@ const DEPLOY_INTERVAL_MS = Number(process.env.MZ_DEPLOY_WORKER_INTERVAL_MS || 50
 const FETCH_TIMEOUT_MS = Number(process.env.MZ_FETCH_TIMEOUT_MS || 30000);
 const APP_HA_MIN_READY_NODES = Math.max(1, Number(process.env.MZ_APP_HA_MIN_READY_NODES || 2));
 const APP_HA_MAX_REPLICAS = Math.max(1, Number(process.env.MZ_APP_HA_MAX_REPLICAS || 2));
+const REPLICA_AUTO_REPAIR_TIMEOUT_MS = Math.max(
+  30_000,
+  Number(process.env.MZ_DEPLOY_REPLICA_AUTO_REPAIR_TIMEOUT_MS || 180_000),
+);
+const REPLICA_AUTO_REPAIR_UPDATE_MONITOR = process.env.MZ_DEPLOY_REPLICA_UPDATE_MONITOR || '90s';
 function isLoopbackHost(host: string) {
   const value = String(host || '').trim().toLowerCase();
   return value === '127.0.0.1' || value === 'localhost' || value === '::1';
@@ -2370,6 +2375,35 @@ async function configureReplica(containerId: string, masterHost: string, replica
   ]);
 }
 
+function summarizeReplicaTasksForError(tasks: Array<{ name: string; current_state: string; error: string }>): string {
+  if (!tasks.length) return '';
+  return tasks
+    .slice(0, 5)
+    .map((task) => `${task.name} ${task.current_state}${task.error ? ` (${task.error})` : ''}`.trim())
+    .join('; ');
+}
+
+function buildReplicaConfigureScript(params: { masterHost: string; replicaHost: string; replicaUser: string }): string {
+  const safeMasterHost = params.masterHost.replace(/'/g, "''");
+  const safeReplicaHost = params.replicaHost.replace(/'/g, "''");
+  const safeReplicaUser = params.replicaUser.replace(/'/g, "''");
+  const passRef = '${REPL_PASS}';
+  return [
+    'set -e',
+    'REPL_PASS="$(cat /run/secrets/db_replication_password)"',
+    'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+    `i=0; until mariadb -h '${safeMasterHost}' -uroot -p"$ROOT_PASS" -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 60 ]; then echo "primary not ready" >&2; exit 1; fi; sleep 1; done`,
+    `i=0; until mariadb -h '${safeReplicaHost}' -uroot -p"$ROOT_PASS" -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 60 ]; then echo "replica not ready" >&2; exit 1; fi; sleep 1; done`,
+    `mariadb -h '${safeMasterHost}' -uroot -p"$ROOT_PASS" -e "CREATE USER IF NOT EXISTS '${safeReplicaUser}'@'%' IDENTIFIED BY '${passRef}';"`,
+    `mariadb -h '${safeMasterHost}' -uroot -p"$ROOT_PASS" -e "ALTER USER '${safeReplicaUser}'@'%' IDENTIFIED BY '${passRef}';"`,
+    `mariadb -h '${safeMasterHost}' -uroot -p"$ROOT_PASS" -e "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '${safeReplicaUser}'@'%'; FLUSH PRIVILEGES;"`,
+    `(mariadb -h '${safeMasterHost}' -uroot -p"$ROOT_PASS" -e "GRANT SLAVE MONITOR ON *.* TO 'magento'@'%';" || true)`,
+    `(mariadb -h '${safeReplicaHost}' -uroot -p"$ROOT_PASS" -e "STOP SLAVE; RESET SLAVE ALL;" || true)`,
+    `mariadb -h '${safeReplicaHost}' -uroot -p"$ROOT_PASS" -e "CHANGE MASTER TO MASTER_HOST='${safeMasterHost}', MASTER_PORT=3306, MASTER_USER='${safeReplicaUser}', MASTER_PASSWORD='${passRef}', MASTER_USE_GTID=slave_pos; START SLAVE;"`,
+    `(mariadb -h '${safeReplicaHost}' -uroot -p"$ROOT_PASS" -e "SET GLOBAL read_only=1;" || true)`,
+  ].join(' && ');
+}
+
 async function configureReplicaViaSwarmJob(params: {
   environmentId: number;
   replicaServiceFullName: string;
@@ -2384,27 +2418,17 @@ async function configureReplicaViaSwarmJob(params: {
   const replicaTasks = await listServiceTasks(params.replicaServiceFullName);
   const desiredRunning = replicaTasks.filter((task) => task.desired_state.toLowerCase() === 'running');
   if (!desiredRunning.length) {
-    const summary = replicaTasks
-      .slice(0, 3)
-      .map((task) => `${task.name} ${task.current_state}${task.error ? ` (${task.error})` : ''}`)
-      .join('; ');
+    const summary = summarizeReplicaTasksForError(replicaTasks);
     throw new Error(
       `replica service has no desired running tasks${summary ? `: ${summary}` : ''}`,
     );
   }
 
-  const safeMasterHost = params.masterHost.replace(/'/g, "''");
-  const safeReplicaUser = params.replicaUser.replace(/'/g, "''");
-  const safeReplicaHost = params.replicaServiceFullName.replace(/'/g, "''");
-  const passRef = '${REPL_PASS}';
-  const script = [
-    'set -e',
-    'REPL_PASS="$(cat /run/secrets/db_replication_password)"',
-    'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
-    `i=0; until mariadb -h '${safeReplicaHost}' -uroot -p"$ROOT_PASS" -e "SELECT 1" >/dev/null 2>&1; do i=$((i+1)); if [ "$i" -gt 30 ]; then echo "replica not ready" >&2; exit 1; fi; sleep 1; done`,
-    `mariadb -h '${safeReplicaHost}' -uroot -p"$ROOT_PASS" -e "CHANGE MASTER TO MASTER_HOST='${safeMasterHost}', MASTER_PORT=3306, MASTER_USER='${safeReplicaUser}', MASTER_PASSWORD='${passRef}', MASTER_USE_GTID=slave_pos;"`,
-    `mariadb -h '${safeReplicaHost}' -uroot -p"$ROOT_PASS" -e "START SLAVE;"`,
-  ].join(' && ');
+  const script = buildReplicaConfigureScript({
+    masterHost: params.masterHost,
+    replicaHost: params.replicaServiceFullName,
+    replicaUser: params.replicaUser,
+  });
 
   const job = await runSwarmJob({
     name: buildJobName('deploy-replica-config', params.environmentId),
@@ -2418,6 +2442,120 @@ async function configureReplicaViaSwarmJob(params: {
   if (!job.ok) {
     const detail = (job.logs || job.error || '').trim();
     throw new Error(detail || `replica config job failed (${job.state})`);
+  }
+}
+
+async function autoRepairReplicaService(
+  replicaServiceFullName: string,
+  log: (message: string) => void,
+): Promise<void> {
+  const scale = await runCommandCaptureWithStatus('docker', [
+    'service',
+    'scale',
+    `${replicaServiceFullName}=1`,
+  ]);
+  if (scale.code !== 0) {
+    const output = (scale.stderr || scale.stdout || '').trim();
+    throw new Error(`failed to scale replica service (${output || `exit ${scale.code}`})`);
+  }
+  log(`replica auto-repair: scaled ${replicaServiceFullName} to 1`);
+
+  const policyArgs = [
+    'service',
+    'update',
+    '--detach=true',
+    '--update-monitor',
+    REPLICA_AUTO_REPAIR_UPDATE_MONITOR,
+    '--update-failure-action',
+    'rollback',
+    '--update-order',
+    'stop-first',
+    '--rollback-order',
+    'stop-first',
+    replicaServiceFullName,
+  ];
+  let policyUpdate = await runCommandCaptureWithStatus('docker', policyArgs);
+  if (policyUpdate.code !== 0) {
+    const output = `${policyUpdate.stdout || ''}\n${policyUpdate.stderr || ''}`.toLowerCase();
+    if (output.includes('update paused') || output.includes('paused')) {
+      await resumePausedServiceUpdate(replicaServiceFullName, log);
+      policyUpdate = await runCommandCaptureWithStatus('docker', policyArgs);
+    }
+  }
+  if (policyUpdate.code !== 0) {
+    const output = `${policyUpdate.stdout || ''}\n${policyUpdate.stderr || ''}`.trim();
+    if (!isNoopServiceUpdateOutput(output)) {
+      throw new Error(`failed to set replica service update policy (${output || `exit ${policyUpdate.code}`})`);
+    }
+  } else {
+    log(
+      `replica auto-repair: update policy applied (${replicaServiceFullName}, monitor=${REPLICA_AUTO_REPAIR_UPDATE_MONITOR})`,
+    );
+  }
+
+  const resumed = await resumePausedServiceUpdate(replicaServiceFullName, log);
+  if (!resumed) {
+    throw new Error('failed to resume paused replica service update');
+  }
+
+  const forced = await tryForceUpdateService(replicaServiceFullName, log);
+  if (!forced) {
+    const update = await inspectServiceUpdateStatus(replicaServiceFullName);
+    const updateSummary = update
+      ? `${update.state}${update.message ? ` (${update.message})` : ''}`
+      : 'unknown';
+    throw new Error(`failed to force replica service update (status=${updateSummary})`);
+  }
+
+  const ready = await waitForAllDesiredServiceTasksRunning(
+    replicaServiceFullName,
+    log,
+    REPLICA_AUTO_REPAIR_TIMEOUT_MS,
+  );
+  if (!ready) {
+    const tasks = await listServiceTasks(replicaServiceFullName);
+    const summary = summarizeReplicaTasksForError(tasks);
+    throw new Error(`replica service not ready after auto-repair${summary ? `: ${summary}` : ''}`);
+  }
+}
+
+function buildReplicaSetupFailureMessage(initialMessage: string, repairMessage: string): string {
+  const initial = initialMessage.trim() || 'unknown failure';
+  const repair = repairMessage.trim() || 'unknown auto-repair failure';
+  return `replica setup failed after auto-repair (initial: ${initial}; auto-repair: ${repair})`;
+}
+
+async function configureReplicaWithAutoRepair(params: {
+  environmentId: number;
+  replicaServiceFullName: string;
+  masterHost: string;
+  replicaUser: string;
+  log: (message: string) => void;
+}): Promise<void> {
+  try {
+    await configureReplicaViaSwarmJob({
+      environmentId: params.environmentId,
+      replicaServiceFullName: params.replicaServiceFullName,
+      masterHost: params.masterHost,
+      replicaUser: params.replicaUser,
+    });
+    return;
+  } catch (error) {
+    const initialMessage = error instanceof Error ? error.message : String(error);
+    params.log(`replica config failed; attempting auto-repair: ${initialMessage}`);
+    try {
+      await autoRepairReplicaService(params.replicaServiceFullName, params.log);
+      await configureReplicaViaSwarmJob({
+        environmentId: params.environmentId,
+        replicaServiceFullName: params.replicaServiceFullName,
+        masterHost: params.masterHost,
+        replicaUser: params.replicaUser,
+      });
+      params.log('replica auto-repair succeeded');
+    } catch (repairError) {
+      const repairMessage = repairError instanceof Error ? repairError.message : String(repairError);
+      throw new Error(buildReplicaSetupFailureMessage(initialMessage, repairMessage));
+    }
   }
 }
 
@@ -4602,19 +4740,15 @@ async function processDeployment(recordPath: string) {
 
   progress.start('app_prepare');
   if (replicaServiceName === 'database-replica') {
-    try {
-      progress.detail('app_prepare', 'Configuring database replication');
-      await configureReplicaViaSwarmJob({
-        environmentId,
-        replicaServiceFullName: stackService('database-replica'),
-        masterHost: stackService('database'),
-        replicaUser,
-      });
-      log('replica configured');
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      log(`replica setup skipped: ${message}`);
-    }
+    progress.detail('app_prepare', 'Configuring database replication');
+    await configureReplicaWithAutoRepair({
+      environmentId,
+      replicaServiceFullName: stackService('database-replica'),
+      masterHost: stackService('database'),
+      replicaUser,
+      log,
+    });
+    log('replica configured');
   }
 
   progress.detail('app_prepare', 'Waiting for PHP containers');
@@ -5303,6 +5437,8 @@ export const __testing = {
   buildProxySqlRuleReconcileScript,
   shouldReuseAppImagesForCloudSwarmRef,
   getQueueSourceDirs,
+  buildReplicaConfigureScript,
+  buildReplicaSetupFailureMessage,
   resolveAggressivePruneCutoffSeconds,
   getHistoryLastSuccessfulDeployAt,
 };
