@@ -3271,11 +3271,12 @@ export async function pushStatus() {
   const cloudInitStatus = readCloudInitStatus();
   const cloudInitPayload = cloudInitStatus ? JSON.stringify(cloudInitStatus) : null;
   const upgradeStatus = readUpgradeStatusPayload();
+  const upgradeStatusPayload = upgradeStatus ? JSON.stringify(upgradeStatus) : null;
   const masterSshPublicKey = readNodeFile('stack_master_ssh.pub');
   const payload: Record<string, unknown> = {
     status: nodeStatus,
     cloud_init_status: cloudInitPayload,
-    upgrade_status: upgradeStatus,
+    upgrade_status: upgradeStatusPayload,
   };
   if (stackStatus) {
     payload.stack_status = stackStatus;

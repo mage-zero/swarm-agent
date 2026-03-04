@@ -297,6 +297,20 @@ const RUNBOOKS: RunbookDefinition[] = [
     supports_remediation: false,
   },
   {
+    id: 'db_replica_healthcheck_status',
+    name: 'Database replica healthcheck/auth status',
+    description: 'Inspect database-replica task stability and healthcheck authentication configuration.',
+    safe: true,
+    supports_remediation: false,
+  },
+  {
+    id: 'db_replica_healthcheck_repair',
+    name: 'Repair database replica healthcheck/auth config',
+    description: 'Restore replica healthcheck credentials file on replica data volume and restart replica task.',
+    safe: false,
+    supports_remediation: true,
+  },
+  {
     id: 'db_replica_enable',
     name: 'Enable database replica placement',
     description: 'Ensure database-replica runs on a different node and is replicating (replica-required).',
@@ -823,11 +837,9 @@ function extractBetweenMarkers(lines: string[], startMarker: string, endMarker: 
   return lines.slice(startIndex + 1, endIndex).join('\n');
 }
 
-function parseDbReplicationProbe(rawLogs: string): DbReplicationProbe | null {
-  if (!rawLogs.trim()) return null;
-  const lines = rawLogs.split('\n');
+function parseKeyValueLines(rawLogs: string): Map<string, string> {
   const values = new Map<string, string>();
-  for (const line of lines) {
+  for (const line of rawLogs.split('\n')) {
     const trimmed = line.trim();
     const idx = trimmed.indexOf('=');
     if (idx <= 0) continue;
@@ -836,6 +848,13 @@ function parseDbReplicationProbe(rawLogs: string): DbReplicationProbe | null {
     if (!key) continue;
     values.set(key, value);
   }
+  return values;
+}
+
+function parseDbReplicationProbe(rawLogs: string): DbReplicationProbe | null {
+  if (!rawLogs.trim()) return null;
+  const lines = rawLogs.split('\n');
+  const values = parseKeyValueLines(rawLogs);
 
   const primarySlaveRaw = extractBetweenMarkers(lines, 'PRIMARY_SLAVE_STATUS_BEGIN', 'PRIMARY_SLAVE_STATUS_END');
   const replicaSlaveRaw = extractBetweenMarkers(lines, 'REPLICA_SLAVE_STATUS_BEGIN', 'REPLICA_SLAVE_STATUS_END');
@@ -1009,9 +1028,11 @@ async function runDatabaseJob(
   const result = await runSwarmJob({
     name: jobName,
     image: spec.image,
+    entrypoint: 'sh',
     networks: [networkName],
     secrets,
-    command: ['sh', '-lc', script],
+    command: ['-lc', script],
+    disable_healthcheck: true,
     timeout_ms: opts?.timeout_ms,
   });
 
@@ -1021,6 +1042,71 @@ async function runDatabaseJob(
     state: result.state,
     error: result.error,
     details: result.details,
+  };
+}
+
+async function runReplicaVolumeJob(
+  environmentId: number,
+  jobPrefix: string,
+  script: string,
+  opts?: { timeout_ms?: number }
+): Promise<{ ok: boolean; logs: string; state: string; error?: string; details?: string[]; service?: string; node?: string }> {
+  const replicaService = envServiceName(environmentId, 'database-replica');
+  const spec = await inspectServiceSpec(replicaService);
+  if (!spec) {
+    return {
+      ok: false,
+      state: 'missing_service',
+      logs: '',
+      error: `service not found (${replicaService})`,
+    };
+  }
+
+  const mounts = spec.mounts.map((mount) => ({
+    type: mount.type,
+    source: mount.source,
+    target: mount.target,
+    read_only: mount.read_only,
+  }));
+  const secrets = spec.secrets.map((secret) => ({ source: secret.secret_name, target: secret.file_name }));
+  const networks = Array.from(new Set(spec.networks.map((net) => net.name).filter(Boolean)));
+  if (!networks.length) networks.push('mz-backend');
+
+  const node = await getServiceTaskNode(environmentId, 'database-replica');
+  if (!node) {
+    return {
+      ok: false,
+      state: 'missing_node',
+      logs: '',
+      error: `unable to resolve database-replica task node (${replicaService})`,
+      service: replicaService,
+    };
+  }
+  const constraints = [`node.hostname==${node}`];
+
+  const jobName = buildJobName(jobPrefix, environmentId);
+  const result = await runSwarmJob({
+    name: jobName,
+    image: spec.image,
+    entrypoint: 'sh',
+    command: ['-lc', script],
+    networks,
+    secrets,
+    mounts,
+    env: spec.env,
+    constraints,
+    disable_healthcheck: true,
+    timeout_ms: opts?.timeout_ms,
+  });
+
+  return {
+    ok: result.ok,
+    logs: result.logs,
+    state: result.state,
+    error: result.error,
+    details: result.details,
+    service: replicaService,
+    node,
   };
 }
 
@@ -2317,6 +2403,10 @@ export async function executeRunbookById(
       return runSwarmTuningProfileApply(environmentId, input);
     case 'db_replication_status':
       return runDbReplicationStatus(environmentId);
+    case 'db_replica_healthcheck_status':
+      return runDbReplicaHealthcheckStatus(environmentId);
+    case 'db_replica_healthcheck_repair':
+      return runDbReplicaHealthcheckRepair(environmentId);
     case 'db_replica_enable':
       return runDbReplicaEnable(environmentId);
     case 'db_failover':
@@ -3656,6 +3746,247 @@ async function runSwarmTuningProfileApply(environmentId: number, input: Record<s
   };
 }
 
+const DB_REPLICA_HEALTHCHECK_LOG_PATTERNS = [
+  /access denied for user ['"`]?healthcheck/i,
+  /my-healthcheck\.cnf/i,
+  /healthcheck.*(access denied|authentication)/i,
+];
+
+function extractMatchingLines(raw: string, patterns: RegExp[], limit = 8): string[] {
+  if (!raw.trim()) return [];
+  const matched: string[] = [];
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (patterns.some((pattern) => pattern.test(trimmed))) {
+      matched.push(trimmed);
+    }
+  }
+  return matched.slice(Math.max(0, matched.length - limit));
+}
+
+async function runDbReplicaHealthcheckStatus(environmentId: number): Promise<RunbookResult> {
+  const serviceName = envServiceName(environmentId, 'database-replica');
+  const tasks = await listServiceTasks(serviceName);
+  if (!tasks.length) {
+    return {
+      runbook_id: 'db_replica_healthcheck_status',
+      status: 'failed',
+      summary: 'Database replica service not found or has no tasks.',
+      observations: [`Missing tasks for ${serviceName}`],
+      data: {
+        environment_id: environmentId,
+        service: serviceName,
+        has_issue: true,
+      },
+    };
+  }
+
+  const summary = summarizeServiceTasks(tasks);
+  const observations: string[] = [
+    `Service: ${serviceName}`,
+    `Tasks: running=${summary.running}/${summary.desired_running} total=${summary.total}`,
+    summary.nodes.length ? `Nodes: ${summary.nodes.join(', ')}` : '',
+    ...summary.issues.map((line) => `Issue: ${line}`),
+  ].filter(Boolean);
+
+  const logResult = await runCommand(
+    'docker',
+    ['service', 'logs', serviceName, '--raw', '--no-task-ids', '--tail', '120'],
+    25_000,
+  );
+  const healthcheckLogLines = extractMatchingLines(
+    `${logResult.stdout || ''}\n${logResult.stderr || ''}`,
+    DB_REPLICA_HEALTHCHECK_LOG_PATTERNS,
+    6,
+  );
+  if (healthcheckLogLines.length) {
+    observations.push(...healthcheckLogLines.map((line) => `Replica log: ${line}`));
+  }
+
+  const fileProbeScript = [
+    'set -e',
+    'HC_FILE="/var/lib/mysql/.my-healthcheck.cnf"',
+    'if [ -s "$HC_FILE" ]; then',
+    '  echo "HC_FILE_PRESENT=1"',
+    '  user_line="$(grep -E \"^[[:space:]]*user=\" \"$HC_FILE\" | tail -n1 || true)"',
+    '  if [ -n "$user_line" ]; then',
+    '    echo "HC_FILE_USER=${user_line#*=}"',
+    '  fi',
+    'else',
+    '  echo "HC_FILE_PRESENT=0"',
+    'fi',
+  ].join('\n');
+  const fileProbe = await runReplicaVolumeJob(environmentId, 'db-hc-status', fileProbeScript, { timeout_ms: 45_000 });
+
+  let filePresent: boolean | null = null;
+  let fileUser = '';
+  if (fileProbe.ok) {
+    const values = parseKeyValueLines(fileProbe.logs);
+    filePresent = (values.get('HC_FILE_PRESENT') || '').trim() === '1';
+    fileUser = String(values.get('HC_FILE_USER') || '').trim();
+    observations.push(
+      `Healthcheck credentials file: ${filePresent ? 'present' : 'missing'} (/var/lib/mysql/.my-healthcheck.cnf)`,
+    );
+    if (fileUser) {
+      observations.push(`Healthcheck credentials user: ${fileUser}`);
+    }
+  } else {
+    observations.push(`Replica volume probe failed: ${fileProbe.error || fileProbe.state}`);
+  }
+
+  const fileConfigIssue = filePresent === false;
+  const runtimeAuthIssue = !summary.ok && healthcheckLogLines.length > 0;
+  const hasIssue = fileConfigIssue || runtimeAuthIssue;
+  const status: RunbookResult['status'] = summary.ok
+    ? (hasIssue ? 'warning' : 'ok')
+    : (hasIssue ? 'failed' : 'warning');
+
+  const summaryText = status === 'ok'
+    ? 'Replica healthcheck/auth configuration looks healthy.'
+    : hasIssue && !summary.ok
+      ? 'Replica task instability is linked to healthcheck/auth issues.'
+      : hasIssue
+        ? 'Replica healthcheck/auth configuration needs attention.'
+        : 'Replica service has task issues; healthcheck/auth issue not confirmed.';
+
+  return {
+    runbook_id: 'db_replica_healthcheck_status',
+    status,
+    summary: summaryText,
+    observations,
+    data: {
+      environment_id: environmentId,
+      service: serviceName,
+      tasks: tasks.slice(0, 10),
+      service_summary: summary,
+      file_probe: {
+        ok: fileProbe.ok,
+        state: fileProbe.state,
+        error: fileProbe.error || '',
+        node: fileProbe.node || '',
+        file_present: filePresent,
+        file_user: fileUser || null,
+      },
+      healthcheck_log_lines: healthcheckLogLines,
+      has_issue: hasIssue,
+    },
+  };
+}
+
+async function runDbReplicaHealthcheckRepair(environmentId: number): Promise<RunbookResult> {
+  const actions: string[] = [];
+  const observations: string[] = [];
+
+  const precheck = await runDbReplicaHealthcheckStatus(environmentId);
+  observations.push(`Pre-check: ${precheck.summary}`);
+  const preData = (precheck.data || {}) as Record<string, unknown>;
+  const hasIssue = preData.has_issue === true;
+
+  if (!hasIssue) {
+    return {
+      runbook_id: 'db_replica_healthcheck_repair',
+      status: precheck.status === 'failed' ? 'warning' : 'ok',
+      summary: 'Replica healthcheck/auth configuration does not require repair.',
+      observations,
+      data: {
+        environment_id: environmentId,
+        precheck,
+      },
+      remediation: {
+        attempted: false,
+        actions,
+      },
+    };
+  }
+
+  const repairScript = [
+    'set -e',
+    'ROOT_PASS="$(cat /run/secrets/db_root_password)"',
+    'HC_FILE="/var/lib/mysql/.my-healthcheck.cnf"',
+    'umask 077',
+    'printf "[client]\\nuser=root\\npassword=%s\\n" "$ROOT_PASS" > "$HC_FILE"',
+    'chmod 600 "$HC_FILE"',
+    'chown mysql:mysql "$HC_FILE" || true',
+    'echo "HC_FILE_WRITTEN=1"',
+  ].join('\n');
+  const repairJob = await runReplicaVolumeJob(environmentId, 'db-hc-repair', repairScript, { timeout_ms: 60_000 });
+  actions.push('Rewrote /var/lib/mysql/.my-healthcheck.cnf with local root credentials');
+  if (!repairJob.ok) {
+    observations.push(`Repair job failed: ${repairJob.error || repairJob.state}`);
+    if (repairJob.details?.length) observations.push(`Repair task: ${repairJob.details[0]}`);
+    return {
+      runbook_id: 'db_replica_healthcheck_repair',
+      status: 'failed',
+      summary: 'Failed to repair replica healthcheck/auth configuration.',
+      observations,
+      data: {
+        environment_id: environmentId,
+        precheck,
+        repair_job: {
+          ok: repairJob.ok,
+          state: repairJob.state,
+          error: repairJob.error || '',
+          details: repairJob.details || [],
+          node: repairJob.node || '',
+        },
+      },
+      remediation: {
+        attempted: true,
+        actions,
+      },
+    };
+  }
+
+  const replicaService = envServiceName(environmentId, 'database-replica');
+  const restart = await runCommand('docker', ['service', 'update', '--force', replicaService], 60_000);
+  if (restart.code === 0) {
+    actions.push('Forced database-replica service update');
+  } else {
+    observations.push(`Replica service restart trigger failed: ${restart.stderr.trim() || restart.stdout.trim() || 'unknown error'}`);
+  }
+
+  const running = await waitForServiceRunning(replicaService, 120_000);
+  if (!running.ok) {
+    observations.push(`Replica state after repair: ${(running.state || '').trim()} ${(running.note || '').trim()}`.trim());
+  }
+
+  const postcheck = await runDbReplicaHealthcheckStatus(environmentId);
+  observations.push(`Post-check: ${postcheck.summary}`);
+  const postData = (postcheck.data || {}) as Record<string, unknown>;
+  const resolved = postData.has_issue !== true && postcheck.status !== 'failed';
+
+  return {
+    runbook_id: 'db_replica_healthcheck_repair',
+    status: resolved ? 'ok' : 'warning',
+    summary: resolved
+      ? 'Replica healthcheck/auth configuration repaired.'
+      : 'Replica healthcheck/auth repair attempted but issues remain.',
+    observations,
+    data: {
+      environment_id: environmentId,
+      precheck,
+      repair_job: {
+        ok: repairJob.ok,
+        state: repairJob.state,
+        error: repairJob.error || '',
+        details: repairJob.details || [],
+        node: repairJob.node || '',
+      },
+      restart: {
+        ok: restart.code === 0,
+        error: restart.code === 0 ? '' : (restart.stderr.trim() || restart.stdout.trim() || 'unknown error'),
+      },
+      wait_for_running: running,
+      postcheck,
+    },
+    remediation: {
+      attempted: true,
+      actions,
+    },
+  };
+}
+
 async function runDbReplicationStatus(environmentId: number): Promise<RunbookResult> {
   const observations: string[] = [];
   const data: Record<string, unknown> = {};
@@ -4540,6 +4871,23 @@ async function runDeployActiveSummary(environmentId: number): Promise<RunbookRes
 }
 
 async function runStabilizationStatus(environmentId: number): Promise<RunbookResult> {
+  const checkLabels: Record<string, string> = {
+    db_replication_status: 'Database replication',
+    db_replica_healthcheck_status: 'Replica healthcheck/auth',
+    db_replica_healthcheck_repair: 'Replica healthcheck/auth repair',
+    db_replica_repair: 'Database replica repair',
+    proxysql_ready: 'ProxySQL readiness',
+    http_smoke_check: 'HTTP smoke check',
+    varnish_ready: 'Varnish readiness',
+  };
+  const checkLabel = (runbookId: string): string => {
+    const normalized = String(runbookId || '').trim();
+    if (!normalized) {
+      return 'Check';
+    }
+    return checkLabels[normalized] || normalized.replace(/_/g, ' ');
+  };
+
   const lease = readStabilizationLease(environmentId);
   const leaseActive = isStabilizationLeaseActive(lease);
   const state = readStabilizationState(environmentId);
@@ -4560,36 +4908,66 @@ async function runStabilizationStatus(environmentId: number): Promise<RunbookRes
     observations.push(`Last deploy window ended at ${lease.ended_at}`);
   }
   if (state?.current_step) {
-    observations.push(`Current step: ${state.current_step}`);
+    observations.push(`Current step: ${checkLabel(state.current_step)}`);
   }
   if (state?.next_run_at) {
     observations.push(`Next run at: ${state.next_run_at}`);
   }
   if (state?.last_error) {
-    observations.push(`Last error: ${state.last_error}`);
+    observations.push(`Latest issue: ${state.last_error}`);
   }
 
   const checks = Array.isArray(state?.checks) ? state.checks : [];
   const checkSummary = checks.slice(0, 5).map((check) => ({
     runbook_id: String((check as any)?.runbook_id || ''),
+    label: checkLabel(String((check as any)?.runbook_id || '')),
     status: String((check as any)?.status || ''),
     summary: String((check as any)?.summary || ''),
     finished_at: String((check as any)?.finished_at || ''),
   }));
+  const failedCount = checkSummary.filter((check) => check.status.toLowerCase() === 'failed').length;
+  const warningCount = checkSummary.filter((check) => check.status.toLowerCase() === 'warning').length;
+  const okCount = checkSummary.filter((check) => check.status.toLowerCase() === 'ok').length;
 
   const normalizedStatus = status.toLowerCase();
   const runbookStatus: RunbookResult['status'] = normalizedStatus === 'stable'
     ? 'ok'
     : normalizedStatus === 'maintenance' || normalizedStatus === 'stabilizing'
       ? 'warning'
-      : normalizedStatus === 'degraded'
+    : normalizedStatus === 'degraded'
         ? 'failed'
         : 'warning';
+
+  let summary = `Stabilization status: ${status}.`;
+  if (normalizedStatus === 'maintenance') {
+    summary = 'Stabilization paused during deployment window.';
+  } else if (normalizedStatus === 'stabilizing') {
+    const step = String(state?.current_step || '').trim();
+    summary = step !== ''
+      ? `Stabilization running checks (${checkLabel(step)}).`
+      : 'Stabilization running checks.';
+  } else if (normalizedStatus === 'stable') {
+    summary = checkSummary.length > 0
+      ? `Stabilization healthy (${okCount}/${checkSummary.length} checks passing).`
+      : 'Stabilization healthy.';
+  } else if (normalizedStatus === 'degraded') {
+    const parts: string[] = [];
+    if (failedCount > 0) {
+      parts.push(`${failedCount} failed`);
+    }
+    if (warningCount > 0) {
+      parts.push(`${warningCount} warning`);
+    }
+    const issueSummary = parts.length > 0 ? parts.join(', ') : 'issues detected';
+    summary = `Stabilization detected problems (${issueSummary}). Automatic retry scheduled.`;
+  } else if (normalizedStatus === 'unknown') {
+    summary = 'Stabilization status not yet reported.';
+  }
 
   return {
     runbook_id: 'stabilization_status',
     status: runbookStatus,
-    summary: `Stabilization status: ${status}.`,
+    summary,
     observations,
     data: {
       environment_id: environmentId,

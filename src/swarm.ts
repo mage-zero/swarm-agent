@@ -45,6 +45,7 @@ export type SwarmJobOptions = {
   mounts?: Array<{ type: string; source: string; target: string; read_only?: boolean }>;
   env?: Record<string, string>;
   constraints?: string[];
+  disable_healthcheck?: boolean;
   timeout_ms?: number;
 };
 
@@ -437,6 +438,37 @@ export async function waitForServiceNotRunning(serviceFullName: string, timeoutM
 }
 
 export async function runSwarmJob(options: SwarmJobOptions): Promise<SwarmJobResult> {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const terminalStateWords = new Set(['Complete', 'Failed', 'Rejected']);
+  const summarizeTasks = (tasks: SwarmServiceTask[]): { state: string; terminal: boolean; details: string[] } => {
+    const details = tasks.slice(0, 5).map((task) => {
+      const nodePart = task.node ? ` node=${task.node}` : '';
+      const errorPart = task.error ? ` error=${task.error}` : '';
+      return `${task.current_state}${nodePart}${errorPart}`.trim();
+    });
+
+    for (const task of tasks) {
+      const word = parseTaskStateWord(task.current_state);
+      if (terminalStateWords.has(word)) {
+        return { state: word, terminal: true, details };
+      }
+    }
+
+    const firstWord = parseTaskStateWord(tasks[0]?.current_state || '');
+    return { state: firstWord || 'unknown', terminal: false, details };
+  };
+  const removeService = async (): Promise<void> => {
+    const rm = await runCommand('docker', ['service', 'rm', options.name], 12_000);
+    if (rm.code !== 0) return;
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < 15_000) {
+      const inspect = await runCommand('docker', ['service', 'inspect', options.name], 12_000);
+      if (inspect.code !== 0) break;
+      await sleep(500);
+    }
+  };
+  const createJob = async () => runCommand('docker', args, 30_000);
+
   const timeoutMs = options.timeout_ms ?? 5 * 60_000;
   const jobImage = stripDigestFromImageRef(options.image) || options.image;
   const command = normalizeSwarmJobCommand(options.command, options.entrypoint);
@@ -454,6 +486,9 @@ export async function runSwarmJob(options: SwarmJobOptions): Promise<SwarmJobRes
     '1',
     '--no-resolve-image',
   ];
+  if (options.disable_healthcheck) {
+    args.push('--no-healthcheck');
+  }
 
   for (const network of options.networks || []) {
     args.push('--network', network);
@@ -482,7 +517,16 @@ export async function runSwarmJob(options: SwarmJobOptions): Promise<SwarmJobRes
 
   args.push(jobImage, ...command);
 
-  const created = await runCommand('docker', args, 30_000);
+  let created = await createJob();
+  if (created.code !== 0) {
+    const createError = `${created.stderr}\n${created.stdout}`.trim();
+    const conflict = /already exists|already in use|name conflicts/i.test(createError);
+    if (conflict) {
+      await removeService();
+      await sleep(400);
+      created = await createJob();
+    }
+  }
   if (created.code !== 0) {
     return {
       ok: false,
@@ -495,34 +539,37 @@ export async function runSwarmJob(options: SwarmJobOptions): Promise<SwarmJobRes
   let finalState = 'unknown';
   let logs = '';
   const details: string[] = [];
+  let timedOut = false;
 
   try {
     const startedAt = Date.now();
     while (Date.now() - startedAt < timeoutMs) {
-      const ps = await runCommand('docker', ['service', 'ps', options.name, '--no-trunc', '--format', '{{.CurrentState}}|{{.Error}}'], 12_000);
-      const lines = ps.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
-      if (lines.length) {
-        details.splice(0, details.length, ...lines.slice(0, 5));
-        const [stateRaw] = (lines[0] || '').split('|');
-        const stateWord = (stateRaw || '').trim().split(' ')[0] || '';
-        if (stateWord) {
-          finalState = stateWord;
+      const tasks = await listServiceTasks(options.name);
+      if (tasks.length) {
+        const summary = summarizeTasks(tasks);
+        details.splice(0, details.length, ...summary.details);
+        if (summary.state) {
+          finalState = summary.state;
         }
-        if (stateWord === 'Complete' || stateWord === 'Failed' || stateWord === 'Rejected') {
+        if (summary.terminal) {
           break;
         }
       }
-      await new Promise((r) => setTimeout(r, 500));
+      await sleep(500);
+    }
+
+    if (!terminalStateWords.has(finalState)) {
+      timedOut = true;
     }
 
     const logResult = await runCommand('docker', ['service', 'logs', options.name, '--raw', '--no-task-ids'], 30_000);
     logs = (logResult.stdout || logResult.stderr || '').trim();
   } finally {
-    await runCommand('docker', ['service', 'rm', options.name], 12_000);
+    await removeService();
   }
 
   const ok = finalState === 'Complete';
-  if (!ok && finalState === 'unknown') {
+  if (!ok && timedOut) {
     return {
       ok: false,
       state: 'timeout',

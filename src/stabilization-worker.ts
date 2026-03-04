@@ -39,6 +39,24 @@ const STABILIZATION_RUN_INTERVAL_MS = Math.max(
 let stabilizationTickTimer: NodeJS.Timeout | null = null;
 let stabilizationTickRunning = false;
 
+const STABILIZATION_CHECK_LABELS: Record<string, string> = {
+  db_replication_status: 'Database replication',
+  db_replica_healthcheck_status: 'Replica healthcheck/auth',
+  db_replica_healthcheck_repair: 'Replica healthcheck/auth repair',
+  db_replica_repair: 'Database replica repair',
+  proxysql_ready: 'ProxySQL readiness',
+  http_smoke_check: 'HTTP smoke check',
+  varnish_ready: 'Varnish readiness',
+};
+
+function formatStabilizationCheckLabel(runbookId: string): string {
+  const normalized = String(runbookId || '').trim();
+  if (!normalized) {
+    return 'Check';
+  }
+  return STABILIZATION_CHECK_LABELS[normalized] || normalized.replace(/_/g, ' ');
+}
+
 function log(message: string) {
   console.log(`[stabilization] ${message}`);
 }
@@ -138,6 +156,29 @@ async function runStabilizationCycle(environmentId: number, reason: string): Pro
       status: 'stabilizing',
       mode: 'active',
       run_id: runId,
+      current_step: 'db_replica_healthcheck_status',
+      current_step_started_at: nowIso(),
+      checks,
+    });
+    const dbHealthcheckStatus = await executeCheck(environmentId, 'db_replica_healthcheck_status');
+    checks.push(dbHealthcheckStatus);
+
+    if (dbHealthcheckStatus.status !== 'ok') {
+      upsertStabilizationState(environmentId, {
+        status: 'stabilizing',
+        mode: 'active',
+        run_id: runId,
+        current_step: 'db_replica_healthcheck_repair',
+        current_step_started_at: nowIso(),
+        checks,
+      });
+      checks.push(await executeCheck(environmentId, 'db_replica_healthcheck_repair'));
+    }
+
+    upsertStabilizationState(environmentId, {
+      status: 'stabilizing',
+      mode: 'active',
+      run_id: runId,
       current_step: 'db_replica_repair',
       current_step_started_at: nowIso(),
       checks,
@@ -181,7 +222,7 @@ async function runStabilizationCycle(environmentId: number, reason: string): Pro
   const lastError = hasErrors
     ? checks
       .filter((check) => check.status === 'failed' || check.status === 'warning')
-      .map((check) => `${check.runbook_id}: ${check.summary}`)
+      .map((check) => `${formatStabilizationCheckLabel(check.runbook_id)}: ${check.summary}`)
       .join('; ')
     : '';
 
@@ -189,7 +230,10 @@ async function runStabilizationCycle(environmentId: number, reason: string): Pro
     status: hasErrors ? 'degraded' : 'stable',
     mode: 'active',
     run_id: runId,
-    current_step: '',
+    current_step: hasErrors
+      ? 'Waiting for next retry cycle'
+      : 'Monitoring between scheduled checks',
+    current_step_started_at: nowAt,
     checks,
     last_error: lastError,
     last_success_at: hasErrors ? readStabilizationState(environmentId)?.last_success_at : nowAt,
