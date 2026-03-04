@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: auto-tag-release-main
@@ -127,3 +128,28 @@ jobs:
             dist/swarm-agent.cjs \
             dist/swarm-agent.cjs.sha256 \
             dist/changelog.json
+
+  cleanup-artifacts:
+    if: always()
+    needs: tag-version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete workflow artifacts from this run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const run_id = context.runId;
+            const artifacts = await github.paginate(
+              github.rest.actions.listWorkflowRunArtifacts,
+              { owner, repo, run_id, per_page: 100 }
+            );
+            core.info(`Found ${artifacts.length} artifact(s) for run ${run_id}`);
+            for (const artifact of artifacts) {
+              core.info(`Deleting artifact ${artifact.id} (${artifact.name})`);
+              await github.rest.actions.deleteArtifact({
+                owner,
+                repo,
+                artifact_id: artifact.id,
+              });
+            }
