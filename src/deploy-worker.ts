@@ -104,6 +104,12 @@ import {
 import {
   runPostDeploySmokeChecks,
 } from './lib/smoke-check.js';
+import {
+  notifyDeployEndForStabilization,
+  notifyDeployHeartbeatForStabilization,
+  notifyDeployStartForStabilization,
+  requestImmediateStabilizationRun,
+} from './stabilization-worker.js';
 
 type DeployPayload = {
   artifact?: string;
@@ -246,11 +252,6 @@ const DEPLOY_INTERVAL_MS = Number(process.env.MZ_DEPLOY_WORKER_INTERVAL_MS || 50
 const FETCH_TIMEOUT_MS = Number(process.env.MZ_FETCH_TIMEOUT_MS || 30000);
 const APP_HA_MIN_READY_NODES = Math.max(1, Number(process.env.MZ_APP_HA_MIN_READY_NODES || 2));
 const APP_HA_MAX_REPLICAS = Math.max(1, Number(process.env.MZ_APP_HA_MAX_REPLICAS || 2));
-const REPLICA_AUTO_REPAIR_TIMEOUT_MS = Math.max(
-  30_000,
-  Number(process.env.MZ_DEPLOY_REPLICA_AUTO_REPAIR_TIMEOUT_MS || 180_000),
-);
-const REPLICA_AUTO_REPAIR_UPDATE_MONITOR = process.env.MZ_DEPLOY_REPLICA_UPDATE_MONITOR || '90s';
 function isLoopbackHost(host: string) {
   const value = String(host || '').trim().toLowerCase();
   return value === '127.0.0.1' || value === 'localhost' || value === '::1';
@@ -2445,120 +2446,6 @@ async function configureReplicaViaSwarmJob(params: {
   }
 }
 
-async function autoRepairReplicaService(
-  replicaServiceFullName: string,
-  log: (message: string) => void,
-): Promise<void> {
-  const scale = await runCommandCaptureWithStatus('docker', [
-    'service',
-    'scale',
-    `${replicaServiceFullName}=1`,
-  ]);
-  if (scale.code !== 0) {
-    const output = (scale.stderr || scale.stdout || '').trim();
-    throw new Error(`failed to scale replica service (${output || `exit ${scale.code}`})`);
-  }
-  log(`replica auto-repair: scaled ${replicaServiceFullName} to 1`);
-
-  const policyArgs = [
-    'service',
-    'update',
-    '--detach=true',
-    '--update-monitor',
-    REPLICA_AUTO_REPAIR_UPDATE_MONITOR,
-    '--update-failure-action',
-    'rollback',
-    '--update-order',
-    'stop-first',
-    '--rollback-order',
-    'stop-first',
-    replicaServiceFullName,
-  ];
-  let policyUpdate = await runCommandCaptureWithStatus('docker', policyArgs);
-  if (policyUpdate.code !== 0) {
-    const output = `${policyUpdate.stdout || ''}\n${policyUpdate.stderr || ''}`.toLowerCase();
-    if (output.includes('update paused') || output.includes('paused')) {
-      await resumePausedServiceUpdate(replicaServiceFullName, log);
-      policyUpdate = await runCommandCaptureWithStatus('docker', policyArgs);
-    }
-  }
-  if (policyUpdate.code !== 0) {
-    const output = `${policyUpdate.stdout || ''}\n${policyUpdate.stderr || ''}`.trim();
-    if (!isNoopServiceUpdateOutput(output)) {
-      throw new Error(`failed to set replica service update policy (${output || `exit ${policyUpdate.code}`})`);
-    }
-  } else {
-    log(
-      `replica auto-repair: update policy applied (${replicaServiceFullName}, monitor=${REPLICA_AUTO_REPAIR_UPDATE_MONITOR})`,
-    );
-  }
-
-  const resumed = await resumePausedServiceUpdate(replicaServiceFullName, log);
-  if (!resumed) {
-    throw new Error('failed to resume paused replica service update');
-  }
-
-  const forced = await tryForceUpdateService(replicaServiceFullName, log);
-  if (!forced) {
-    const update = await inspectServiceUpdateStatus(replicaServiceFullName);
-    const updateSummary = update
-      ? `${update.state}${update.message ? ` (${update.message})` : ''}`
-      : 'unknown';
-    throw new Error(`failed to force replica service update (status=${updateSummary})`);
-  }
-
-  const ready = await waitForAllDesiredServiceTasksRunning(
-    replicaServiceFullName,
-    log,
-    REPLICA_AUTO_REPAIR_TIMEOUT_MS,
-  );
-  if (!ready) {
-    const tasks = await listServiceTasks(replicaServiceFullName);
-    const summary = summarizeReplicaTasksForError(tasks);
-    throw new Error(`replica service not ready after auto-repair${summary ? `: ${summary}` : ''}`);
-  }
-}
-
-function buildReplicaSetupFailureMessage(initialMessage: string, repairMessage: string): string {
-  const initial = initialMessage.trim() || 'unknown failure';
-  const repair = repairMessage.trim() || 'unknown auto-repair failure';
-  return `replica setup failed after auto-repair (initial: ${initial}; auto-repair: ${repair})`;
-}
-
-async function configureReplicaWithAutoRepair(params: {
-  environmentId: number;
-  replicaServiceFullName: string;
-  masterHost: string;
-  replicaUser: string;
-  log: (message: string) => void;
-}): Promise<void> {
-  try {
-    await configureReplicaViaSwarmJob({
-      environmentId: params.environmentId,
-      replicaServiceFullName: params.replicaServiceFullName,
-      masterHost: params.masterHost,
-      replicaUser: params.replicaUser,
-    });
-    return;
-  } catch (error) {
-    const initialMessage = error instanceof Error ? error.message : String(error);
-    params.log(`replica config failed; attempting auto-repair: ${initialMessage}`);
-    try {
-      await autoRepairReplicaService(params.replicaServiceFullName, params.log);
-      await configureReplicaViaSwarmJob({
-        environmentId: params.environmentId,
-        replicaServiceFullName: params.replicaServiceFullName,
-        masterHost: params.masterHost,
-        replicaUser: params.replicaUser,
-      });
-      params.log('replica auto-repair succeeded');
-    } catch (repairError) {
-      const repairMessage = repairError instanceof Error ? repairError.message : String(repairError);
-      throw new Error(buildReplicaSetupFailureMessage(initialMessage, repairMessage));
-    }
-  }
-}
-
 function buildProxySqlRuleReconcileScript(proxysqlServiceFullName: string): string {
   const sql = buildProxySqlQueryRulesSql(PROXYSQL_MANAGED_QUERY_RULES).trimEnd();
   const script = [
@@ -4093,8 +3980,40 @@ async function processDeployment(recordPath: string) {
     throw new Error('Deployment payload missing artifact/stack/environment');
   }
   log(`start stack=${stackId} env=${environmentId} artifact=${artifactKey}`);
-  const stackName = `mz-env-${environmentId}`;
-  const recordMeta = record as unknown as Record<string, unknown>;
+  let stabilizationLeaseActive = false;
+  const stabilizationHeartbeat = () => {
+    if (!stabilizationLeaseActive) return;
+    try {
+      notifyDeployHeartbeatForStabilization(environmentId, deploymentId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`stabilization heartbeat failed: ${message}`);
+    }
+  };
+  let stabilizationHeartbeatTimer: NodeJS.Timeout | null = null;
+  const startStabilizationHeartbeatTimer = () => {
+    if (!stabilizationLeaseActive || stabilizationHeartbeatTimer) return;
+    stabilizationHeartbeatTimer = setInterval(() => {
+      stabilizationHeartbeat();
+    }, 60_000);
+    stabilizationHeartbeatTimer.unref?.();
+  };
+  const stopStabilizationHeartbeatTimer = () => {
+    if (!stabilizationHeartbeatTimer) return;
+    clearInterval(stabilizationHeartbeatTimer);
+    stabilizationHeartbeatTimer = null;
+  };
+  try {
+    notifyDeployStartForStabilization(environmentId, deploymentId);
+    stabilizationLeaseActive = true;
+    startStabilizationHeartbeatTimer();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log(`stabilization start failed: ${message}`);
+  }
+  try {
+    const stackName = `mz-env-${environmentId}`;
+    const recordMeta = record as unknown as Record<string, unknown>;
 
   const config = readConfig();
   const baseUrl = (config.mz_control_base_url || process.env.MZ_CONTROL_BASE_URL || '').trim();
@@ -4110,6 +4029,7 @@ async function processDeployment(recordPath: string) {
     status: 'deploying',
   });
   log('reported deploying status');
+  stabilizationHeartbeat();
 
   await maybeAggressivePrune('pre-deploy', prunePreviousSuccessAt);
   await ensureMinimumFreeSpace('pre-deploy');
@@ -4709,6 +4629,7 @@ async function processDeployment(recordPath: string) {
     }
   }
   progress.ok('deploy_stack');
+  stabilizationHeartbeat();
 
   progress.start('db_prepare');
   let dbContainerId = await waitForContainer(stackName, 'database', 5 * 60 * 1000);
@@ -4737,18 +4658,30 @@ async function processDeployment(recordPath: string) {
     log(`base URLs set to ${envBaseUrl}`);
   }
   progress.ok('db_prepare');
+  stabilizationHeartbeat();
 
   progress.start('app_prepare');
   if (replicaServiceName === 'database-replica') {
     progress.detail('app_prepare', 'Configuring database replication');
-    await configureReplicaWithAutoRepair({
-      environmentId,
-      replicaServiceFullName: stackService('database-replica'),
-      masterHost: stackService('database'),
-      replicaUser,
-      log,
-    });
-    log('replica configured');
+    try {
+      await configureReplicaViaSwarmJob({
+        environmentId,
+        replicaServiceFullName: stackService('database-replica'),
+        masterHost: stackService('database'),
+        replicaUser,
+      });
+      log('replica configured');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`replica configuration deferred to stabilization: ${message}`);
+      progress.detail('app_prepare', 'Replica configuration deferred to stabilization worker');
+      try {
+        requestImmediateStabilizationRun(environmentId, 'replica_config_failed', deploymentId);
+      } catch (enqueueError) {
+        const enqueueMessage = enqueueError instanceof Error ? enqueueError.message : String(enqueueError);
+        log(`stabilization enqueue failed: ${enqueueMessage}`);
+      }
+    }
   }
 
   progress.detail('app_prepare', 'Waiting for PHP containers');
@@ -4828,6 +4761,7 @@ async function processDeployment(recordPath: string) {
     });
   }
   progress.ok('app_prepare');
+  stabilizationHeartbeat();
 
   progress.start('magento_steps');
   progress.detail('magento_steps', 'Flushing cache before setup:db:status');
@@ -5057,6 +4991,7 @@ async function processDeployment(recordPath: string) {
   await enforceMagentoPerformance(adminContainerId, stackName, log);
   log('magento deploy steps complete');
   progress.ok('magento_steps');
+  stabilizationHeartbeat();
 
   if (envHostname) {
     const varnishServiceName = `${stackName}_varnish`;
@@ -5119,6 +5054,7 @@ async function processDeployment(recordPath: string) {
     log('post-deploy smoke checks skipped: no environment hostname available');
     progress.skipped('smoke_checks', 'No environment hostname available');
   }
+  stabilizationHeartbeat();
 
   // Detect silent Swarm rollbacks / paused updates (otherwise smoke checks can pass on old tasks).
   log('verifying deployed service images + update states');
@@ -5171,6 +5107,7 @@ async function processDeployment(recordPath: string) {
     throw new Error(`Deploy verification failed: ${failures.join('; ')}.`);
   }
   progress.ok('verify');
+  stabilizationHeartbeat();
 
   progress.start('finalize');
   await reportDeploymentStatus(baseUrl, nodeId, nodeSecret, {
@@ -5200,7 +5137,19 @@ async function processDeployment(recordPath: string) {
     log(`cleanup skipped: ${message}`);
   }
   progress.ok('finalize');
+  if (stabilizationLeaseActive) {
+    try {
+      notifyDeployEndForStabilization(environmentId, deploymentId, 'succeeded');
+      stabilizationLeaseActive = false;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`stabilization end failed: ${message}`);
+    }
+  }
   progress.doneOk();
+  } finally {
+    stopStabilizationHeartbeatTimer();
+  }
 }
 
 async function cleanupFailedArtifact(record: Record<string, any>) {
@@ -5339,6 +5288,16 @@ async function handleDeploymentFile(recordPath: string) {
       existing = {};
     }
     const merged = { ...existing, ...failedRecord } as Record<string, any>;
+    const failedDeploymentId = String(merged?.id || path.basename(recordPath, '.json')).trim() || path.basename(recordPath, '.json');
+    const failedEnvironmentId = Number(merged?.payload?.environment_id ?? 0);
+    if (failedDeploymentId && failedEnvironmentId) {
+      try {
+        notifyDeployEndForStabilization(failedEnvironmentId, failedDeploymentId, 'failed');
+      } catch (stabilizationError) {
+        const message = stabilizationError instanceof Error ? stabilizationError.message : String(stabilizationError);
+        console.warn(`stabilization end (failed deploy) failed: ${message}`);
+      }
+    }
     fs.writeFileSync(failedPath, JSON.stringify(merged, null, 2));
     try {
       fs.unlinkSync(recordPath);
@@ -5352,11 +5311,11 @@ async function handleDeploymentFile(recordPath: string) {
     const baseUrl = (config.mz_control_base_url || process.env.MZ_CONTROL_BASE_URL || '').trim();
     const nodeId = readNodeFile('node-id');
     const nodeSecret = readNodeFile('node-secret');
-    const environmentId = Number(merged?.payload?.environment_id ?? 0);
+    const environmentId = failedEnvironmentId;
     if (baseUrl && nodeId && nodeSecret && environmentId) {
       try {
         await reportDeploymentStatus(baseUrl, nodeId, nodeSecret, {
-          deployment_id: merged?.id || path.basename(recordPath, '.json'),
+          deployment_id: failedDeploymentId,
           environment_id: environmentId,
           status: 'failed',
           message: failedRecord.error,
@@ -5438,7 +5397,6 @@ export const __testing = {
   shouldReuseAppImagesForCloudSwarmRef,
   getQueueSourceDirs,
   buildReplicaConfigureScript,
-  buildReplicaSetupFailureMessage,
   resolveAggressivePruneCutoffSeconds,
   getHistoryLastSuccessfulDeployAt,
 };

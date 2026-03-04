@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { __testing } from '../src/deploy-worker.js';
 
-const { buildReplicaConfigureScript, buildReplicaSetupFailureMessage } = __testing;
+const { buildReplicaConfigureScript } = __testing;
 
-describe('deploy-worker replica auto-repair', () => {
+describe('deploy-worker replica configuration script', () => {
   it('builds a replica config script that resets and reconfigures replication', () => {
     const script = buildReplicaConfigureScript({
       masterHost: 'mz-env-15_database',
@@ -19,11 +19,5 @@ describe('deploy-worker replica auto-repair', () => {
     expect(script).toContain('STOP SLAVE; RESET SLAVE ALL;');
     expect(script).toContain(`CHANGE MASTER TO MASTER_HOST='mz-env-15_database'`);
     expect(script).toContain('SET GLOBAL read_only=1;');
-  });
-
-  it('combines initial failure and auto-repair failure details', () => {
-    expect(buildReplicaSetupFailureMessage('replica not ready', 'service update paused')).toBe(
-      'replica setup failed after auto-repair (initial: replica not ready; auto-repair: service update paused)',
-    );
   });
 });

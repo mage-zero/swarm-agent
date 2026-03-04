@@ -23,6 +23,11 @@ import {
   waitForServiceNotRunning,
   waitForServiceRunning,
 } from './swarm.js';
+import {
+  isStabilizationLeaseActive,
+  readStabilizationLease,
+  readStabilizationState,
+} from './stabilization-state.js';
 
 const NODE_DIR = process.env.MZ_NODE_DIR || '/opt/mz-node';
 const DEPLOY_QUEUE_DIR = process.env.MZ_DEPLOY_QUEUE_DIR || '/opt/mage-zero/deployments';
@@ -62,7 +67,7 @@ type RunbookDefinition = {
   supports_remediation: boolean;
 };
 
-type RunbookResult = {
+export type RunbookResult = {
   runbook_id: string;
   status: 'ok' | 'warning' | 'failed';
   summary: string;
@@ -407,6 +412,13 @@ const RUNBOOKS: RunbookDefinition[] = [
     id: 'deploy_active_summary',
     name: 'Active deploy summary',
     description: 'Show the currently processing deploy (if any) for the environment.',
+    safe: true,
+    supports_remediation: false,
+  },
+  {
+    id: 'stabilization_status',
+    name: 'Stabilization status',
+    description: 'Show latest stabilization controller status for the environment.',
     safe: true,
     supports_remediation: false,
   },
@@ -2289,24 +2301,11 @@ export async function listRunbooks() {
   return RUNBOOKS;
 }
 
-export async function executeRunbook(request: Request): Promise<RunbookResult | { error: string; status: number }> {
-  const authorized = await validateNodeRequest(request);
-  if (!authorized) {
-    return { error: 'unauthorized', status: 401 };
-  }
-  const body = await request.json().catch(() => null) as {
-    runbook_id?: string;
-    environment_id?: number;
-    input?: Record<string, unknown>;
-  } | null;
-  const runbookId = String(body?.runbook_id || '').trim();
-  const environmentId = Number(body?.environment_id || 0);
-  const input = (body?.input && typeof body.input === 'object' && !Array.isArray(body.input))
-    ? (body.input as Record<string, unknown>)
-    : {};
-  if (!runbookId || !environmentId) {
-    return { error: 'missing_parameters', status: 400 };
-  }
+export async function executeRunbookById(
+  runbookId: string,
+  environmentId: number,
+  input: Record<string, unknown> = {},
+): Promise<RunbookResult | null> {
   switch (runbookId) {
     case 'disk_usage_summary':
       return runDiskUsageSummary();
@@ -2350,6 +2349,8 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
       return runDeployFailureSummary(environmentId);
     case 'deploy_active_summary':
       return runDeployActiveSummary(environmentId);
+    case 'stabilization_status':
+      return runStabilizationStatus(environmentId);
     case 'deploy_log_excerpt':
       return runDeployLogExcerpt(environmentId, input);
     case 'deploy_pause_status':
@@ -2381,8 +2382,33 @@ export async function executeRunbook(request: Request): Promise<RunbookResult | 
     case 'varnish_restart':
       return runServiceRestart(environmentId, '_varnish', 'varnish_restart', 'Varnish');
     default:
-      return { error: 'unknown_runbook', status: 404 };
+      return null;
   }
+}
+
+export async function executeRunbook(request: Request): Promise<RunbookResult | { error: string; status: number }> {
+  const authorized = await validateNodeRequest(request);
+  if (!authorized) {
+    return { error: 'unauthorized', status: 401 };
+  }
+  const body = await request.json().catch(() => null) as {
+    runbook_id?: string;
+    environment_id?: number;
+    input?: Record<string, unknown>;
+  } | null;
+  const runbookId = String(body?.runbook_id || '').trim();
+  const environmentId = Number(body?.environment_id || 0);
+  const input = (body?.input && typeof body.input === 'object' && !Array.isArray(body.input))
+    ? (body.input as Record<string, unknown>)
+    : {};
+  if (!runbookId || !environmentId) {
+    return { error: 'missing_parameters', status: 400 };
+  }
+  const result = await executeRunbookById(runbookId, environmentId, input);
+  if (!result) {
+    return { error: 'unknown_runbook', status: 404 };
+  }
+  return result;
 }
 
 function normalizeDbRestoreObjectKey(environmentId: number, raw: string): string | null {
@@ -4510,6 +4536,76 @@ async function runDeployActiveSummary(environmentId: number): Promise<RunbookRes
     status: 'ok',
     summary: 'No active deploy found for this environment.',
     observations: [`Scanned ${entries.length} processing record(s) in ${DEPLOY_PROCESSING_DIR}`],
+  };
+}
+
+async function runStabilizationStatus(environmentId: number): Promise<RunbookResult> {
+  const lease = readStabilizationLease(environmentId);
+  const leaseActive = isStabilizationLeaseActive(lease);
+  const state = readStabilizationState(environmentId);
+
+  const status = String(
+    state?.status
+    || (leaseActive ? 'maintenance' : 'unknown'),
+  ).trim() || 'unknown';
+  const mode = String(
+    state?.mode
+    || (leaseActive ? 'observe_only' : 'active'),
+  ).trim() || 'active';
+
+  const observations: string[] = [];
+  if (leaseActive) {
+    observations.push(`Deploy window active (observe_only) until ${String(lease?.expires_at || '(unknown)')}`);
+  } else if (lease?.ended_at) {
+    observations.push(`Last deploy window ended at ${lease.ended_at}`);
+  }
+  if (state?.current_step) {
+    observations.push(`Current step: ${state.current_step}`);
+  }
+  if (state?.next_run_at) {
+    observations.push(`Next run at: ${state.next_run_at}`);
+  }
+  if (state?.last_error) {
+    observations.push(`Last error: ${state.last_error}`);
+  }
+
+  const checks = Array.isArray(state?.checks) ? state.checks : [];
+  const checkSummary = checks.slice(0, 5).map((check) => ({
+    runbook_id: String((check as any)?.runbook_id || ''),
+    status: String((check as any)?.status || ''),
+    summary: String((check as any)?.summary || ''),
+    finished_at: String((check as any)?.finished_at || ''),
+  }));
+
+  const normalizedStatus = status.toLowerCase();
+  const runbookStatus: RunbookResult['status'] = normalizedStatus === 'stable'
+    ? 'ok'
+    : normalizedStatus === 'maintenance' || normalizedStatus === 'stabilizing'
+      ? 'warning'
+      : normalizedStatus === 'degraded'
+        ? 'failed'
+        : 'warning';
+
+  return {
+    runbook_id: 'stabilization_status',
+    status: runbookStatus,
+    summary: `Stabilization status: ${status}.`,
+    observations,
+    data: {
+      environment_id: environmentId,
+      status,
+      mode,
+      updated_at: state?.updated_at || null,
+      run_id: state?.run_id || null,
+      current_step: state?.current_step || null,
+      current_step_started_at: state?.current_step_started_at || null,
+      next_run_at: state?.next_run_at || null,
+      last_success_at: state?.last_success_at || null,
+      last_failure_at: state?.last_failure_at || null,
+      lease: lease || null,
+      lease_active: leaseActive,
+      checks: checkSummary,
+    },
   };
 }
 

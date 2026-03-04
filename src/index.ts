@@ -8,6 +8,7 @@ import { startInspectionScheduler, startStatusReporter, startTuningScheduler } f
 import { startMeshSyncScheduler } from './mesh.js';
 import { startUpgradeScheduler } from './upgrade.js';
 import { startRunbookCleanupScheduler } from './swarm.js';
+import { startStabilizationWorker } from './stabilization-worker.js';
 
 const port = Number(process.env.PORT ?? 8080);
 
@@ -19,6 +20,7 @@ startEnvironmentSync();
 void ensureCloudSwarmDeployKey();
 startDeploymentWorker();
 startAddonWorker();
+startStabilizationWorker();
 startUpgradeScheduler();
 startRunbookCleanupScheduler();
 
