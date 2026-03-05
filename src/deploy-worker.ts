@@ -3171,6 +3171,122 @@ async function inspectServiceDesiredReplicas(serviceName: string): Promise<numbe
   return Number.isInteger(parsed) ? parsed : null;
 }
 
+type ServiceCommandSpec = {
+  command: string[] | null;
+  args: string[] | null;
+};
+
+function parseJsonStringArray(raw: string): string[] | null {
+  const value = String(raw || '').trim();
+  if (!value || value === 'null') {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed.map((entry) => String(entry || ''));
+  } catch {
+    return null;
+  }
+}
+
+function formatServiceCommandSpec(spec: ServiceCommandSpec | null): string {
+  if (!spec) {
+    return 'command=(unknown) args=(unknown)';
+  }
+  const command = spec.command ? JSON.stringify(spec.command) : 'null';
+  const args = spec.args ? JSON.stringify(spec.args) : 'null';
+  return `command=${command} args=${args}`;
+}
+
+function serviceUsesLegacyCronLoop(spec: ServiceCommandSpec | null): boolean {
+  if (!spec?.args || spec.args.length !== 3) {
+    return false;
+  }
+  return spec.args[0] === 'sh'
+    && spec.args[1] === '-c'
+    && spec.args[2].includes('php bin/magento cron:run')
+    && !spec.args[2].includes('--group=');
+}
+
+function serviceUsesCronSupervisor(spec: ServiceCommandSpec | null): boolean {
+  if (!spec) {
+    return false;
+  }
+  const joined = [...(spec.command || []), ...(spec.args || [])].join(' ');
+  return joined.includes('cron:run --group=') || joined.includes('mz-cron-supervisor.sh');
+}
+
+async function inspectServiceCommandSpec(serviceName: string): Promise<ServiceCommandSpec | null> {
+  const result = await runCommandCaptureWithStatus('docker', [
+    'service',
+    'inspect',
+    serviceName,
+    '--format',
+    '{{json .Spec.TaskTemplate.ContainerSpec.Command}}|{{json .Spec.TaskTemplate.ContainerSpec.Args}}',
+  ]);
+  if (result.code !== 0) {
+    return null;
+  }
+  const line = String(result.stdout || '').trim();
+  if (!line) {
+    return null;
+  }
+  const separator = line.indexOf('|');
+  if (separator < 0) {
+    return null;
+  }
+  return {
+    command: parseJsonStringArray(line.slice(0, separator)),
+    args: parseJsonStringArray(line.slice(separator + 1)),
+  };
+}
+
+async function reconcileCronSupervisorIfNeeded(
+  stackName: string,
+  appStackPath: string,
+  envVars: NodeJS.ProcessEnv,
+  logDir: string,
+  log: (message: string) => void,
+): Promise<void> {
+  const cronServiceName = `${stackName}_cron`;
+  const before = await inspectServiceCommandSpec(cronServiceName);
+  if (!before) {
+    log(`warning: unable to inspect cron service command for ${cronServiceName}; skipping command reconcile`);
+    return;
+  }
+  if (serviceUsesCronSupervisor(before)) {
+    return;
+  }
+
+  const beforeSummary = formatServiceCommandSpec(before);
+  if (serviceUsesLegacyCronLoop(before)) {
+    log(`cron service is using legacy single-loop command (${beforeSummary}); reapplying app stack to reconcile`);
+  } else {
+    log(`cron service command is unexpected (${beforeSummary}); reapplying app stack to reconcile`);
+  }
+
+  await runCommandLogged('docker', [
+    'stack',
+    'deploy',
+    '--with-registry-auth',
+    '-c',
+    appStackPath,
+    stackName,
+  ], { env: envVars, logDir, label: 'stack-deploy-app-cron-reconcile' });
+
+  const after = await inspectServiceCommandSpec(cronServiceName);
+  if (!after || !serviceUsesCronSupervisor(after)) {
+    const afterSummary = formatServiceCommandSpec(after);
+    throw new Error(
+      `cron command reconcile failed for ${cronServiceName}: before=${beforeSummary}; after=${afterSummary}`,
+    );
+  }
+  log(`cron service command reconciled to supervisor mode: ${formatServiceCommandSpec(after)}`);
+}
+
 async function waitForAllDesiredServiceTasksRunning(
   serviceName: string,
   log: (message: string) => void,
@@ -4425,6 +4541,9 @@ async function processDeployment(recordPath: string) {
     appStackPath,
   ], { env: envVars });
   assertNoLatestImages(renderedAppStack.stdout);
+  if (!renderedAppStack.stdout.includes('cron:run --group=')) {
+    throw new Error('Rendered app stack is missing grouped cron supervisor command (cron:run --group=...)');
+  }
 
   const secrets = envRecord?.environment_secrets ?? null;
   const envBaseUrl = envHostname ? `https://${envHostname.replace(/^https?:\/\//, '').replace(/\/+$/, '')}` : '';
@@ -4626,6 +4745,8 @@ async function processDeployment(recordPath: string) {
     stackName,
   ], { env: envVars, logDir, label: 'stack-deploy-app' });
   log('app stack deployed');
+  progress.detail('deploy_stack', 'Reconciling cron supervisor command');
+  await reconcileCronSupervisorIfNeeded(stackName, appStackPath, envVars, logDir, log);
   progress.detail(
     'deploy_stack',
     `Reconciling frontend runtime policy (replicas=${frontendRuntimePolicy.replicas}, ` +

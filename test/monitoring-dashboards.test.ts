@@ -48,16 +48,23 @@ describe('monitoring-dashboards helpers', () => {
     })).toBe(false);
   });
 
-  it('includes a dedicated varnish dashboard and access visualizations', () => {
+  it('includes dedicated varnish and cron dashboards with key visualizations', () => {
     const objects = __testing.buildSavedObjects();
-    const dashboard = objects.find((object) => object.type === 'dashboard' && object.id === 'mz-dashboard-varnish');
+    const varnishDashboard = objects.find((object) => object.type === 'dashboard' && object.id === 'mz-dashboard-varnish');
+    const cronDashboard = objects.find((object) => object.type === 'dashboard' && object.id === 'mz-dashboard-cron');
     const statusTrend = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-varnish-status-trend');
     const hitRateTrend = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-varnish-hit-rate-trend');
+    const cronStatusTrend = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-cron-status-trend');
+    const cronSearch = objects.find((object) => object.type === 'search' && object.id === 'mz-search-cron-logs');
 
-    expect(dashboard).toBeTruthy();
+    expect(varnishDashboard).toBeTruthy();
+    expect(cronDashboard).toBeTruthy();
     expect(statusTrend).toBeTruthy();
     expect(hitRateTrend).toBeTruthy();
-    expect(dashboard?.attributes?.title).toBe('3) Varnish');
+    expect(cronStatusTrend).toBeTruthy();
+    expect(cronSearch).toBeTruthy();
+    expect(varnishDashboard?.attributes?.title).toBe('3) Varnish');
+    expect(cronDashboard?.attributes?.title).toBe('4) Cron');
   });
 
   it('restores useful default time ranges for shared dashboards', () => {
@@ -65,6 +72,7 @@ describe('monitoring-dashboards helpers', () => {
     const ops = objects.find((object) => object.type === 'dashboard' && object.id === 'mz-dashboard-ops');
     const containers = objects.find((object) => object.type === 'dashboard' && object.id === 'mz-dashboard-magento-containers');
     const varnish = objects.find((object) => object.type === 'dashboard' && object.id === 'mz-dashboard-varnish');
+    const cron = objects.find((object) => object.type === 'dashboard' && object.id === 'mz-dashboard-cron');
 
     expect(ops?.attributes?.timeRestore).toBe(true);
     expect(ops?.attributes?.timeFrom).toBe('now-24h');
@@ -75,6 +83,9 @@ describe('monitoring-dashboards helpers', () => {
     expect(varnish?.attributes?.timeRestore).toBe(true);
     expect(varnish?.attributes?.timeFrom).toBe('now-7d');
     expect(varnish?.attributes?.timeTo).toBe('now');
+    expect(cron?.attributes?.timeRestore).toBe(true);
+    expect(cron?.attributes?.timeFrom).toBe('now-24h');
+    expect(cron?.attributes?.timeTo).toBe('now');
   });
 
   it('uses dashboard-context placeholders in varnish Vega queries', () => {
@@ -125,5 +136,24 @@ describe('monitoring-dashboards helpers', () => {
     expect(JSON.stringify(trendMust)).toContain('mz.docker.cpu.total.norm.pct');
     expect(JSON.stringify(byServiceTransform)).toContain('isValid(datum.cpu_avg)');
     expect(JSON.stringify(trendTransform)).toContain('isValid(datum.point.cpu_avg)');
+  });
+
+  it('uses cron.scheduler dataset for cron visualizations and saved search', () => {
+    const objects = __testing.buildSavedObjects();
+    const cronStatusTrend = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-cron-status-trend');
+    const cronSearch = objects.find((object) => object.type === 'search' && object.id === 'mz-search-cron-logs');
+
+    const statusSpec = JSON.parse(
+      String((JSON.parse(String(cronStatusTrend?.attributes?.visState || '{}'))?.params?.spec) || '{}'),
+    ) as Record<string, unknown>;
+    const searchSource = JSON.parse(
+      String((cronSearch?.attributes?.kibanaSavedObjectMeta as Record<string, unknown>)?.searchSourceJSON || '{}'),
+    ) as Record<string, unknown>;
+    const query = (searchSource.query && typeof searchSource.query === 'object')
+      ? (searchSource.query as Record<string, unknown>)
+      : {};
+
+    expect(JSON.stringify(statusSpec)).toContain('cron.scheduler');
+    expect(String(query.query || '')).toContain('cron.scheduler');
   });
 });

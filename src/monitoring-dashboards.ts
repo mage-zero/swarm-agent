@@ -31,6 +31,7 @@ const SEARCH_LOGS_ID = 'mz-search-logs';
 const SEARCH_METRICS_ID = 'mz-search-host-metrics';
 const SEARCH_DOCKER_METRICS_ID = 'mz-search-docker-metrics';
 const SEARCH_VARNISH_LOGS_ID = 'mz-search-varnish-logs';
+const SEARCH_CRON_LOGS_ID = 'mz-search-cron-logs';
 const VIS_VPS_RESOURCE_COCKPIT_ID = 'mz-vis-vps-resource-cockpit';
 const VIS_VPS_ROOT_TREND_ID = 'mz-vis-vps-root-trend';
 const VIS_VPS_CPU_BY_HOST_ID = 'mz-vis-vps-cpu-by-host';
@@ -45,9 +46,15 @@ const VIS_VARNISH_STATUS_TREND_ID = 'mz-vis-varnish-status-trend';
 const VIS_VARNISH_HIT_RATE_TREND_ID = 'mz-vis-varnish-hit-rate-trend';
 const VIS_VARNISH_HANDLING_BREAKDOWN_ID = 'mz-vis-varnish-handling-breakdown';
 const VIS_VARNISH_LATENCY_TREND_ID = 'mz-vis-varnish-latency-trend';
+const VIS_CRON_STATUS_TREND_ID = 'mz-vis-cron-status-trend';
+const VIS_CRON_NON_OK_GROUPS_ID = 'mz-vis-cron-nonok-groups';
+const VIS_CRON_SKIPPED_GROUPS_ID = 'mz-vis-cron-skipped-groups';
+const VIS_CRON_DISCOVERED_GROUPS_TREND_ID = 'mz-vis-cron-discovered-groups-trend';
+const VIS_CRON_WARNING_TREND_ID = 'mz-vis-cron-warning-trend';
 const DASHBOARD_OPS_ID = 'mz-dashboard-ops';
 const DASHBOARD_MAGENTO_CONTAINERS_ID = 'mz-dashboard-magento-containers';
 const DASHBOARD_VARNISH_ID = 'mz-dashboard-varnish';
+const DASHBOARD_CRON_ID = 'mz-dashboard-cron';
 const DEPRECATED_SAVED_OBJECTS: Array<{ type: SavedObject['type']; id: string }> = [
   { type: 'visualization', id: 'mz-vis-host-tophosts' },
   { type: 'visualization', id: 'mz-vis-container-active-by-service' },
@@ -389,6 +396,12 @@ function buildSavedObjects(): SavedObject[] {
   const varnishLogsSearchSource = JSON.stringify({
     index: DATA_VIEW_LOGS_ID,
     query: { language: 'kuery', query: 'event.dataset.keyword : "varnish.access"' },
+    filter: [],
+  });
+
+  const cronLogsSearchSource = JSON.stringify({
+    index: DATA_VIEW_LOGS_ID,
+    query: { language: 'kuery', query: 'event.dataset.keyword : "cron.scheduler"' },
     filter: [],
   });
 
@@ -1178,6 +1191,233 @@ function buildSavedObjects(): SavedObject[] {
     },
   };
 
+  const cronStatusTrendSpec = {
+    $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
+    title: 'Cron Group Status Trend',
+    data: {
+      url: {
+        index: 'mz-logs-*',
+        body: {
+          size: 0,
+          query: buildDashboardContextQuery([
+            { term: { 'event.dataset.keyword': 'cron.scheduler' } },
+            { exists: { field: 'cron.status.keyword' } },
+          ]),
+          aggs: {
+            timeline: {
+              date_histogram: {
+                field: '@timestamp',
+                fixed_interval: '1m',
+                min_doc_count: 0,
+              },
+              aggs: {
+                status: {
+                  terms: {
+                    field: 'cron.status.keyword',
+                    size: 8,
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      format: { property: 'aggregations.timeline.buckets' },
+    },
+    transform: [
+      { calculate: 'toDate(datum.key_as_string)', as: 'timestamp' },
+      { flatten: ['status.buckets'], as: ['status_bucket'] },
+      { calculate: 'datum.status_bucket.key', as: 'status' },
+      { calculate: 'upper(datum.status)', as: 'status_label' },
+      { calculate: 'datum.status_bucket.doc_count', as: 'events' },
+    ],
+    mark: { type: 'line', point: false },
+    encoding: {
+      x: { field: 'timestamp', type: 'temporal', title: 'Time' },
+      y: { field: 'events', type: 'quantitative', title: 'Events' },
+      color: { field: 'status_label', type: 'nominal', title: 'Status' },
+      tooltip: [
+        { field: 'timestamp', type: 'temporal', title: 'Time' },
+        { field: 'status_label', type: 'nominal', title: 'Status' },
+        { field: 'events', type: 'quantitative', title: 'Events' },
+      ],
+    },
+  };
+
+  const cronNonOkGroupsSpec = {
+    $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
+    title: 'Cron Non-OK Groups',
+    data: {
+      url: {
+        index: 'mz-logs-*',
+        body: {
+          size: 0,
+          query: buildDashboardContextQuery([
+            { term: { 'event.dataset.keyword': 'cron.scheduler' } },
+            { terms: { 'cron.status.keyword': ['error', 'timeout'] } },
+            { exists: { field: 'cron.group.keyword' } },
+          ]),
+          aggs: {
+            groups: {
+              terms: {
+                field: 'cron.group.keyword',
+                size: 15,
+                order: { _count: 'desc' },
+              },
+              aggs: {
+                errors: { filter: { term: { 'cron.status.keyword': 'error' } } },
+                timeouts: { filter: { term: { 'cron.status.keyword': 'timeout' } } },
+              },
+            },
+          },
+        },
+      },
+      format: { property: 'aggregations.groups.buckets' },
+    },
+    transform: [
+      { calculate: 'datum.key', as: 'group_label' },
+      { calculate: 'datum.doc_count', as: 'non_ok_events' },
+      { calculate: 'datum.errors.doc_count', as: 'error_events' },
+      { calculate: 'datum.timeouts.doc_count', as: 'timeout_events' },
+    ],
+    mark: { type: 'bar' },
+    encoding: {
+      y: { field: 'group_label', type: 'nominal', sort: '-x', title: 'Group' },
+      x: { field: 'non_ok_events', type: 'quantitative', title: 'Non-OK events' },
+      tooltip: [
+        { field: 'group_label', type: 'nominal', title: 'Group' },
+        { field: 'non_ok_events', type: 'quantitative', title: 'Non-OK events' },
+        { field: 'error_events', type: 'quantitative', title: 'Error events' },
+        { field: 'timeout_events', type: 'quantitative', title: 'Timeout events' },
+      ],
+    },
+  };
+
+  const cronSkippedGroupsSpec = {
+    $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
+    title: 'Cron Skipped Groups (already-running)',
+    data: {
+      url: {
+        index: 'mz-logs-*',
+        body: {
+          size: 0,
+          query: buildDashboardContextQuery([
+            { term: { 'event.dataset.keyword': 'cron.scheduler' } },
+            { term: { 'cron.status.keyword': 'skipped' } },
+            { exists: { field: 'cron.group.keyword' } },
+          ]),
+          aggs: {
+            groups: {
+              terms: {
+                field: 'cron.group.keyword',
+                size: 15,
+                order: { _count: 'desc' },
+              },
+            },
+          },
+        },
+      },
+      format: { property: 'aggregations.groups.buckets' },
+    },
+    transform: [
+      { calculate: 'datum.key', as: 'group_label' },
+      { calculate: 'datum.doc_count', as: 'skipped_events' },
+    ],
+    mark: { type: 'bar', color: '#f59e0b' },
+    encoding: {
+      y: { field: 'group_label', type: 'nominal', sort: '-x', title: 'Group' },
+      x: { field: 'skipped_events', type: 'quantitative', title: 'Skipped events' },
+      tooltip: [
+        { field: 'group_label', type: 'nominal', title: 'Group' },
+        { field: 'skipped_events', type: 'quantitative', title: 'Skipped events' },
+      ],
+    },
+  };
+
+  const cronDiscoveredGroupsTrendSpec = {
+    $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
+    title: 'Cron Discovered Group Count Trend',
+    data: {
+      url: {
+        index: 'mz-logs-*',
+        body: {
+          size: 0,
+          query: buildDashboardContextQuery([
+            { term: { 'event.dataset.keyword': 'cron.scheduler' } },
+            { exists: { field: 'cron.discovered_groups' } },
+          ]),
+          aggs: {
+            timeline: {
+              date_histogram: {
+                field: '@timestamp',
+                fixed_interval: '5m',
+                min_doc_count: 0,
+              },
+              aggs: {
+                discovered_max: { max: { field: 'cron.discovered_groups' } },
+              },
+            },
+          },
+        },
+      },
+      format: { property: 'aggregations.timeline.buckets' },
+    },
+    transform: [
+      { calculate: 'toDate(datum.key_as_string)', as: 'timestamp' },
+      { calculate: 'datum.discovered_max.value', as: 'discovered_groups' },
+      { filter: 'isValid(datum.discovered_groups)' },
+    ],
+    mark: { type: 'line', point: false, color: '#2563eb' },
+    encoding: {
+      x: { field: 'timestamp', type: 'temporal', title: 'Time' },
+      y: { field: 'discovered_groups', type: 'quantitative', title: 'Discovered groups' },
+      tooltip: [
+        { field: 'timestamp', type: 'temporal', title: 'Time' },
+        { field: 'discovered_groups', type: 'quantitative', title: 'Discovered groups' },
+      ],
+    },
+  };
+
+  const cronWarningTrendSpec = {
+    $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
+    title: 'Cron Warning Trend',
+    data: {
+      url: {
+        index: 'mz-logs-*',
+        body: {
+          size: 0,
+          query: buildDashboardContextQuery([
+            { term: { 'event.dataset.keyword': 'cron.scheduler' } },
+            { exists: { field: 'cron.warning' } },
+          ]),
+          aggs: {
+            timeline: {
+              date_histogram: {
+                field: '@timestamp',
+                fixed_interval: '5m',
+                min_doc_count: 0,
+              },
+            },
+          },
+        },
+      },
+      format: { property: 'aggregations.timeline.buckets' },
+    },
+    transform: [
+      { calculate: 'toDate(datum.key_as_string)', as: 'timestamp' },
+      { calculate: 'datum.doc_count', as: 'warning_events' },
+    ],
+    mark: { type: 'line', point: false, color: '#dc2626' },
+    encoding: {
+      x: { field: 'timestamp', type: 'temporal', title: 'Time' },
+      y: { field: 'warning_events', type: 'quantitative', title: 'Warning events' },
+      tooltip: [
+        { field: 'timestamp', type: 'temporal', title: 'Time' },
+        { field: 'warning_events', type: 'quantitative', title: 'Warning events' },
+      ],
+    },
+  };
+
   const operationsDashboardPanels = JSON.stringify([
     {
       panelIndex: '1',
@@ -1278,6 +1518,57 @@ function buildSavedObjects(): SavedObject[] {
       gridData: { x: 24, y: 14, w: 24, h: 15, i: '4' },
       type: 'visualization',
       id: VIS_VARNISH_LATENCY_TREND_ID,
+      embeddableConfig: {},
+      version: '8.0.0',
+    },
+  ]);
+
+  const cronDashboardPanels = JSON.stringify([
+    {
+      panelIndex: '1',
+      gridData: { x: 0, y: 0, w: 24, h: 14, i: '1' },
+      type: 'visualization',
+      id: VIS_CRON_STATUS_TREND_ID,
+      embeddableConfig: {},
+      version: '8.0.0',
+    },
+    {
+      panelIndex: '2',
+      gridData: { x: 24, y: 0, w: 24, h: 14, i: '2' },
+      type: 'visualization',
+      id: VIS_CRON_NON_OK_GROUPS_ID,
+      embeddableConfig: {},
+      version: '8.0.0',
+    },
+    {
+      panelIndex: '3',
+      gridData: { x: 0, y: 14, w: 24, h: 15, i: '3' },
+      type: 'visualization',
+      id: VIS_CRON_SKIPPED_GROUPS_ID,
+      embeddableConfig: {},
+      version: '8.0.0',
+    },
+    {
+      panelIndex: '4',
+      gridData: { x: 24, y: 14, w: 24, h: 15, i: '4' },
+      type: 'visualization',
+      id: VIS_CRON_DISCOVERED_GROUPS_TREND_ID,
+      embeddableConfig: {},
+      version: '8.0.0',
+    },
+    {
+      panelIndex: '5',
+      gridData: { x: 0, y: 29, w: 24, h: 14, i: '5' },
+      type: 'visualization',
+      id: VIS_CRON_WARNING_TREND_ID,
+      embeddableConfig: {},
+      version: '8.0.0',
+    },
+    {
+      panelIndex: '6',
+      gridData: { x: 24, y: 29, w: 24, h: 14, i: '6' },
+      type: 'search',
+      id: SEARCH_CRON_LOGS_ID,
       embeddableConfig: {},
       version: '8.0.0',
     },
@@ -1384,6 +1675,29 @@ function buildSavedObjects(): SavedObject[] {
         sort: [['@timestamp', 'desc']],
         kibanaSavedObjectMeta: {
           searchSourceJSON: varnishLogsSearchSource,
+        },
+      },
+    },
+    {
+      type: 'search',
+      id: SEARCH_CRON_LOGS_ID,
+      attributes: {
+        title: 'Cron Scheduler Logs',
+        columns: [
+          '@timestamp',
+          'mz.env_id',
+          'cron.group',
+          'cron.status',
+          'cron.reason',
+          'cron.exit',
+          'cron.timeout_s',
+          'cron.discovered_groups',
+          'cron.warning',
+          'message',
+        ],
+        sort: [['@timestamp', 'desc']],
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: cronLogsSearchSource,
         },
       },
     },
@@ -1662,6 +1976,101 @@ function buildSavedObjects(): SavedObject[] {
       },
     },
     {
+      type: 'visualization',
+      id: VIS_CRON_STATUS_TREND_ID,
+      attributes: {
+        title: 'Cron Group Status Trend',
+        visState: JSON.stringify({
+          title: 'Cron Group Status Trend',
+          type: 'vega',
+          aggs: [],
+          params: { spec: JSON.stringify(cronStatusTrendSpec) },
+        }),
+        uiStateJSON: '{}',
+        description: '',
+        version: 1,
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: cronLogsSearchSource,
+        },
+      },
+    },
+    {
+      type: 'visualization',
+      id: VIS_CRON_NON_OK_GROUPS_ID,
+      attributes: {
+        title: 'Cron Non-OK Groups',
+        visState: JSON.stringify({
+          title: 'Cron Non-OK Groups',
+          type: 'vega',
+          aggs: [],
+          params: { spec: JSON.stringify(cronNonOkGroupsSpec) },
+        }),
+        uiStateJSON: '{}',
+        description: '',
+        version: 1,
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: cronLogsSearchSource,
+        },
+      },
+    },
+    {
+      type: 'visualization',
+      id: VIS_CRON_SKIPPED_GROUPS_ID,
+      attributes: {
+        title: 'Cron Skipped Groups',
+        visState: JSON.stringify({
+          title: 'Cron Skipped Groups',
+          type: 'vega',
+          aggs: [],
+          params: { spec: JSON.stringify(cronSkippedGroupsSpec) },
+        }),
+        uiStateJSON: '{}',
+        description: '',
+        version: 1,
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: cronLogsSearchSource,
+        },
+      },
+    },
+    {
+      type: 'visualization',
+      id: VIS_CRON_DISCOVERED_GROUPS_TREND_ID,
+      attributes: {
+        title: 'Cron Discovered Group Count Trend',
+        visState: JSON.stringify({
+          title: 'Cron Discovered Group Count Trend',
+          type: 'vega',
+          aggs: [],
+          params: { spec: JSON.stringify(cronDiscoveredGroupsTrendSpec) },
+        }),
+        uiStateJSON: '{}',
+        description: '',
+        version: 1,
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: cronLogsSearchSource,
+        },
+      },
+    },
+    {
+      type: 'visualization',
+      id: VIS_CRON_WARNING_TREND_ID,
+      attributes: {
+        title: 'Cron Warning Trend',
+        visState: JSON.stringify({
+          title: 'Cron Warning Trend',
+          type: 'vega',
+          aggs: [],
+          params: { spec: JSON.stringify(cronWarningTrendSpec) },
+        }),
+        uiStateJSON: '{}',
+        description: '',
+        version: 1,
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: cronLogsSearchSource,
+        },
+      },
+    },
+    {
       type: 'dashboard',
       id: DASHBOARD_OPS_ID,
       attributes: {
@@ -1739,6 +2148,33 @@ function buildSavedObjects(): SavedObject[] {
         },
       },
     },
+    {
+      type: 'dashboard',
+      id: DASHBOARD_CRON_ID,
+      attributes: {
+        title: '4) Cron',
+        hits: 0,
+        description: 'Cron scheduler status, contention, warnings, and raw execution logs.',
+        panelsJSON: cronDashboardPanels,
+        optionsJSON: JSON.stringify({
+          useMargins: true,
+          syncColors: false,
+          syncCursor: true,
+          syncTooltips: false,
+          hidePanelTitles: false,
+        }),
+        version: 1,
+        timeRestore: true,
+        timeFrom: DASHBOARD_DEFAULT_TIME_FROM,
+        timeTo: DASHBOARD_DEFAULT_TIME_TO,
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: JSON.stringify({
+            query: { language: 'kuery', query: 'event.dataset.keyword : "cron.scheduler"' },
+            filter: [],
+          }),
+        },
+      },
+    },
   ];
 }
 
@@ -1773,7 +2209,7 @@ export async function bootstrapMonitoringDashboards(): Promise<BootstrapResult> 
 
   return {
     dashboard_id: DASHBOARD_OPS_ID,
-    dashboard_ids: [DASHBOARD_OPS_ID, DASHBOARD_MAGENTO_CONTAINERS_ID, DASHBOARD_VARNISH_ID],
+    dashboard_ids: [DASHBOARD_OPS_ID, DASHBOARD_MAGENTO_CONTAINERS_ID, DASHBOARD_VARNISH_ID, DASHBOARD_CRON_ID],
     upserted_objects: upsertedObjects,
     container_id: containerId,
   };
