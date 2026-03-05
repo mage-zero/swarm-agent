@@ -1,24 +1,17 @@
 {
-  "version": "0.4.88",
+  "version": "0.4.89",
   "date": "2026-03-04",
-  "summary": "Harden stabilization remediation for DB replica failures and improve runbook job execution reliability",
+  "summary": "Pin monitoring image versions and verify registry images before deploying the monitoring stack",
   "requires": {
-    "cloud-swarm": ">=1.0.34"
+    "cloud-swarm": ">=1.0.35"
   },
   "changes": [
     {
-      "id": "stabilization-db-replica-healthcheck-auto-repair",
-      "description": "Add db_replica_healthcheck_status and db_replica_healthcheck_repair runbooks, wire them into the stabilization cycle before db_replica_repair, and expose clearer stabilization step/check labels in status output.",
-      "phase": "post_deploy",
+      "id": "monitoring-image-version-pinning",
+      "description": "Pin monitoring stack versions from versions.env so Magento deploy overrides (e.g. OPENSEARCH_VERSION) don't leak into monitoring image tags. Verify custom monitoring images exist in the registry before deploying, with automatic build fallback.",
+      "phase": "pre_migrate",
       "downtimeMinutes": 0,
-      "scope": "environment"
-    },
-    {
-      "id": "swarm-job-hardening",
-      "description": "Harden runSwarmJob create/poll/cleanup behavior and disable image healthchecks for short-lived database runbook jobs so probe and repair jobs are not marked unhealthy by container-level checks.",
-      "phase": "post_deploy",
-      "downtimeMinutes": 0,
-      "scope": "infrastructure"
+      "scope": "stack"
     }
   ]
 }

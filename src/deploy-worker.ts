@@ -2015,7 +2015,89 @@ async function monitoringConfigsStale(log: (msg: string) => void): Promise<boole
   return false;
 }
 
+/**
+ * Version keys that monitoring images are tagged with.  These must come from
+ * versions.env (what build-monitoring.sh used) — NOT from the Magento deploy
+ * overrides, which can set e.g. OPENSEARCH_VERSION for the store search engine
+ * to a value the monitoring images were never built for.
+ */
+const MONITORING_VERSION_KEYS = [
+  'OPENSEARCH_VERSION',
+  'OTEL_COLLECTOR_VERSION',
+  'DATA_PREPPER_VERSION',
+  'FILEBEAT_VERSION',
+  'METRICBEAT_VERSION',
+] as const;
+
+/** Custom monitoring images that live in the local registry. */
+const MONITORING_CUSTOM_IMAGES = [
+  { repository: 'mz-opensearch-monitoring', versionKey: 'OPENSEARCH_VERSION' },
+  { repository: 'mz-opensearch-dashboards', versionKey: 'OPENSEARCH_VERSION' },
+  { repository: 'mz-metricbeat', versionKey: 'METRICBEAT_VERSION' },
+  { repository: 'mz-filebeat', versionKey: 'FILEBEAT_VERSION' },
+] as const;
+
+async function collectMissingMonitoringImages(
+  monitoringEnv: NodeJS.ProcessEnv,
+): Promise<string[]> {
+  const registryHost = String(monitoringEnv.REGISTRY_PULL_HOST || monitoringEnv.REGISTRY_HOST || '127.0.0.1').trim() || '127.0.0.1';
+  const registryPort = String(monitoringEnv.REGISTRY_PORT || '5000').trim() || '5000';
+  const missing: string[] = [];
+  for (const { repository, versionKey } of MONITORING_CUSTOM_IMAGES) {
+    const tag = String(monitoringEnv[versionKey] || '').trim();
+    if (!tag) {
+      missing.push(`${repository}:<missing-version>`);
+      continue;
+    }
+    const exists = await registryImageTagExists(registryHost, registryPort, repository, tag);
+    if (!exists) {
+      missing.push(`${repository}:${tag}`);
+    }
+  }
+  return missing;
+}
+
+function buildMonitoringStackEnv(envVars: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const monitoringEnv: NodeJS.ProcessEnv = { ...envVars };
+  // Pin monitoring versions from versions.env so Magento deploy overrides
+  // (e.g. OPENSEARCH_VERSION for the store search service) don't leak into
+  // monitoring image tags that were built with the versions.env values.
+  const versionDefaults = readVersionDefaults(CLOUD_SWARM_DIR);
+  for (const key of MONITORING_VERSION_KEYS) {
+    if (versionDefaults[key]) {
+      monitoringEnv[key] = versionDefaults[key];
+    }
+  }
+  return monitoringEnv;
+}
+
 async function ensureMonitoringStack(log: (msg: string) => void, envVars: NodeJS.ProcessEnv) {
+  const monitoringEnv = buildMonitoringStackEnv(envVars);
+
+  // 0. Verify custom monitoring images exist in the registry.
+  const missingImages = await collectMissingMonitoringImages(monitoringEnv);
+  if (missingImages.length) {
+    log(`monitoring images missing from registry: ${missingImages.join(', ')}; attempting build`);
+    const buildScript = path.join(CLOUD_SWARM_DIR, 'scripts/build-monitoring.sh');
+    if (!fs.existsSync(buildScript)) {
+      log('build-monitoring.sh not found; skipping monitoring stack deploy');
+      return;
+    }
+    const { code: buildCode } = await runCommandCaptureWithStatus(
+      'bash', [buildScript], { env: monitoringEnv, cwd: CLOUD_SWARM_DIR },
+    );
+    if (buildCode !== 0) {
+      log('build-monitoring.sh failed; skipping monitoring stack deploy');
+      return;
+    }
+    const stillMissing = await collectMissingMonitoringImages(monitoringEnv);
+    if (stillMissing.length) {
+      log(`monitoring images still missing after build: ${stillMissing.join(', ')}; skipping monitoring stack deploy`);
+      return;
+    }
+    log('monitoring images built successfully');
+  }
+
   // 1. Ensure the mz-monitoring overlay network exists
   const { code: netCode } = await runCommandCaptureWithStatus(
     'docker', ['network', 'inspect', 'mz-monitoring'],
@@ -2078,7 +2160,7 @@ async function ensureMonitoringStack(log: (msg: string) => void, envVars: NodeJS
     '-c', monitoringBaseStackPath,
     '-c', monitoringStackPath,
     'mz-monitoring',
-  ], { env: envVars });
+  ], { env: monitoringEnv });
   await ensureCloudflaredMonitoringNetwork(log);
   await waitForMonitoringRuntimeHealthy(log);
   await ensureMonitoringDashboards(log);
