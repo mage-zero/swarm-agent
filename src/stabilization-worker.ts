@@ -134,56 +134,125 @@ function shouldRunBySchedule(nextRunAt: string | undefined, nowMs: number): bool
   return parsed <= nowMs;
 }
 
+function parseDesiredReplicaCountFromMode(raw: string): number | null {
+  const payload = String(raw || '').trim();
+  if (!payload) return null;
+  try {
+    const parsed = JSON.parse(payload) as {
+      Replicated?: { Replicas?: unknown };
+      Global?: unknown;
+    };
+    if (parsed && typeof parsed === 'object') {
+      if (parsed.Global && !parsed.Replicated) {
+        return 1;
+      }
+      const replicasRaw = parsed.Replicated?.Replicas;
+      if (typeof replicasRaw === 'number' && Number.isFinite(replicasRaw)) {
+        return Math.max(0, Math.trunc(replicasRaw));
+      }
+      if (typeof replicasRaw === 'string') {
+        const normalized = replicasRaw.trim();
+        if (!normalized) return null;
+        const parsedReplicas = Number.parseInt(normalized, 10);
+        if (Number.isFinite(parsedReplicas)) {
+          return Math.max(0, parsedReplicas);
+        }
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function isDatabaseReplicaExpected(environmentId: number): Promise<boolean> {
+  const serviceName = `mz-env-${environmentId}_database-replica`;
+  const inspect = await runCommand(
+    'docker',
+    ['service', 'inspect', serviceName, '--format', '{{json .Spec.Mode}}'],
+    12_000,
+  );
+  if (inspect.code !== 0) {
+    const errorText = `${inspect.stderr || ''} ${inspect.stdout || ''}`.toLowerCase();
+    if (errorText.includes('no such service') || errorText.includes('not found')) {
+      log(`env=${environmentId} ${serviceName} is absent; skipping replica stabilization checks`);
+      return false;
+    }
+    log(`env=${environmentId} failed to inspect ${serviceName}; keeping replica stabilization checks enabled`);
+    return true;
+  }
+  const desiredReplicas = parseDesiredReplicaCountFromMode(inspect.stdout || '');
+  if (desiredReplicas === null) {
+    log(`env=${environmentId} unable to parse replica mode for ${serviceName}; keeping replica stabilization checks enabled`);
+    return true;
+  }
+  if (desiredReplicas < 1) {
+    log(`env=${environmentId} ${serviceName} desired replicas=${desiredReplicas}; skipping replica stabilization checks`);
+    return false;
+  }
+  return true;
+}
+
 async function runStabilizationCycle(environmentId: number, reason: string): Promise<void> {
   const runId = crypto.randomUUID();
   const checks: StabilizationCheck[] = [];
+  const dbReplicaExpected = await isDatabaseReplicaExpected(environmentId);
 
   upsertStabilizationState(environmentId, {
     status: 'stabilizing',
     mode: 'active',
     run_id: runId,
-    current_step: 'db_replication_status',
+    current_step: dbReplicaExpected ? 'db_replication_status' : 'proxysql_ready',
     current_step_started_at: nowIso(),
     checks: [],
     last_error: '',
   });
 
-  const dbStatus = await executeCheck(environmentId, 'db_replication_status');
-  checks.push(dbStatus);
+  if (dbReplicaExpected) {
+    const dbStatus = await executeCheck(environmentId, 'db_replication_status');
+    checks.push(dbStatus);
 
-  if (dbStatus.status !== 'ok') {
-    upsertStabilizationState(environmentId, {
-      status: 'stabilizing',
-      mode: 'active',
-      run_id: runId,
-      current_step: 'db_replica_healthcheck_status',
-      current_step_started_at: nowIso(),
-      checks,
-    });
-    const dbHealthcheckStatus = await executeCheck(environmentId, 'db_replica_healthcheck_status');
-    checks.push(dbHealthcheckStatus);
-
-    if (dbHealthcheckStatus.status !== 'ok') {
+    if (dbStatus.status !== 'ok') {
       upsertStabilizationState(environmentId, {
         status: 'stabilizing',
         mode: 'active',
         run_id: runId,
-        current_step: 'db_replica_healthcheck_repair',
+        current_step: 'db_replica_healthcheck_status',
         current_step_started_at: nowIso(),
         checks,
       });
-      checks.push(await executeCheck(environmentId, 'db_replica_healthcheck_repair'));
-    }
+      const dbHealthcheckStatus = await executeCheck(environmentId, 'db_replica_healthcheck_status');
+      checks.push(dbHealthcheckStatus);
 
-    upsertStabilizationState(environmentId, {
-      status: 'stabilizing',
-      mode: 'active',
-      run_id: runId,
-      current_step: 'db_replica_repair',
-      current_step_started_at: nowIso(),
-      checks,
+      if (dbHealthcheckStatus.status !== 'ok') {
+        upsertStabilizationState(environmentId, {
+          status: 'stabilizing',
+          mode: 'active',
+          run_id: runId,
+          current_step: 'db_replica_healthcheck_repair',
+          current_step_started_at: nowIso(),
+          checks,
+        });
+        checks.push(await executeCheck(environmentId, 'db_replica_healthcheck_repair'));
+      }
+
+      upsertStabilizationState(environmentId, {
+        status: 'stabilizing',
+        mode: 'active',
+        run_id: runId,
+        current_step: 'db_replica_repair',
+        current_step_started_at: nowIso(),
+        checks,
+      });
+      checks.push(await executeCheck(environmentId, 'db_replica_repair'));
+    }
+  } else {
+    checks.push({
+      runbook_id: 'db_replication_status',
+      status: 'ok',
+      summary: 'Database replica is intentionally disabled (service absent or scaled to 0); replication checks skipped.',
+      finished_at: nowIso(),
     });
-    checks.push(await executeCheck(environmentId, 'db_replica_repair'));
   }
 
   upsertStabilizationState(environmentId, {
@@ -384,3 +453,10 @@ export function startStabilizationWorker(): void {
   }, STABILIZATION_TICK_MS);
   stabilizationTickTimer.unref?.();
 }
+
+export const __testing = {
+  parseServiceEnvironmentIds,
+  parseDesiredReplicaCountFromMode,
+  isDatabaseReplicaExpected,
+  runStabilizationCycle,
+};

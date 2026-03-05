@@ -1,17 +1,9 @@
 {
-  "version": "0.4.90",
+  "version": "0.4.91",
   "date": "2026-03-05",
-  "summary": "Add cron scheduler observability dashboards and migration-driven monitoring refresh rollout",
+  "summary": "Treat database replica as optional during stabilization when the replica service is intentionally disabled",
   "requires": {
     "cloud-swarm": ">=1.0.39"
   },
-  "changes": [
-    {
-      "id": "refresh-monitoring-cron-dashboard-v1",
-      "description": "Rebuild and redeploy monitoring assets, reconnect cloudflared, and bootstrap dashboards to roll out structured cron scheduler telemetry parsing and the new cron dashboard across existing stacks.",
-      "phase": "pre_migrate",
-      "downtimeMinutes": 0,
-      "scope": "stack"
-    }
-  ]
+  "changes": []
 }
