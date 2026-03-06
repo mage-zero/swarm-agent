@@ -1,17 +1,52 @@
 {
-  "version": "0.4.92",
-  "date": "2026-03-05",
-  "summary": "Add cron queue/task observability dashboards and rollout migration for backlog and staleness monitoring",
+  "version": "0.4.94",
+  "date": "2026-03-06",
+  "summary": "Roll out Magento admin/cron/frontend DB direct routing, DB baseline tuning, cron scheduler defaults, monitoring asset refresh, and keep ProxySQL in standby mode",
   "requires": {
-    "cloud-swarm": ">=1.0.40"
+    "cloud-swarm": ">=1.0.42"
   },
   "changes": [
     {
-      "id": "refresh-monitoring-cron-dashboard-v2",
-      "description": "Rebuild and redeploy monitoring assets, reconnect cloudflared, and bootstrap dashboards to roll out cron queue/task observability panels for backlog, staleness, and top failing/overdue jobs across existing stacks.",
+      "id": "rebuild-base-service-images",
+      "description": "Rebuild and redeploy base cloud-swarm service images so runtime defaults and config wiring updates are available to current stacks.",
       "phase": "pre_migrate",
       "downtimeMinutes": 0,
       "scope": "stack"
+    },
+    {
+      "id": "refresh-monitoring-observability-assets",
+      "description": "Rebuild and redeploy monitoring assets and bootstrap dashboards so updated Metricbeat integrations and observability fixes are rolled out across existing stacks.",
+      "phase": "pre_migrate",
+      "downtimeMinutes": 0,
+      "scope": "stack"
+    },
+    {
+      "id": "route-admin-cron-db-path-v1",
+      "description": "Route Magento frontend/admin/cron services to direct writer DB endpoints by setting per-service DB host/port environment values.",
+      "phase": "pre_migrate",
+      "downtimeMinutes": 0,
+      "scope": "environment"
+    },
+    {
+      "id": "enforce-cron-scheduler-baseline-v1",
+      "description": "Enforce generic cron scheduler baseline controls for faster backlog recovery without codebase-specific job logic.",
+      "phase": "pre_migrate",
+      "downtimeMinutes": 0,
+      "scope": "environment"
+    },
+    {
+      "id": "scale-proxysql-standby-v1",
+      "description": "Scale ProxySQL services to zero replicas so environments run direct DB traffic while retaining the service for future re-enable.",
+      "phase": "pre_migrate",
+      "downtimeMinutes": 0,
+      "scope": "environment"
+    },
+    {
+      "id": "enforce-db-baseline-tuning-v1",
+      "description": "Enforce MariaDB baseline tuning (buffer pool sizing from memory limits, query_cache_size=0, query_cache_type=OFF) and wait for DB services to return healthy tasks.",
+      "phase": "migrate",
+      "downtimeMinutes": 2,
+      "scope": "environment"
     }
   ]
 }

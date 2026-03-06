@@ -5,6 +5,7 @@ import { buildNodeHeaders } from './node-hmac.js';
 import { bootstrapMonitoringDashboardsWithRetry } from './monitoring-dashboards.js';
 import { resolveDatadogTraceEnv } from './lib/apm-tracing.js';
 import { buildProxySqlQueryRulesSql, PROXYSQL_MANAGED_QUERY_RULES } from './lib/proxysql.js';
+import { formatMemoryBytes, GIB, MIB } from './lib/version-config.js';
 import { buildCapacityPayload } from './status.js';
 import { buildJobName, inspectServiceSpec, listServiceTasks, runSwarmJob } from './swarm.js';
 
@@ -40,6 +41,9 @@ const MONITORING_DASHBOARDS_REQUIRED = (process.env.MZ_MONITORING_DASHBOARDS_REQ
 const APP_HA_MIN_READY_NODES = Math.max(1, Number(process.env.MZ_APP_HA_MIN_READY_NODES || 2));
 const APP_HA_MAX_REPLICAS = Math.max(1, Number(process.env.MZ_APP_HA_MAX_REPLICAS || 2));
 const APP_HA_CPU_EPSILON = 0.01;
+const DB_BUFFER_POOL_MIN_BYTES = 512 * MIB;
+const DB_BUFFER_POOL_MAX_BYTES = 8 * GIB;
+const DB_BUFFER_POOL_ROUND_STEP_BYTES = 64 * MIB;
 
 type AppHaReplicaPolicyInput = {
   ready_node_count: number;
@@ -205,6 +209,119 @@ function resolveAppHaReplicaPolicy(input: AppHaReplicaPolicyInput): AppHaReplica
     shortfall_cpu_cores: 0,
     shortfall_memory_bytes: 0,
   };
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function resolveDbBufferPoolBaselineBytes(memoryLimitBytes: number): number {
+  const normalizedMemory = Number.isFinite(memoryLimitBytes) && memoryLimitBytes > 0
+    ? memoryLimitBytes
+    : DB_BUFFER_POOL_MIN_BYTES;
+  const rawTarget = Math.floor(normalizedMemory * 0.60);
+  const clamped = clampNumber(rawTarget, DB_BUFFER_POOL_MIN_BYTES, DB_BUFFER_POOL_MAX_BYTES);
+  const rounded = Math.round(clamped / DB_BUFFER_POOL_ROUND_STEP_BYTES) * DB_BUFFER_POOL_ROUND_STEP_BYTES;
+  return clampNumber(rounded, DB_BUFFER_POOL_MIN_BYTES, DB_BUFFER_POOL_MAX_BYTES);
+}
+
+function parseMemoryBytesValue(raw: string): number | null {
+  const value = String(raw || '').trim();
+  if (!value) return null;
+  const match = value.match(/^(\d+(?:\.\d+)?)\s*([kmg])?b?$/i);
+  if (!match) {
+    const plain = Number(value);
+    return Number.isFinite(plain) && plain > 0 ? Math.round(plain) : null;
+  }
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  const unit = String(match[2] || '').toLowerCase();
+  const multiplier = unit === 'g'
+    ? GIB
+    : unit === 'm'
+      ? MIB
+      : unit === 'k'
+        ? 1024
+        : 1;
+  return Math.max(1, Math.round(amount * multiplier));
+}
+
+async function inspectServiceLimitMemoryBytes(serviceName: string): Promise<number | null> {
+  const inspect = await runCommand(
+    'docker',
+    ['service', 'inspect', serviceName, '--format', '{{json .Spec.TaskTemplate.Resources.Limits}}'],
+    30_000,
+  );
+  if (inspect.code !== 0) {
+    const output = `${inspect.stdout || ''}\n${inspect.stderr || ''}`;
+    if (isNoSuchServiceOutput(output)) {
+      return null;
+    }
+    throw new Error(`Failed to inspect ${serviceName} memory limit: ${inspect.stderr || inspect.stdout || `exit ${inspect.code}`}`);
+  }
+
+  const raw = String(inspect.stdout || '').trim();
+  if (!raw || raw === '<no value>' || raw === 'null') {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const memory = Number(parsed.MemoryBytes || 0);
+    if (!Number.isFinite(memory) || memory <= 0) {
+      return null;
+    }
+    return Math.round(memory);
+  } catch {
+    return null;
+  }
+}
+
+async function applyServiceEnvOverrides(
+  serviceName: string,
+  overrides: Record<string, string>,
+  force = true,
+): Promise<ServiceReplicaApplyResult> {
+  const spec = await inspectServiceSpec(serviceName);
+  if (!spec) {
+    return { status: 'skipped', detail: 'service not found' };
+  }
+
+  const keys = Object.keys(overrides);
+  const changed = keys.some((key) => String(spec.env[key] || '') !== String(overrides[key] || ''));
+  if (!changed && !force) {
+    return { status: 'skipped', detail: 'already aligned' };
+  }
+
+  const args: string[] = ['service', 'update'];
+  for (const key of keys) {
+    args.push('--env-rm', key);
+  }
+  for (const [key, value] of Object.entries(overrides)) {
+    args.push('--env-add', `${key}=${value}`);
+  }
+  if (force) {
+    args.push('--force');
+  }
+  args.push(serviceName);
+
+  const update = await runCommand('docker', args, 120_000);
+  if (update.code !== 0) {
+    const combined = `${update.stdout || ''}\n${update.stderr || ''}`;
+    if (isNoSuchServiceOutput(combined)) {
+      return { status: 'skipped', detail: 'service not found during update' };
+    }
+    if (isNoopServiceUpdateOutput(combined)) {
+      return { status: 'skipped', detail: 'nothing to update' };
+    }
+    return {
+      status: 'failed',
+      detail: combined.trim() || `docker service update failed (exit ${update.code})`,
+    };
+  }
+  if (!changed) {
+    return { status: 'updated', detail: `forced rollout (${keys.join(',')})` };
+  }
+  return { status: 'updated', detail: `updated env (${keys.join(',')})` };
 }
 
 function isNoSuchServiceOutput(text: string): boolean {
@@ -643,6 +760,39 @@ async function recoverPlacementPausedFrontendService(
   }
 
   return { status: 'updated', detail: `resumed paused update and forced rollout (order=${desiredOrder})` };
+}
+
+async function waitForServiceDesiredTasksRunning(
+  serviceName: string,
+  timeoutMs = 180_000,
+): Promise<ServiceReplicaApplyResult> {
+  const startedAt = Date.now();
+  let lastState = '';
+  while (Date.now() - startedAt < timeoutMs) {
+    const tasks = await listServiceTasks(serviceName);
+    const desiredRunning = tasks.filter((task) => task.desired_state.toLowerCase() === 'running');
+    if (!desiredRunning.length) {
+      return { status: 'skipped', detail: 'no desired running tasks' };
+    }
+    const nonRunning = desiredRunning.filter((task) => !task.current_state.startsWith('Running'));
+    if (!nonRunning.length) {
+      return { status: 'updated', detail: `${desiredRunning.length}/${desiredRunning.length} desired tasks running` };
+    }
+    const failed = nonRunning.find((task) => task.current_state.startsWith('Failed') || task.current_state.startsWith('Rejected'));
+    if (failed) {
+      const suffix = failed.error ? ` (${failed.error})` : '';
+      return {
+        status: 'failed',
+        detail: `${failed.name} ${failed.current_state}${suffix}`.trim(),
+      };
+    }
+    lastState = nonRunning[0]?.current_state || lastState;
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+  }
+  return {
+    status: 'failed',
+    detail: `timed out waiting for desired tasks to run (${lastState || 'no task state'})`,
+  };
 }
 
 async function fetchStackSnapshot(ctx: MigrationContext): Promise<StackSnapshot> {
@@ -1494,6 +1644,124 @@ registerMigration('refresh-monitoring-cron-dashboard-v2', async (ctx) => {
   await executeMigration('connect-cloudflared-to-monitoring', ctx);
   await executeMigration('bootstrap-monitoring-dashboards', ctx);
   console.log('upgrade.migration.refresh_monitoring_cron_dashboard_v2: complete');
+});
+
+registerMigration('route-admin-cron-db-path-v1', async (ctx) => {
+  const environmentId = Number(ctx.environmentId || 0);
+  if (!Number.isFinite(environmentId) || environmentId <= 0) {
+    console.warn('upgrade.migration.route_admin_cron_db_path_v1: missing environmentId; skipping');
+    return;
+  }
+
+  const databaseHost = envServiceName(environmentId, 'database');
+  const overrides = {
+    MZ_DB_HOST: databaseHost,
+    MZ_DB_PORT: '3306',
+  };
+  const serviceSuffixes = ['php-fpm', 'php-fpm-admin', 'cron'];
+  for (const suffix of serviceSuffixes) {
+    const serviceName = envServiceName(environmentId, suffix);
+    const result = await applyServiceEnvOverrides(serviceName, overrides, true);
+    if (result.status === 'failed') {
+      throw new Error(`Failed to route ${serviceName} DB path: ${result.detail}`);
+    }
+    console.log(
+      `upgrade.migration.route_admin_cron_db_path_v1: env=${environmentId} ${serviceName} `
+      + `${result.status} (${result.detail})`
+    );
+  }
+});
+
+registerMigration('enforce-cron-scheduler-baseline-v1', async (ctx) => {
+  const environmentId = Number(ctx.environmentId || 0);
+  if (!Number.isFinite(environmentId) || environmentId <= 0) {
+    console.warn('upgrade.migration.enforce_cron_scheduler_baseline_v1: missing environmentId; skipping');
+    return;
+  }
+
+  const cronService = envServiceName(environmentId, 'cron');
+  const result = await applyServiceEnvOverrides(cronService, {
+    MZ_CRON_LOOP_SECONDS: '30',
+    MZ_CRON_GROUP_REFRESH_SECONDS: '120',
+    MZ_CRON_GROUP_TIMEOUT_SECONDS: '900',
+    MZ_CRON_STAGGER: '0',
+  }, true);
+  if (result.status === 'failed') {
+    throw new Error(`Failed to enforce cron scheduler baseline on ${cronService}: ${result.detail}`);
+  }
+  console.log(
+    `upgrade.migration.enforce_cron_scheduler_baseline_v1: env=${environmentId} ${cronService} `
+    + `${result.status} (${result.detail})`
+  );
+});
+
+registerMigration('scale-proxysql-standby-v1', async (ctx) => {
+  const environmentId = Number(ctx.environmentId || 0);
+  if (!Number.isFinite(environmentId) || environmentId <= 0) {
+    console.warn('upgrade.migration.scale_proxysql_standby_v1: missing environmentId; skipping');
+    return;
+  }
+
+  const proxysqlService = envServiceName(environmentId, 'proxysql');
+  const result = await applyServiceReplicaPolicy(proxysqlService, 0, 0);
+  if (result.status === 'failed') {
+    throw new Error(`Failed to scale ${proxysqlService} to standby: ${result.detail}`);
+  }
+  console.log(
+    `upgrade.migration.scale_proxysql_standby_v1: env=${environmentId} ${proxysqlService} `
+    + `${result.status} (${result.detail})`
+  );
+});
+
+registerMigration('enforce-db-baseline-tuning-v1', async (ctx) => {
+  const environmentId = Number(ctx.environmentId || 0);
+  if (!Number.isFinite(environmentId) || environmentId <= 0) {
+    console.warn('upgrade.migration.enforce_db_baseline_tuning_v1: missing environmentId; skipping');
+    return;
+  }
+
+  const dbServices = ['database', 'database-replica'];
+  for (const suffix of dbServices) {
+    const serviceName = envServiceName(environmentId, suffix);
+    const spec = await inspectServiceSpec(serviceName);
+    if (!spec) {
+      console.log(`upgrade.migration.enforce_db_baseline_tuning_v1: env=${environmentId} ${serviceName} skipped (missing)`);
+      continue;
+    }
+
+    const currentBufferPool = parseMemoryBytesValue(spec.env.MZ_DB_INNODB_BUFFER_POOL_SIZE || '');
+    const limitMemory = await inspectServiceLimitMemoryBytes(serviceName);
+    const baselineBufferPool = resolveDbBufferPoolBaselineBytes(Number(limitMemory || 0));
+    const targetBufferPool = currentBufferPool && currentBufferPool > 0
+      ? clampNumber(currentBufferPool, DB_BUFFER_POOL_MIN_BYTES, DB_BUFFER_POOL_MAX_BYTES)
+      : baselineBufferPool;
+    const overrides = {
+      MZ_DB_INNODB_BUFFER_POOL_SIZE: formatMemoryBytes(targetBufferPool),
+      MZ_DB_QUERY_CACHE_SIZE: '0',
+      MZ_DB_QUERY_CACHE_TYPE: 'OFF',
+    };
+    const applyResult = await applyServiceEnvOverrides(serviceName, overrides, true);
+    if (applyResult.status === 'failed') {
+      throw new Error(`Failed to enforce DB baseline tuning on ${serviceName}: ${applyResult.detail}`);
+    }
+    console.log(
+      `upgrade.migration.enforce_db_baseline_tuning_v1: env=${environmentId} ${serviceName} `
+      + `${applyResult.status} (${applyResult.detail})`
+    );
+
+    const replicaConfig = await inspectServiceReplicaConfig(serviceName);
+    const desiredReplicas = replicaConfig?.replicas || 0;
+    if (desiredReplicas > 0) {
+      const waitResult = await waitForServiceDesiredTasksRunning(serviceName, 180_000);
+      if (waitResult.status === 'failed') {
+        throw new Error(`Service ${serviceName} did not return to running state: ${waitResult.detail}`);
+      }
+      console.log(
+        `upgrade.migration.enforce_db_baseline_tuning_v1: env=${environmentId} ${serviceName} `
+        + `post-update ${waitResult.status} (${waitResult.detail})`
+      );
+    }
+  }
 });
 
 registerMigration('rebuild-base-service-images', async (ctx) => {

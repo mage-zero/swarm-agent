@@ -252,6 +252,36 @@ const DEPLOY_INTERVAL_MS = Number(process.env.MZ_DEPLOY_WORKER_INTERVAL_MS || 50
 const FETCH_TIMEOUT_MS = Number(process.env.MZ_FETCH_TIMEOUT_MS || 30000);
 const APP_HA_MIN_READY_NODES = Math.max(1, Number(process.env.MZ_APP_HA_MIN_READY_NODES || 2));
 const APP_HA_MAX_REPLICAS = Math.max(1, Number(process.env.MZ_APP_HA_MAX_REPLICAS || 2));
+const DB_BUFFER_POOL_MIN_BYTES = 512 * MIB;
+const DB_BUFFER_POOL_MAX_BYTES = 8 * GIB;
+const DB_BUFFER_POOL_ROUND_STEP_BYTES = 64 * MIB;
+
+type MagentoDbRoute = {
+  host: string;
+  port: string;
+};
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function resolveDbBufferPoolBaselineBytes(memoryLimitBytes: number): number {
+  const normalizedMemory = Number.isFinite(memoryLimitBytes) && memoryLimitBytes > 0
+    ? memoryLimitBytes
+    : DB_BUFFER_POOL_MIN_BYTES;
+  const rawTarget = Math.floor(normalizedMemory * 0.60);
+  const clamped = clampNumber(rawTarget, DB_BUFFER_POOL_MIN_BYTES, DB_BUFFER_POOL_MAX_BYTES);
+  const rounded = Math.round(clamped / DB_BUFFER_POOL_ROUND_STEP_BYTES) * DB_BUFFER_POOL_ROUND_STEP_BYTES;
+  return clampNumber(rounded, DB_BUFFER_POOL_MIN_BYTES, DB_BUFFER_POOL_MAX_BYTES);
+}
+
+function resolveDirectDatabaseRoute(stackService: (service: string) => string): MagentoDbRoute {
+  return {
+    host: stackService('database'),
+    port: '3306',
+  };
+}
+
 function isLoopbackHost(host: string) {
   const value = String(host || '').trim().toLowerCase();
   return value === '127.0.0.1' || value === 'localhost' || value === '::1';
@@ -2306,12 +2336,12 @@ async function waitForDatabase(containerId: string, timeoutMs: number) {
   throw new Error('Database did not become ready in time');
 }
 
-async function waitForProxySql(containerId: string, stackName: string, timeoutMs: number) {
+async function waitForDatabaseEndpoint(containerId: string, stackName: string, timeoutMs: number) {
   const start = Date.now();
   let currentId = containerId;
   const probe = [
-    '$host=getenv("MZ_DB_HOST") ?: "proxysql";',
-    '$port=(int)(getenv("MZ_DB_PORT") ?: 6033);',
+    '$host=getenv("MZ_DB_HOST") ?: "database";',
+    '$port=(int)(getenv("MZ_DB_PORT") ?: 3306);',
     '$fp=@fsockopen($host,$port,$errno,$errstr,1);',
     'if(!$fp){fwrite(STDERR,$errstr ?: "connect failed"); exit(1);} fclose($fp);',
   ].join(' ');
@@ -2331,7 +2361,7 @@ async function waitForProxySql(containerId: string, stackName: string, timeoutMs
       await delay(2000);
     }
   }
-  throw new Error('ProxySQL did not become ready in time');
+  throw new Error('Database endpoint did not become ready in time');
 }
 
 async function waitForRedisCache(containerId: string, stackName: string, timeoutMs: number) {
@@ -4412,6 +4442,13 @@ async function processDeployment(recordPath: string) {
   const buildxNetwork = process.env.BUILDX_NETWORK || 'host';
   const frontendRuntimePolicy = resolveFrontendRuntimePolicy(appHaPolicy.replicas);
   const frontendReplicaCount = frontendRuntimePolicy.replicas;
+  const directDbRoute = resolveDirectDatabaseRoute(stackService);
+  const dbBufferPoolOverride = String(configEnv.MZ_DB_INNODB_BUFFER_POOL_SIZE || '').trim();
+  const dbMemoryLimitBytes = Number(plannerResources.database?.limits?.memory_bytes || 0);
+  const dbBufferPoolBaseline = formatMemoryBytes(resolveDbBufferPoolBaselineBytes(dbMemoryLimitBytes));
+  const dbBufferPoolEnv = dbBufferPoolOverride || dbBufferPoolBaseline;
+  const proxysqlReplicasRaw = String(configEnv.MZ_PROXYSQL_REPLICAS || process.env.MZ_PROXYSQL_REPLICAS || '0').trim();
+  const proxysqlReplicas = /^[0-9]+$/.test(proxysqlReplicasRaw) ? proxysqlReplicasRaw : '0';
 
   const envVars: NodeJS.ProcessEnv = {
     ...process.env,
@@ -4434,11 +4471,21 @@ async function processDeployment(recordPath: string) {
     MAGE_VERSION: mageVersion,
     MYSQL_DATABASE: process.env.MYSQL_DATABASE || 'magento',
     MYSQL_USER: process.env.MYSQL_USER || 'magento',
-    MZ_DB_HOST: stackService('proxysql'),
-    MZ_DB_PORT: '6033',
+    MZ_DB_HOST: directDbRoute.host,
+    MZ_DB_PORT: directDbRoute.port,
+    MZ_DB_HOST_FRONTEND: directDbRoute.host,
+    MZ_DB_PORT_FRONTEND: directDbRoute.port,
+    MZ_DB_HOST_ADMIN: directDbRoute.host,
+    MZ_DB_PORT_ADMIN: directDbRoute.port,
+    MZ_DB_HOST_CRON: directDbRoute.host,
+    MZ_DB_PORT_CRON: directDbRoute.port,
+    MZ_DB_INNODB_BUFFER_POOL_SIZE: dbBufferPoolEnv,
+    MZ_DB_QUERY_CACHE_SIZE: '0',
+    MZ_DB_QUERY_CACHE_TYPE: 'OFF',
     MZ_PROXYSQL_DB_HOST: stackService('database'),
     MZ_PROXYSQL_DB_REPLICA_HOST: stackService(replicaServiceName),
     MZ_PROXYSQL_DB_PORT: '3306',
+    MZ_PROXYSQL_REPLICAS: proxysqlReplicas,
     MZ_MARIADB_MASTER_HOST: stackService('database'),
     MZ_REPLICATION_USER: replicaUser,
     MZ_DATABASE_REPLICA_REPLICAS: replicaEnabled ? '1' : '0',
@@ -4724,15 +4771,19 @@ async function processDeployment(recordPath: string) {
   }
   envVars.MZ_SEARCH_ENGINE = searchEngine;
 
-  progress.detail('deploy_stack', 'Reconciling ProxySQL query routing rules');
-  try {
-    await enforceProxySqlQueryRules({
-      environmentId,
-      log,
-    });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log(`WARNING: ProxySQL query rules reconciliation failed (non-fatal): ${msg}`);
+  if (Number(envVars.MZ_PROXYSQL_REPLICAS || 0) > 0) {
+    progress.detail('deploy_stack', 'Reconciling ProxySQL query routing rules');
+    try {
+      await enforceProxySqlQueryRules({
+        environmentId,
+        log,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`WARNING: ProxySQL query rules reconciliation failed (non-fatal): ${msg}`);
+    }
+  } else {
+    log('proxysql query rule reconcile skipped: service is in standby (replicas=0)');
   }
 
   progress.detail('deploy_stack', `Deploying application (search engine: ${searchEngine})`);
@@ -4951,8 +5002,8 @@ async function processDeployment(recordPath: string) {
     opensearchTimeout
   );
   dbContainerId = await setSearchEngine(stackName, dbContainerId, envVars.MYSQL_DATABASE || 'magento', 'mysql');
-  progress.detail('app_prepare', 'Waiting for ProxySQL');
-  await waitForProxySql(adminContainerId, stackName, 5 * 60 * 1000);
+  progress.detail('app_prepare', 'Waiting for database endpoint');
+  await waitForDatabaseEndpoint(adminContainerId, stackName, 5 * 60 * 1000);
   progress.detail('app_prepare', 'Waiting for Redis');
   await waitForRedisCache(adminContainerId, stackName, 5 * 60 * 1000);
   progress.detail('app_prepare', 'Applying runtime configuration');
@@ -5600,6 +5651,8 @@ export const __testing = {
   shouldReuseAppImagesForCloudSwarmRef,
   getQueueSourceDirs,
   buildReplicaConfigureScript,
+  resolveDbBufferPoolBaselineBytes,
+  resolveDirectDatabaseRoute,
   resolveAggressivePruneCutoffSeconds,
   getHistoryLastSuccessfulDeployAt,
 };

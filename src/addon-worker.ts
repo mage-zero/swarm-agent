@@ -373,7 +373,7 @@ async function deployAddon(record: DeploymentRecord, deploymentId: string) {
 
   const dbSecretName = `mz_env_${environmentId}_db_password_v${SECRET_VERSION}`;
   const rabbitSecretName = `mz_env_${environmentId}_rabbitmq_password_v${SECRET_VERSION}`;
-  const dbHost = stackServiceName(environmentId, 'proxysql');
+  const dbHost = stackServiceName(environmentId, 'database');
   const rabbitHost = stackServiceName(environmentId, 'rabbitmq');
 
   const containerLabels = [
@@ -394,7 +394,7 @@ async function deployAddon(record: DeploymentRecord, deploymentId: string) {
     `MZ_ENVIRONMENT_ID=${environmentId}`,
     `MZ_STACK_ID=${payload.stack_id || ''}`.trim(),
     `MZ_DB_HOST=${dbHost}`,
-    'MZ_DB_PORT=6033',
+    'MZ_DB_PORT=3306',
     'MZ_DB_NAME=magento',
     'MZ_DB_USER=magento',
     'MZ_DB_PASSWORD_FILE=/run/secrets/db_password',
@@ -403,7 +403,7 @@ async function deployAddon(record: DeploymentRecord, deploymentId: string) {
     'MZ_RABBITMQ_USER=magento',
     'MZ_RABBITMQ_PASSWORD_FILE=/run/secrets/rabbitmq_password',
     `DB_HOST=${dbHost}`,
-    'DB_PORT=6033',
+    'DB_PORT=3306',
     'DB_NAME=magento',
     'DB_USER=magento',
     'DB_PASSWORD_FILE=/run/secrets/db_password',

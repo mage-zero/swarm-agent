@@ -135,14 +135,10 @@ function buildDatabaseConfigChanges(
   const tmpTable = clamp(Math.floor(memoryLimit * tmpTableRatio), 32 * MIB, 256 * MIB);
   const threadCache = clamp(Math.round(maxConnections / 10), 16, 128);
 
-  let queryCache = 0;
-  if (memoryLimit >= 2 * GIB) {
-    queryCache = 64 * MIB;
-  } else if (memoryLimit >= 1 * GIB) {
-    queryCache = 32 * MIB;
-  }
+  const queryCache = 0;
 
   notes.push('Derived from database container memory limit and baseline heuristics.');
+  notes.push('Query cache remains disabled (query_cache_size=0) for InnoDB-first workloads.');
 
   // --- Workload-aware derivations (mysqltuner-style) ---
 

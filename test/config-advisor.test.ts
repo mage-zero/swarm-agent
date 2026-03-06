@@ -49,7 +49,7 @@ describe('config advisor', () => {
 
     expect(Number(db?.changes['max_connections'])).toBe(200);
     expect(Number(db?.changes['thread_cache_size'])).toBe(20);
-    expect(Number(db?.changes['query_cache_size'])).toBe(64 * MIB);
+    expect(Number(db?.changes['query_cache_size'])).toBe(0);
 
     // New workload-aware variables should have sensible defaults without app metrics
     expect(Number(db?.changes['table_definition_cache'])).toBe(1000);
@@ -193,7 +193,7 @@ describe('config advisor', () => {
     expect(phpAdmin?.changes['opcache.max_accelerated_files']).toBe(100000);
   });
 
-  it('applies database query-cache thresholds and max_connections clamp', () => {
+  it('keeps database query cache disabled and applies max_connections clamp', () => {
     const inspection: PlannerInspectionPayload = {
       generated_at: '2026-02-19T00:00:00.000Z',
       services: [],
@@ -218,9 +218,9 @@ describe('config advisor', () => {
     expect(primary).toBeTruthy();
     expect(replica).toBeTruthy();
 
-    expect(primary?.changes['query_cache_size']).toBe(32 * MIB);
+    expect(primary?.changes['query_cache_size']).toBe(0);
     expect(primary?.changes['max_connections']).toBe(150);
-    expect(replica?.changes['query_cache_size']).toBe(64 * MIB);
+    expect(replica?.changes['query_cache_size']).toBe(0);
     expect(replica?.changes['max_connections']).toBe(600);
   });
 
