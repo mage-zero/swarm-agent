@@ -708,7 +708,7 @@ function timingSafeEquals(a: string, b: string): boolean {
   return result === 0;
 }
 
-async function validateNodeRequest(request: Request): Promise<boolean> {
+export async function validateNodeRequest(request: Request): Promise<boolean> {
   const nodeId = readNodeFile('node-id');
   const nodeSecret = readNodeFile('node-secret');
   if (!nodeId || !nodeSecret) {

@@ -1,7 +1,7 @@
 {
-  "version": "0.4.96",
+  "version": "0.4.97",
   "date": "2026-03-06",
-  "summary": "Harden cron dashboard no-data handling and require queue telemetry markers when validating inline cron supervisor commands",
+  "summary": "Require node-auth for planner, services, and runbook reads while suppressing unsigned detailed status expansions",
   "requires": {
     "cloud-swarm": ">=1.0.42"
   },

@@ -12,6 +12,7 @@ import {
   handleNodeRemovalRequest,
   handleTuningApprovalRequest,
   handleTuningDisapprovalRequest,
+  validateNodeRequest,
 } from './status.js';
 import { handleMeshJoinRequest } from './mesh.js';
 import { handleDeployLogsBundle } from './deploy-logs.js';
@@ -19,6 +20,14 @@ import { executeRunbook, handleServiceRestart, listRunbooks } from './support-ru
 import { cleanupOrphanedRunbookJobs } from './swarm.js';
 import { handleMonitoringDashboardsBootstrap } from './monitoring-dashboards.js';
 import { Readable } from 'stream';
+
+async function isNodeAuthorized(request: Request): Promise<boolean> {
+  return validateNodeRequest(request);
+}
+
+function unauthorizedResponse() {
+  return { error: 'Unauthorized' } as const;
+}
 
 export const createApp = () => {
   const app = new Hono();
@@ -52,6 +61,10 @@ export const createApp = () => {
   });
 
   app.get('/v1/planner', async (c) => {
+    const request = c.req.raw ?? (c.req as unknown as Request);
+    if (!await isNodeAuthorized(request)) {
+      return c.json(unauthorizedResponse(), 401);
+    }
     const payload = await buildPlannerPayload();
     return c.json(payload);
   });
@@ -81,6 +94,10 @@ export const createApp = () => {
   });
 
   app.get('/v1/support/runbooks', async (c) => {
+    const request = c.req.raw ?? (c.req as unknown as Request);
+    if (!await isNodeAuthorized(request)) {
+      return c.json(unauthorizedResponse(), 401);
+    }
     const runbooks = await listRunbooks();
     return c.json({ runbooks });
   });
@@ -134,20 +151,26 @@ export const createApp = () => {
   });
 
   app.get('/v1/services', async (c) => {
+    const request = c.req.raw ?? (c.req as unknown as Request);
+    if (!await isNodeAuthorized(request)) {
+      return c.json(unauthorizedResponse(), 401);
+    }
     const environmentId = Number(c.req.query('environment_id') || 0);
     const payload = await buildServiceStatusPayload(environmentId || undefined);
     return c.json(payload);
   });
 
   app.get('/', async (c) => {
+    const request = c.req.raw ?? (c.req as unknown as Request);
+    const isAuthorized = await isNodeAuthorized(request);
     const host = (c.req.header('host') || '').split(':')[0];
     const wantsJson =
       c.req.query('format') === 'json' ||
       (c.req.header('accept') || '').includes('application/json');
     const includes = (c.req.query('include') || '').split(',');
-    const includeCapacity = includes.includes('capacity');
-    const includePlanner = includes.includes('planner');
-    const includeServices = includes.includes('services');
+    const includeCapacity = isAuthorized && includes.includes('capacity');
+    const includePlanner = isAuthorized && includes.includes('planner');
+    const includeServices = isAuthorized && includes.includes('services');
     const result = await buildStatusPayload(
       host,
       wantsJson,
