@@ -1259,7 +1259,6 @@ function buildSavedObjects(): SavedObject[] {
           size: 0,
           query: buildDashboardContextQuery([
             { term: { 'event.dataset.keyword': 'cron.scheduler' } },
-            { exists: { field: 'cron.queue.backlog_due' } },
           ]),
           aggs: {
             timeline: {
@@ -1267,6 +1266,10 @@ function buildSavedObjects(): SavedObject[] {
                 field: '@timestamp',
                 fixed_interval: '1m',
                 min_doc_count: 0,
+                extended_bounds: {
+                  min: { '%timefilter%': 'min' },
+                  max: { '%timefilter%': 'max' },
+                },
               },
               aggs: {
                 backlog_max: { max: { field: 'cron.queue.backlog_due' } },
@@ -1280,10 +1283,10 @@ function buildSavedObjects(): SavedObject[] {
     },
     transform: [
       { calculate: 'toDate(datum.key_as_string)', as: 'timestamp' },
-      { calculate: 'isValid(datum.backlog_max.value) ? datum.backlog_max.value : null', as: 'backlog_due' },
-      { calculate: 'isValid(datum.running_max.value) ? datum.running_max.value : null', as: 'running' },
+      { calculate: 'isValid(datum.backlog_max.value) ? datum.backlog_max.value : 0', as: 'backlog_due' },
+      { calculate: 'isValid(datum.running_max.value) ? datum.running_max.value : 0', as: 'running' },
       { fold: ['backlog_due', 'running'], as: ['series', 'tasks'] },
-      { filter: 'isValid(datum.tasks)' },
+      { filter: 'isValid(datum.tasks) && isFinite(datum.tasks)' },
       { calculate: "datum.series === 'backlog_due' ? 'Due backlog' : 'Running now'", as: 'series_label' },
     ],
     mark: { type: 'line', point: false },
@@ -1314,7 +1317,6 @@ function buildSavedObjects(): SavedObject[] {
           size: 0,
           query: buildDashboardContextQuery([
             { term: { 'event.dataset.keyword': 'cron.scheduler' } },
-            { exists: { field: 'cron.queue.oldest_due_s' } },
           ]),
           aggs: {
             timeline: {
@@ -1322,6 +1324,10 @@ function buildSavedObjects(): SavedObject[] {
                 field: '@timestamp',
                 fixed_interval: '1m',
                 min_doc_count: 0,
+                extended_bounds: {
+                  min: { '%timefilter%': 'min' },
+                  max: { '%timefilter%': 'max' },
+                },
               },
               aggs: {
                 oldest_due_max: { max: { field: 'cron.queue.oldest_due_s' } },
@@ -1335,10 +1341,10 @@ function buildSavedObjects(): SavedObject[] {
     },
     transform: [
       { calculate: 'toDate(datum.key_as_string)', as: 'timestamp' },
-      { calculate: 'isValid(datum.oldest_due_max.value) ? datum.oldest_due_max.value : null', as: 'oldest_due_s' },
-      { calculate: 'isValid(datum.oldest_running_max.value) ? datum.oldest_running_max.value : null', as: 'oldest_running_s' },
+      { calculate: 'isValid(datum.oldest_due_max.value) ? datum.oldest_due_max.value : 0', as: 'oldest_due_s' },
+      { calculate: 'isValid(datum.oldest_running_max.value) ? datum.oldest_running_max.value : 0', as: 'oldest_running_s' },
       { fold: ['oldest_due_s', 'oldest_running_s'], as: ['series', 'age_seconds'] },
-      { filter: 'isValid(datum.age_seconds)' },
+      { filter: 'isValid(datum.age_seconds) && isFinite(datum.age_seconds)' },
       { calculate: "datum.series === 'oldest_due_s' ? 'Oldest due pending' : 'Oldest running'", as: 'series_label' },
     ],
     mark: { type: 'line', point: false },
@@ -1369,7 +1375,6 @@ function buildSavedObjects(): SavedObject[] {
           size: 0,
           query: buildDashboardContextQuery([
             { term: { 'event.dataset.keyword': 'cron.scheduler' } },
-            { exists: { field: 'cron.queue.failed_1h' } },
           ]),
           aggs: {
             timeline: {
@@ -1377,6 +1382,10 @@ function buildSavedObjects(): SavedObject[] {
                 field: '@timestamp',
                 fixed_interval: '5m',
                 min_doc_count: 0,
+                extended_bounds: {
+                  min: { '%timefilter%': 'min' },
+                  max: { '%timefilter%': 'max' },
+                },
               },
               aggs: {
                 failed_1h_max: { max: { field: 'cron.queue.failed_1h' } },
@@ -1391,11 +1400,11 @@ function buildSavedObjects(): SavedObject[] {
     },
     transform: [
       { calculate: 'toDate(datum.key_as_string)', as: 'timestamp' },
-      { calculate: 'isValid(datum.failed_1h_max.value) ? datum.failed_1h_max.value : null', as: 'failed_1h' },
-      { calculate: 'isValid(datum.missed_1h_max.value) ? datum.missed_1h_max.value : null', as: 'missed_1h' },
-      { calculate: 'isValid(datum.success_5m_max.value) ? datum.success_5m_max.value : null', as: 'success_5m' },
+      { calculate: 'isValid(datum.failed_1h_max.value) ? datum.failed_1h_max.value : 0', as: 'failed_1h' },
+      { calculate: 'isValid(datum.missed_1h_max.value) ? datum.missed_1h_max.value : 0', as: 'missed_1h' },
+      { calculate: 'isValid(datum.success_5m_max.value) ? datum.success_5m_max.value : 0', as: 'success_5m' },
       { fold: ['failed_1h', 'missed_1h', 'success_5m'], as: ['series', 'tasks'] },
-      { filter: 'isValid(datum.tasks)' },
+      { filter: 'isValid(datum.tasks) && isFinite(datum.tasks)' },
       {
         calculate: "datum.series === 'failed_1h' ? 'Failed (last 1h)' : (datum.series === 'missed_1h' ? 'Missed (last 1h)' : 'Success (last 5m)')",
         as: 'series_label',
@@ -1432,7 +1441,6 @@ function buildSavedObjects(): SavedObject[] {
           size: 0,
           query: buildDashboardContextQuery([
             { term: { 'event.dataset.keyword': 'cron.scheduler' } },
-            { terms: { 'cron.status.keyword': ['error', 'timeout'] } },
             { exists: { field: 'cron.group.keyword' } },
           ]),
           aggs: {
@@ -1454,9 +1462,9 @@ function buildSavedObjects(): SavedObject[] {
     },
     transform: [
       { calculate: 'datum.key', as: 'group_label' },
-      { calculate: 'datum.doc_count', as: 'non_ok_events' },
       { calculate: 'datum.errors.doc_count', as: 'error_events' },
       { calculate: 'datum.timeouts.doc_count', as: 'timeout_events' },
+      { calculate: 'datum.error_events + datum.timeout_events', as: 'non_ok_events' },
     ],
     mark: { type: 'bar' },
     encoding: {
@@ -1481,7 +1489,6 @@ function buildSavedObjects(): SavedObject[] {
           size: 0,
           query: buildDashboardContextQuery([
             { term: { 'event.dataset.keyword': 'cron.scheduler' } },
-            { term: { 'cron.status.keyword': 'skipped' } },
             { exists: { field: 'cron.group.keyword' } },
           ]),
           aggs: {
@@ -1491,6 +1498,9 @@ function buildSavedObjects(): SavedObject[] {
                 size: 15,
                 order: { _count: 'desc' },
               },
+              aggs: {
+                skipped: { filter: { term: { 'cron.status.keyword': 'skipped' } } },
+              },
             },
           },
         },
@@ -1499,7 +1509,7 @@ function buildSavedObjects(): SavedObject[] {
     },
     transform: [
       { calculate: 'datum.key', as: 'group_label' },
-      { calculate: 'datum.doc_count', as: 'skipped_events' },
+      { calculate: 'datum.skipped.doc_count', as: 'skipped_events' },
     ],
     mark: { type: 'bar', color: '#f59e0b' },
     encoding: {
@@ -1522,13 +1532,12 @@ function buildSavedObjects(): SavedObject[] {
           size: 0,
           query: buildDashboardContextQuery([
             { term: { 'event.dataset.keyword': 'cron.scheduler' } },
-            { exists: { field: 'cron.task.failures_24h' } },
-            { exists: { field: 'cron.task.job_code.keyword' } },
           ]),
           aggs: {
             jobs: {
               terms: {
                 field: 'cron.task.job_code.keyword',
+                missing: '__none__',
                 size: 15,
                 order: { max_failures: 'desc' },
               },
@@ -1542,7 +1551,10 @@ function buildSavedObjects(): SavedObject[] {
       format: { property: 'aggregations.jobs.buckets' },
     },
     transform: [
-      { calculate: 'datum.key', as: 'job_code' },
+      {
+        calculate: "datum.key === '__none__' ? '(no queue_top_failed telemetry)' : datum.key",
+        as: 'job_code',
+      },
       { calculate: 'isValid(datum.max_failures.value) ? datum.max_failures.value : 0', as: 'failures_24h' },
     ],
     mark: { type: 'bar', color: '#dc2626' },
@@ -1566,13 +1578,12 @@ function buildSavedObjects(): SavedObject[] {
           size: 0,
           query: buildDashboardContextQuery([
             { term: { 'event.dataset.keyword': 'cron.scheduler' } },
-            { exists: { field: 'cron.task.max_age_s' } },
-            { exists: { field: 'cron.task.job_code.keyword' } },
           ]),
           aggs: {
             jobs: {
               terms: {
                 field: 'cron.task.job_code.keyword',
+                missing: '__none__',
                 size: 15,
                 order: { max_age: 'desc' },
               },
@@ -1587,7 +1598,10 @@ function buildSavedObjects(): SavedObject[] {
       format: { property: 'aggregations.jobs.buckets' },
     },
     transform: [
-      { calculate: 'datum.key', as: 'job_code' },
+      {
+        calculate: "datum.key === '__none__' ? '(no queue_top_overdue telemetry)' : datum.key",
+        as: 'job_code',
+      },
       { calculate: 'isValid(datum.max_age.value) ? datum.max_age.value : 0', as: 'max_age_s' },
       { calculate: 'isValid(datum.overdue_max.value) ? datum.overdue_max.value : 0', as: 'overdue' },
     ],
@@ -1613,7 +1627,6 @@ function buildSavedObjects(): SavedObject[] {
           size: 0,
           query: buildDashboardContextQuery([
             { term: { 'event.dataset.keyword': 'cron.scheduler' } },
-            { exists: { field: 'cron.discovered_groups' } },
           ]),
           aggs: {
             timeline: {
@@ -1621,6 +1634,10 @@ function buildSavedObjects(): SavedObject[] {
                 field: '@timestamp',
                 fixed_interval: '5m',
                 min_doc_count: 0,
+                extended_bounds: {
+                  min: { '%timefilter%': 'min' },
+                  max: { '%timefilter%': 'max' },
+                },
               },
               aggs: {
                 discovered_max: { max: { field: 'cron.discovered_groups' } },
@@ -1633,8 +1650,8 @@ function buildSavedObjects(): SavedObject[] {
     },
     transform: [
       { calculate: 'toDate(datum.key_as_string)', as: 'timestamp' },
-      { calculate: 'datum.discovered_max.value', as: 'discovered_groups' },
-      { filter: 'isValid(datum.discovered_groups)' },
+      { calculate: 'isValid(datum.discovered_max.value) ? datum.discovered_max.value : 0', as: 'discovered_groups' },
+      { filter: 'isValid(datum.discovered_groups) && isFinite(datum.discovered_groups)' },
     ],
     mark: { type: 'line', point: false, color: '#2563eb' },
     encoding: {
@@ -1657,7 +1674,6 @@ function buildSavedObjects(): SavedObject[] {
           size: 0,
           query: buildDashboardContextQuery([
             { term: { 'event.dataset.keyword': 'cron.scheduler' } },
-            { exists: { field: 'cron.warning' } },
           ]),
           aggs: {
             timeline: {
@@ -1665,6 +1681,13 @@ function buildSavedObjects(): SavedObject[] {
                 field: '@timestamp',
                 fixed_interval: '5m',
                 min_doc_count: 0,
+                extended_bounds: {
+                  min: { '%timefilter%': 'min' },
+                  max: { '%timefilter%': 'max' },
+                },
+              },
+              aggs: {
+                warnings: { filter: { exists: { field: 'cron.warning' } } },
               },
             },
           },
@@ -1674,7 +1697,7 @@ function buildSavedObjects(): SavedObject[] {
     },
     transform: [
       { calculate: 'toDate(datum.key_as_string)', as: 'timestamp' },
-      { calculate: 'datum.doc_count', as: 'warning_events' },
+      { calculate: 'datum.warnings.doc_count', as: 'warning_events' },
     ],
     mark: { type: 'line', point: false, color: '#dc2626' },
     encoding: {

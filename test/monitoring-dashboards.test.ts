@@ -145,10 +145,18 @@ describe('monitoring-dashboards helpers', () => {
   it('uses cron.scheduler dataset for cron queue visualizations and saved search', () => {
     const objects = __testing.buildSavedObjects();
     const cronQueueDepthTrend = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-cron-queue-depth-trend');
+    const cronWarningTrend = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-cron-warning-trend');
+    const cronTopFailedTasks = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-cron-top-failed-tasks');
     const cronSearch = objects.find((object) => object.type === 'search' && object.id === 'mz-search-cron-logs');
 
     const queueDepthSpec = JSON.parse(
       String((JSON.parse(String(cronQueueDepthTrend?.attributes?.visState || '{}'))?.params?.spec) || '{}'),
+    ) as Record<string, unknown>;
+    const warningTrendSpec = JSON.parse(
+      String((JSON.parse(String(cronWarningTrend?.attributes?.visState || '{}'))?.params?.spec) || '{}'),
+    ) as Record<string, unknown>;
+    const topFailedSpec = JSON.parse(
+      String((JSON.parse(String(cronTopFailedTasks?.attributes?.visState || '{}'))?.params?.spec) || '{}'),
     ) as Record<string, unknown>;
     const searchSource = JSON.parse(
       String((cronSearch?.attributes?.kibanaSavedObjectMeta as Record<string, unknown>)?.searchSourceJSON || '{}'),
@@ -160,6 +168,11 @@ describe('monitoring-dashboards helpers', () => {
 
     expect(JSON.stringify(queueDepthSpec)).toContain('cron.scheduler');
     expect(JSON.stringify(queueDepthSpec)).toContain('cron.queue.backlog_due');
+    expect(JSON.stringify(queueDepthSpec)).toContain('%timefilter%');
+    expect(JSON.stringify(queueDepthSpec)).not.toContain('"exists":{"field":"cron.queue.backlog_due"}');
+    expect(JSON.stringify(warningTrendSpec)).toContain('"warnings":{"filter":{"exists":{"field":"cron.warning"}}}');
+    expect(JSON.stringify(topFailedSpec)).toContain('"missing":"__none__"');
+    expect(JSON.stringify(topFailedSpec)).toContain('(no queue_top_failed telemetry)');
     expect(String(query.query || '')).toContain('cron.scheduler');
     expect(columns).toContain('cron.queue.backlog_due');
     expect(columns).toContain('cron.task.job_code');

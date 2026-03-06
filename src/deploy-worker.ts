@@ -3246,7 +3246,19 @@ function serviceUsesCronSupervisor(spec: ServiceCommandSpec | null): boolean {
     return false;
   }
   const joined = [...(spec.command || []), ...(spec.args || [])].join(' ');
-  return joined.includes('cron:run --group=') || joined.includes('mz-cron-supervisor.sh');
+  if (!joined.includes('cron:run --group=') && !joined.includes('mz-cron-supervisor.sh')) {
+    return false;
+  }
+
+  if (joined.includes('mz-cron-supervisor.sh')) {
+    return true;
+  }
+
+  // Inline supervisor variants must include queue telemetry markers; older inline loops
+  // had grouped execution but no queue/task snapshot logging for observability.
+  return joined.includes('queue status=')
+    && joined.includes('queue_top_failed')
+    && joined.includes('queue_top_overdue');
 }
 
 async function inspectServiceCommandSpec(serviceName: string): Promise<ServiceCommandSpec | null> {
@@ -5655,4 +5667,5 @@ export const __testing = {
   resolveDirectDatabaseRoute,
   resolveAggressivePruneCutoffSeconds,
   getHistoryLastSuccessfulDeployAt,
+  serviceUsesCronSupervisor,
 };

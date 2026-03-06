@@ -1,7 +1,7 @@
 {
-  "version": "0.4.95",
+  "version": "0.4.96",
   "date": "2026-03-06",
-  "summary": "Skip ProxySQL readiness stabilization checks when ProxySQL is intentionally absent or scaled to zero",
+  "summary": "Harden cron dashboard no-data handling and require queue telemetry markers when validating inline cron supervisor commands",
   "requires": {
     "cloud-swarm": ">=1.0.42"
   },
