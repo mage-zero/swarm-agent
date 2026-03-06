@@ -1304,6 +1304,63 @@ async function queryProxySqlHostgroups(environmentId: number): Promise<Array<{ h
   return parseProxySqlHostgroups(result.stdout);
 }
 
+async function probeProxySqlDataPlane(
+  environmentId: number,
+): Promise<{ ok: boolean; note: string; details?: string[] }> {
+  const proxysqlService = `mz-env-${environmentId}_proxysql`;
+  const proxysqlSpec = await inspectServiceSpec(proxysqlService);
+  if (!proxysqlSpec) {
+    return { ok: false, note: `Missing service: ${proxysqlService}` };
+  }
+
+  const databaseSpec = await inspectServiceSpec(`mz-env-${environmentId}_database`);
+  const clientImage = databaseSpec?.image || 'mariadb:11';
+  const networkName = pickNetworkName(proxysqlSpec) || (databaseSpec ? pickNetworkName(databaseSpec) : null) || 'mz-backend';
+
+  const dbUser = String(proxysqlSpec.env.MZ_PROXYSQL_DB_USER || 'magento').trim() || 'magento';
+  const passwordFile = path.posix.basename(String(proxysqlSpec.env.MZ_PROXYSQL_DB_PASSWORD_FILE || '/run/secrets/db_password'));
+  let dbPasswordSecret = pickSecretName(proxysqlSpec, passwordFile);
+  if (!dbPasswordSecret && databaseSpec) {
+    dbPasswordSecret = pickSecretName(databaseSpec, passwordFile);
+  }
+  if (!dbPasswordSecret) {
+    return { ok: false, note: `Unable to resolve ${passwordFile} secret for ProxySQL probe` };
+  }
+
+  const command = [
+    'set -e',
+    'CLIENT=""',
+    'if command -v mariadb >/dev/null 2>&1; then CLIENT="mariadb"; elif command -v mysql >/dev/null 2>&1; then CLIENT="mysql"; fi',
+    'if [ -z "$CLIENT" ]; then echo "missing mariadb/mysql client" >&2; exit 2; fi',
+    'DB_PASS="$(cat /run/secrets/db_password)"',
+    '$CLIENT -h "$PROXY_HOST" -P 6033 -u "$PROXY_USER" -p"$DB_PASS" -N -B -e "SELECT 1"',
+  ].join(' && ');
+
+  const job = await runSwarmJob({
+    name: buildJobName('proxysql-dataplane-probe', environmentId),
+    image: clientImage,
+    entrypoint: 'sh',
+    command: ['-lc', command],
+    networks: [networkName],
+    secrets: [{ source: dbPasswordSecret, target: 'db_password' }],
+    env: {
+      PROXY_HOST: proxysqlService,
+      PROXY_USER: dbUser,
+    },
+    timeout_ms: 20_000,
+  });
+
+  if (!job.ok) {
+    return {
+      ok: false,
+      note: job.error || 'ProxySQL dataplane probe failed',
+      details: job.details || [],
+    };
+  }
+
+  return { ok: true, note: 'ProxySQL dataplane query succeeded on port 6033.' };
+}
+
 async function waitForProxySqlWriter(environmentId: number, writerHost: string, timeoutMs = 30_000): Promise<boolean> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -2116,12 +2173,32 @@ async function runProxySqlReady(environmentId: number): Promise<RunbookResult> {
 
   const rows = await queryProxySqlHostgroups(environmentId);
   if (!rows.length) {
+    const dataplane = await probeProxySqlDataPlane(environmentId);
+    if (dataplane.ok) {
+      return {
+        runbook_id: 'proxysql_ready',
+        status: 'ok',
+        summary: 'ProxySQL ready (data-plane reachable; admin readiness unconfirmed).',
+        observations: [
+          ...observations,
+          'Unable to query ProxySQL admin interface (6032) over the overlay network.',
+          dataplane.note,
+          ...(dataplane.details || []),
+        ],
+        data: { service: spec, task_node: node, admin_probe: 'unavailable', dataplane_probe: 'ok' },
+      };
+    }
     return {
       runbook_id: 'proxysql_ready',
       status: 'warning',
       summary: 'ProxySQL is running but admin readiness is unconfirmed.',
-      observations: [...observations, 'Unable to query ProxySQL admin interface (6032) over the overlay network.'],
-      data: { service: spec, task_node: node },
+      observations: [
+        ...observations,
+        'Unable to query ProxySQL admin interface (6032) over the overlay network.',
+        `Data-plane probe failed: ${dataplane.note}`,
+        ...(dataplane.details || []),
+      ],
+      data: { service: spec, task_node: node, admin_probe: 'unavailable', dataplane_probe: 'failed' },
     };
   }
 

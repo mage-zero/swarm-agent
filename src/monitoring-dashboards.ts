@@ -47,8 +47,13 @@ const VIS_VARNISH_HIT_RATE_TREND_ID = 'mz-vis-varnish-hit-rate-trend';
 const VIS_VARNISH_HANDLING_BREAKDOWN_ID = 'mz-vis-varnish-handling-breakdown';
 const VIS_VARNISH_LATENCY_TREND_ID = 'mz-vis-varnish-latency-trend';
 const VIS_CRON_STATUS_TREND_ID = 'mz-vis-cron-status-trend';
+const VIS_CRON_QUEUE_DEPTH_TREND_ID = 'mz-vis-cron-queue-depth-trend';
+const VIS_CRON_QUEUE_AGE_TREND_ID = 'mz-vis-cron-queue-age-trend';
+const VIS_CRON_QUEUE_FAILURE_WINDOW_ID = 'mz-vis-cron-queue-failure-window';
 const VIS_CRON_NON_OK_GROUPS_ID = 'mz-vis-cron-nonok-groups';
 const VIS_CRON_SKIPPED_GROUPS_ID = 'mz-vis-cron-skipped-groups';
+const VIS_CRON_TOP_FAILED_TASKS_ID = 'mz-vis-cron-top-failed-tasks';
+const VIS_CRON_TOP_OVERDUE_TASKS_ID = 'mz-vis-cron-top-overdue-tasks';
 const VIS_CRON_DISCOVERED_GROUPS_TREND_ID = 'mz-vis-cron-discovered-groups-trend';
 const VIS_CRON_WARNING_TREND_ID = 'mz-vis-cron-warning-trend';
 const DASHBOARD_OPS_ID = 'mz-dashboard-ops';
@@ -1244,6 +1249,179 @@ function buildSavedObjects(): SavedObject[] {
     },
   };
 
+  const cronQueueDepthTrendSpec = {
+    $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
+    title: 'Cron Queue Depth (Due Backlog vs Running)',
+    data: {
+      url: {
+        index: 'mz-logs-*',
+        body: {
+          size: 0,
+          query: buildDashboardContextQuery([
+            { term: { 'event.dataset.keyword': 'cron.scheduler' } },
+            { exists: { field: 'cron.queue.backlog_due' } },
+          ]),
+          aggs: {
+            timeline: {
+              date_histogram: {
+                field: '@timestamp',
+                fixed_interval: '1m',
+                min_doc_count: 0,
+              },
+              aggs: {
+                backlog_max: { max: { field: 'cron.queue.backlog_due' } },
+                running_max: { max: { field: 'cron.queue.running' } },
+              },
+            },
+          },
+        },
+      },
+      format: { property: 'aggregations.timeline.buckets' },
+    },
+    transform: [
+      { calculate: 'toDate(datum.key_as_string)', as: 'timestamp' },
+      { calculate: 'isValid(datum.backlog_max.value) ? datum.backlog_max.value : null', as: 'backlog_due' },
+      { calculate: 'isValid(datum.running_max.value) ? datum.running_max.value : null', as: 'running' },
+      { fold: ['backlog_due', 'running'], as: ['series', 'tasks'] },
+      { filter: 'isValid(datum.tasks)' },
+      { calculate: "datum.series === 'backlog_due' ? 'Due backlog' : 'Running now'", as: 'series_label' },
+    ],
+    mark: { type: 'line', point: false },
+    encoding: {
+      x: { field: 'timestamp', type: 'temporal', title: 'Time' },
+      y: { field: 'tasks', type: 'quantitative', title: 'Tasks' },
+      color: {
+        field: 'series_label',
+        type: 'nominal',
+        title: 'Series',
+        scale: { domain: ['Due backlog', 'Running now'], range: ['#dc2626', '#2563eb'] },
+      },
+      tooltip: [
+        { field: 'timestamp', type: 'temporal', title: 'Time' },
+        { field: 'series_label', type: 'nominal', title: 'Series' },
+        { field: 'tasks', type: 'quantitative', title: 'Tasks' },
+      ],
+    },
+  };
+
+  const cronQueueAgeTrendSpec = {
+    $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
+    title: 'Cron Queue Staleness (oldest ages, seconds)',
+    data: {
+      url: {
+        index: 'mz-logs-*',
+        body: {
+          size: 0,
+          query: buildDashboardContextQuery([
+            { term: { 'event.dataset.keyword': 'cron.scheduler' } },
+            { exists: { field: 'cron.queue.oldest_due_s' } },
+          ]),
+          aggs: {
+            timeline: {
+              date_histogram: {
+                field: '@timestamp',
+                fixed_interval: '1m',
+                min_doc_count: 0,
+              },
+              aggs: {
+                oldest_due_max: { max: { field: 'cron.queue.oldest_due_s' } },
+                oldest_running_max: { max: { field: 'cron.queue.oldest_running_s' } },
+              },
+            },
+          },
+        },
+      },
+      format: { property: 'aggregations.timeline.buckets' },
+    },
+    transform: [
+      { calculate: 'toDate(datum.key_as_string)', as: 'timestamp' },
+      { calculate: 'isValid(datum.oldest_due_max.value) ? datum.oldest_due_max.value : null', as: 'oldest_due_s' },
+      { calculate: 'isValid(datum.oldest_running_max.value) ? datum.oldest_running_max.value : null', as: 'oldest_running_s' },
+      { fold: ['oldest_due_s', 'oldest_running_s'], as: ['series', 'age_seconds'] },
+      { filter: 'isValid(datum.age_seconds)' },
+      { calculate: "datum.series === 'oldest_due_s' ? 'Oldest due pending' : 'Oldest running'", as: 'series_label' },
+    ],
+    mark: { type: 'line', point: false },
+    encoding: {
+      x: { field: 'timestamp', type: 'temporal', title: 'Time' },
+      y: { field: 'age_seconds', type: 'quantitative', title: 'Age seconds' },
+      color: {
+        field: 'series_label',
+        type: 'nominal',
+        title: 'Series',
+        scale: { domain: ['Oldest due pending', 'Oldest running'], range: ['#b91c1c', '#7c3aed'] },
+      },
+      tooltip: [
+        { field: 'timestamp', type: 'temporal', title: 'Time' },
+        { field: 'series_label', type: 'nominal', title: 'Series' },
+        { field: 'age_seconds', type: 'quantitative', title: 'Age seconds' },
+      ],
+    },
+  };
+
+  const cronQueueFailureWindowSpec = {
+    $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
+    title: 'Cron Failures/Misses Window',
+    data: {
+      url: {
+        index: 'mz-logs-*',
+        body: {
+          size: 0,
+          query: buildDashboardContextQuery([
+            { term: { 'event.dataset.keyword': 'cron.scheduler' } },
+            { exists: { field: 'cron.queue.failed_1h' } },
+          ]),
+          aggs: {
+            timeline: {
+              date_histogram: {
+                field: '@timestamp',
+                fixed_interval: '5m',
+                min_doc_count: 0,
+              },
+              aggs: {
+                failed_1h_max: { max: { field: 'cron.queue.failed_1h' } },
+                missed_1h_max: { max: { field: 'cron.queue.missed_1h' } },
+                success_5m_max: { max: { field: 'cron.queue.success_5m' } },
+              },
+            },
+          },
+        },
+      },
+      format: { property: 'aggregations.timeline.buckets' },
+    },
+    transform: [
+      { calculate: 'toDate(datum.key_as_string)', as: 'timestamp' },
+      { calculate: 'isValid(datum.failed_1h_max.value) ? datum.failed_1h_max.value : null', as: 'failed_1h' },
+      { calculate: 'isValid(datum.missed_1h_max.value) ? datum.missed_1h_max.value : null', as: 'missed_1h' },
+      { calculate: 'isValid(datum.success_5m_max.value) ? datum.success_5m_max.value : null', as: 'success_5m' },
+      { fold: ['failed_1h', 'missed_1h', 'success_5m'], as: ['series', 'tasks'] },
+      { filter: 'isValid(datum.tasks)' },
+      {
+        calculate: "datum.series === 'failed_1h' ? 'Failed (last 1h)' : (datum.series === 'missed_1h' ? 'Missed (last 1h)' : 'Success (last 5m)')",
+        as: 'series_label',
+      },
+    ],
+    mark: { type: 'line', point: false },
+    encoding: {
+      x: { field: 'timestamp', type: 'temporal', title: 'Time' },
+      y: { field: 'tasks', type: 'quantitative', title: 'Tasks' },
+      color: {
+        field: 'series_label',
+        type: 'nominal',
+        title: 'Series',
+        scale: {
+          domain: ['Failed (last 1h)', 'Missed (last 1h)', 'Success (last 5m)'],
+          range: ['#dc2626', '#f59e0b', '#16a34a'],
+        },
+      },
+      tooltip: [
+        { field: 'timestamp', type: 'temporal', title: 'Time' },
+        { field: 'series_label', type: 'nominal', title: 'Series' },
+        { field: 'tasks', type: 'quantitative', title: 'Tasks' },
+      ],
+    },
+  };
+
   const cronNonOkGroupsSpec = {
     $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
     title: 'Cron Non-OK Groups',
@@ -1330,6 +1508,97 @@ function buildSavedObjects(): SavedObject[] {
       tooltip: [
         { field: 'group_label', type: 'nominal', title: 'Group' },
         { field: 'skipped_events', type: 'quantitative', title: 'Skipped events' },
+      ],
+    },
+  };
+
+  const cronTopFailedTasksSpec = {
+    $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
+    title: 'Top Failed Jobs (24h)',
+    data: {
+      url: {
+        index: 'mz-logs-*',
+        body: {
+          size: 0,
+          query: buildDashboardContextQuery([
+            { term: { 'event.dataset.keyword': 'cron.scheduler' } },
+            { exists: { field: 'cron.task.failures_24h' } },
+            { exists: { field: 'cron.task.job_code.keyword' } },
+          ]),
+          aggs: {
+            jobs: {
+              terms: {
+                field: 'cron.task.job_code.keyword',
+                size: 15,
+                order: { max_failures: 'desc' },
+              },
+              aggs: {
+                max_failures: { max: { field: 'cron.task.failures_24h' } },
+              },
+            },
+          },
+        },
+      },
+      format: { property: 'aggregations.jobs.buckets' },
+    },
+    transform: [
+      { calculate: 'datum.key', as: 'job_code' },
+      { calculate: 'isValid(datum.max_failures.value) ? datum.max_failures.value : 0', as: 'failures_24h' },
+    ],
+    mark: { type: 'bar', color: '#dc2626' },
+    encoding: {
+      y: { field: 'job_code', type: 'nominal', sort: '-x', title: 'Job code' },
+      x: { field: 'failures_24h', type: 'quantitative', title: 'Failures (24h)' },
+      tooltip: [
+        { field: 'job_code', type: 'nominal', title: 'Job code' },
+        { field: 'failures_24h', type: 'quantitative', title: 'Failures (24h)' },
+      ],
+    },
+  };
+
+  const cronTopOverdueTasksSpec = {
+    $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
+    title: 'Top Overdue Pending Jobs',
+    data: {
+      url: {
+        index: 'mz-logs-*',
+        body: {
+          size: 0,
+          query: buildDashboardContextQuery([
+            { term: { 'event.dataset.keyword': 'cron.scheduler' } },
+            { exists: { field: 'cron.task.max_age_s' } },
+            { exists: { field: 'cron.task.job_code.keyword' } },
+          ]),
+          aggs: {
+            jobs: {
+              terms: {
+                field: 'cron.task.job_code.keyword',
+                size: 15,
+                order: { max_age: 'desc' },
+              },
+              aggs: {
+                max_age: { max: { field: 'cron.task.max_age_s' } },
+                overdue_max: { max: { field: 'cron.task.overdue' } },
+              },
+            },
+          },
+        },
+      },
+      format: { property: 'aggregations.jobs.buckets' },
+    },
+    transform: [
+      { calculate: 'datum.key', as: 'job_code' },
+      { calculate: 'isValid(datum.max_age.value) ? datum.max_age.value : 0', as: 'max_age_s' },
+      { calculate: 'isValid(datum.overdue_max.value) ? datum.overdue_max.value : 0', as: 'overdue' },
+    ],
+    mark: { type: 'bar', color: '#b91c1c' },
+    encoding: {
+      y: { field: 'job_code', type: 'nominal', sort: '-x', title: 'Job code' },
+      x: { field: 'max_age_s', type: 'quantitative', title: 'Max overdue age (s)' },
+      tooltip: [
+        { field: 'job_code', type: 'nominal', title: 'Job code' },
+        { field: 'max_age_s', type: 'quantitative', title: 'Max overdue age (s)' },
+        { field: 'overdue', type: 'quantitative', title: 'Overdue tasks' },
       ],
     },
   };
@@ -1526,7 +1795,7 @@ function buildSavedObjects(): SavedObject[] {
   const cronDashboardPanels = JSON.stringify([
     {
       panelIndex: '1',
-      gridData: { x: 0, y: 0, w: 24, h: 14, i: '1' },
+      gridData: { x: 0, y: 0, w: 16, h: 12, i: '1' },
       type: 'visualization',
       id: VIS_CRON_STATUS_TREND_ID,
       embeddableConfig: {},
@@ -1534,39 +1803,79 @@ function buildSavedObjects(): SavedObject[] {
     },
     {
       panelIndex: '2',
-      gridData: { x: 24, y: 0, w: 24, h: 14, i: '2' },
+      gridData: { x: 16, y: 0, w: 16, h: 12, i: '2' },
+      type: 'visualization',
+      id: VIS_CRON_QUEUE_DEPTH_TREND_ID,
+      embeddableConfig: {},
+      version: '8.0.0',
+    },
+    {
+      panelIndex: '3',
+      gridData: { x: 32, y: 0, w: 16, h: 12, i: '3' },
+      type: 'visualization',
+      id: VIS_CRON_QUEUE_AGE_TREND_ID,
+      embeddableConfig: {},
+      version: '8.0.0',
+    },
+    {
+      panelIndex: '4',
+      gridData: { x: 0, y: 12, w: 16, h: 12, i: '4' },
+      type: 'visualization',
+      id: VIS_CRON_QUEUE_FAILURE_WINDOW_ID,
+      embeddableConfig: {},
+      version: '8.0.0',
+    },
+    {
+      panelIndex: '5',
+      gridData: { x: 16, y: 12, w: 16, h: 12, i: '5' },
       type: 'visualization',
       id: VIS_CRON_NON_OK_GROUPS_ID,
       embeddableConfig: {},
       version: '8.0.0',
     },
     {
-      panelIndex: '3',
-      gridData: { x: 0, y: 14, w: 24, h: 15, i: '3' },
+      panelIndex: '6',
+      gridData: { x: 32, y: 12, w: 16, h: 12, i: '6' },
       type: 'visualization',
       id: VIS_CRON_SKIPPED_GROUPS_ID,
       embeddableConfig: {},
       version: '8.0.0',
     },
     {
-      panelIndex: '4',
-      gridData: { x: 24, y: 14, w: 24, h: 15, i: '4' },
+      panelIndex: '7',
+      gridData: { x: 0, y: 24, w: 16, h: 12, i: '7' },
+      type: 'visualization',
+      id: VIS_CRON_TOP_FAILED_TASKS_ID,
+      embeddableConfig: {},
+      version: '8.0.0',
+    },
+    {
+      panelIndex: '8',
+      gridData: { x: 16, y: 24, w: 16, h: 12, i: '8' },
+      type: 'visualization',
+      id: VIS_CRON_TOP_OVERDUE_TASKS_ID,
+      embeddableConfig: {},
+      version: '8.0.0',
+    },
+    {
+      panelIndex: '9',
+      gridData: { x: 32, y: 24, w: 16, h: 12, i: '9' },
       type: 'visualization',
       id: VIS_CRON_DISCOVERED_GROUPS_TREND_ID,
       embeddableConfig: {},
       version: '8.0.0',
     },
     {
-      panelIndex: '5',
-      gridData: { x: 0, y: 29, w: 24, h: 14, i: '5' },
+      panelIndex: '10',
+      gridData: { x: 0, y: 36, w: 16, h: 12, i: '10' },
       type: 'visualization',
       id: VIS_CRON_WARNING_TREND_ID,
       embeddableConfig: {},
       version: '8.0.0',
     },
     {
-      panelIndex: '6',
-      gridData: { x: 24, y: 29, w: 24, h: 14, i: '6' },
+      panelIndex: '11',
+      gridData: { x: 16, y: 36, w: 32, h: 12, i: '11' },
       type: 'search',
       id: SEARCH_CRON_LOGS_ID,
       embeddableConfig: {},
@@ -1688,7 +1997,20 @@ function buildSavedObjects(): SavedObject[] {
           'mz.env_id',
           'cron.group',
           'cron.status',
+          'cron.queue.status',
+          'cron.queue.backlog_due',
+          'cron.queue.oldest_due_s',
+          'cron.queue.running',
+          'cron.queue.oldest_running_s',
+          'cron.queue.failed_1h',
+          'cron.queue.missed_1h',
+          'cron.queue.success_5m',
+          'cron.task.job_code',
+          'cron.task.failures_24h',
+          'cron.task.overdue',
+          'cron.task.max_age_s',
           'cron.reason',
+          'cron.queue.reason',
           'cron.exit',
           'cron.timeout_s',
           'cron.discovered_groups',
@@ -1996,6 +2318,63 @@ function buildSavedObjects(): SavedObject[] {
     },
     {
       type: 'visualization',
+      id: VIS_CRON_QUEUE_DEPTH_TREND_ID,
+      attributes: {
+        title: 'Cron Queue Depth (Due Backlog vs Running)',
+        visState: JSON.stringify({
+          title: 'Cron Queue Depth (Due Backlog vs Running)',
+          type: 'vega',
+          aggs: [],
+          params: { spec: JSON.stringify(cronQueueDepthTrendSpec) },
+        }),
+        uiStateJSON: '{}',
+        description: '',
+        version: 1,
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: cronLogsSearchSource,
+        },
+      },
+    },
+    {
+      type: 'visualization',
+      id: VIS_CRON_QUEUE_AGE_TREND_ID,
+      attributes: {
+        title: 'Cron Queue Staleness (oldest ages, seconds)',
+        visState: JSON.stringify({
+          title: 'Cron Queue Staleness (oldest ages, seconds)',
+          type: 'vega',
+          aggs: [],
+          params: { spec: JSON.stringify(cronQueueAgeTrendSpec) },
+        }),
+        uiStateJSON: '{}',
+        description: '',
+        version: 1,
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: cronLogsSearchSource,
+        },
+      },
+    },
+    {
+      type: 'visualization',
+      id: VIS_CRON_QUEUE_FAILURE_WINDOW_ID,
+      attributes: {
+        title: 'Cron Failures/Misses Window',
+        visState: JSON.stringify({
+          title: 'Cron Failures/Misses Window',
+          type: 'vega',
+          aggs: [],
+          params: { spec: JSON.stringify(cronQueueFailureWindowSpec) },
+        }),
+        uiStateJSON: '{}',
+        description: '',
+        version: 1,
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: cronLogsSearchSource,
+        },
+      },
+    },
+    {
+      type: 'visualization',
       id: VIS_CRON_NON_OK_GROUPS_ID,
       attributes: {
         title: 'Cron Non-OK Groups',
@@ -2004,6 +2383,44 @@ function buildSavedObjects(): SavedObject[] {
           type: 'vega',
           aggs: [],
           params: { spec: JSON.stringify(cronNonOkGroupsSpec) },
+        }),
+        uiStateJSON: '{}',
+        description: '',
+        version: 1,
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: cronLogsSearchSource,
+        },
+      },
+    },
+    {
+      type: 'visualization',
+      id: VIS_CRON_TOP_FAILED_TASKS_ID,
+      attributes: {
+        title: 'Top Failed Jobs (24h)',
+        visState: JSON.stringify({
+          title: 'Top Failed Jobs (24h)',
+          type: 'vega',
+          aggs: [],
+          params: { spec: JSON.stringify(cronTopFailedTasksSpec) },
+        }),
+        uiStateJSON: '{}',
+        description: '',
+        version: 1,
+        kibanaSavedObjectMeta: {
+          searchSourceJSON: cronLogsSearchSource,
+        },
+      },
+    },
+    {
+      type: 'visualization',
+      id: VIS_CRON_TOP_OVERDUE_TASKS_ID,
+      attributes: {
+        title: 'Top Overdue Pending Jobs',
+        visState: JSON.stringify({
+          title: 'Top Overdue Pending Jobs',
+          type: 'vega',
+          aggs: [],
+          params: { spec: JSON.stringify(cronTopOverdueTasksSpec) },
         }),
         uiStateJSON: '{}',
         description: '',
@@ -2154,7 +2571,7 @@ function buildSavedObjects(): SavedObject[] {
       attributes: {
         title: '4) Cron',
         hits: 0,
-        description: 'Cron scheduler status, contention, warnings, and raw execution logs.',
+        description: 'Cron scheduler backlog, task staleness, failures, contention, and raw execution logs.',
         panelsJSON: cronDashboardPanels,
         optionsJSON: JSON.stringify({
           useMargins: true,

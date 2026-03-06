@@ -1,9 +1,17 @@
 {
-  "version": "0.4.91",
+  "version": "0.4.92",
   "date": "2026-03-05",
-  "summary": "Treat database replica as optional during stabilization when the replica service is intentionally disabled",
+  "summary": "Add cron queue/task observability dashboards and rollout migration for backlog and staleness monitoring",
   "requires": {
-    "cloud-swarm": ">=1.0.39"
+    "cloud-swarm": ">=1.0.40"
   },
-  "changes": []
+  "changes": [
+    {
+      "id": "refresh-monitoring-cron-dashboard-v2",
+      "description": "Rebuild and redeploy monitoring assets, reconnect cloudflared, and bootstrap dashboards to roll out cron queue/task observability panels for backlog, staleness, and top failing/overdue jobs across existing stacks.",
+      "phase": "pre_migrate",
+      "downtimeMinutes": 0,
+      "scope": "stack"
+    }
+  ]
 }

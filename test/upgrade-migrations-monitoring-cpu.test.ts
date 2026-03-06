@@ -206,6 +206,78 @@ describe('refresh-monitoring-cpu-schema-v1 migration', () => {
     ).toBe(true);
   });
 
+  it('refreshes cron queue observability assets via v2 migration', async () => {
+    process.env.REGISTRY_PULL_HOST = '127.0.0.1';
+    const root = createCloudSwarmFixture();
+    tempDirs.push(root);
+    const cloudSwarmDir = path.join(root, 'cloud-swarm');
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        stack: {
+          stack_type: 'production',
+          dashboards_hostname: 'dashboards.example.test',
+        },
+      }),
+      text: async () => '',
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    bootstrapMonitoringDashboardsWithRetryMock.mockResolvedValue({
+      dashboard_id: 'mz-dashboard-ops',
+      dashboard_ids: ['mz-dashboard-ops', 'mz-dashboard-magento-containers', 'mz-dashboard-varnish', 'mz-dashboard-cron'],
+      upserted_objects: 36,
+      container_id: 'cronv2',
+    });
+
+    runCommandMock.mockImplementation(async (command, args) => {
+      const entries = args.map((entry) => String(entry));
+      if (command === 'git') {
+        return { code: 0, stdout: '', stderr: '' };
+      }
+      if (command === 'docker' && entries[0] === 'network' && entries[1] === 'create') {
+        return { code: 1, stdout: '', stderr: 'already exists' };
+      }
+      if (command === 'docker' && entries[0] === 'service' && entries[1] === 'ls') {
+        return { code: 0, stdout: 'mz-edge-cloudflared\n', stderr: '' };
+      }
+      if (command === 'docker' && entries[0] === 'service' && entries[1] === 'update') {
+        return { code: 0, stdout: '', stderr: '' };
+      }
+      if (command === 'docker' && entries[0] === 'stack' && entries[1] === 'deploy') {
+        return { code: 0, stdout: '', stderr: '' };
+      }
+      if (command === 'bash') {
+        return { code: 0, stdout: '', stderr: '' };
+      }
+      return { code: 0, stdout: '', stderr: '' };
+    });
+
+    await executeMigration('refresh-monitoring-cron-dashboard-v2', {
+      stackId: 44,
+      mzControlBaseUrl: 'https://control.example',
+      nodeId: 'node-1',
+      nodeSecret: 'secret',
+      cloudSwarmDir,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(bootstrapMonitoringDashboardsWithRetryMock).toHaveBeenCalledTimes(1);
+    expect(
+      runCommandMock.mock.calls.some(([command, args]) => (
+        command === 'bash'
+        && Array.isArray(args)
+        && String(args[0]) === path.join(cloudSwarmDir, 'scripts', 'build-monitoring.sh')
+      )),
+    ).toBe(true);
+    expect(
+      runCommandMock.mock.calls.some(([command, args]) => (
+        command === 'docker'
+        && Array.isArray(args)
+        && args.slice(0, 2).map(String).join(' ') === 'stack deploy'
+      )),
+    ).toBe(true);
+  });
+
   it('skips non-monitoring stack types', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,

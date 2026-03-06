@@ -55,6 +55,8 @@ describe('monitoring-dashboards helpers', () => {
     const statusTrend = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-varnish-status-trend');
     const hitRateTrend = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-varnish-hit-rate-trend');
     const cronStatusTrend = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-cron-status-trend');
+    const cronQueueDepthTrend = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-cron-queue-depth-trend');
+    const cronTopFailedTasks = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-cron-top-failed-tasks');
     const cronSearch = objects.find((object) => object.type === 'search' && object.id === 'mz-search-cron-logs');
 
     expect(varnishDashboard).toBeTruthy();
@@ -62,6 +64,8 @@ describe('monitoring-dashboards helpers', () => {
     expect(statusTrend).toBeTruthy();
     expect(hitRateTrend).toBeTruthy();
     expect(cronStatusTrend).toBeTruthy();
+    expect(cronQueueDepthTrend).toBeTruthy();
+    expect(cronTopFailedTasks).toBeTruthy();
     expect(cronSearch).toBeTruthy();
     expect(varnishDashboard?.attributes?.title).toBe('3) Varnish');
     expect(cronDashboard?.attributes?.title).toBe('4) Cron');
@@ -138,13 +142,13 @@ describe('monitoring-dashboards helpers', () => {
     expect(JSON.stringify(trendTransform)).toContain('isValid(datum.point.cpu_avg)');
   });
 
-  it('uses cron.scheduler dataset for cron visualizations and saved search', () => {
+  it('uses cron.scheduler dataset for cron queue visualizations and saved search', () => {
     const objects = __testing.buildSavedObjects();
-    const cronStatusTrend = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-cron-status-trend');
+    const cronQueueDepthTrend = objects.find((object) => object.type === 'visualization' && object.id === 'mz-vis-cron-queue-depth-trend');
     const cronSearch = objects.find((object) => object.type === 'search' && object.id === 'mz-search-cron-logs');
 
-    const statusSpec = JSON.parse(
-      String((JSON.parse(String(cronStatusTrend?.attributes?.visState || '{}'))?.params?.spec) || '{}'),
+    const queueDepthSpec = JSON.parse(
+      String((JSON.parse(String(cronQueueDepthTrend?.attributes?.visState || '{}'))?.params?.spec) || '{}'),
     ) as Record<string, unknown>;
     const searchSource = JSON.parse(
       String((cronSearch?.attributes?.kibanaSavedObjectMeta as Record<string, unknown>)?.searchSourceJSON || '{}'),
@@ -152,8 +156,13 @@ describe('monitoring-dashboards helpers', () => {
     const query = (searchSource.query && typeof searchSource.query === 'object')
       ? (searchSource.query as Record<string, unknown>)
       : {};
+    const columns = Array.isArray(cronSearch?.attributes?.columns) ? cronSearch?.attributes?.columns : [];
 
-    expect(JSON.stringify(statusSpec)).toContain('cron.scheduler');
+    expect(JSON.stringify(queueDepthSpec)).toContain('cron.scheduler');
+    expect(JSON.stringify(queueDepthSpec)).toContain('cron.queue.backlog_due');
     expect(String(query.query || '')).toContain('cron.scheduler');
+    expect(columns).toContain('cron.queue.backlog_due');
+    expect(columns).toContain('cron.task.job_code');
+    expect(columns).toContain('cron.task.failures_24h');
   });
 });

@@ -1480,6 +1480,22 @@ registerMigration('refresh-monitoring-cron-dashboard-v1', async (ctx) => {
   console.log('upgrade.migration.refresh_monitoring_cron_dashboard_v1: complete');
 });
 
+registerMigration('refresh-monitoring-cron-dashboard-v2', async (ctx) => {
+  const stack = await fetchStackSnapshot(ctx);
+  const stackType = String(stack.stack_type || '').trim();
+  if (!isMonitoringEligibleStackType(stackType)) {
+    console.log(`upgrade.migration.refresh_monitoring_cron_dashboard_v2: skipped for stack_type=${stackType || 'unknown'}`);
+    return;
+  }
+
+  console.log('upgrade.migration.refresh_monitoring_cron_dashboard_v2: rebuilding and redeploying monitoring stack');
+  await executeMigration('build-monitoring-images', ctx);
+  await executeMigration('deploy-monitoring-stack', ctx);
+  await executeMigration('connect-cloudflared-to-monitoring', ctx);
+  await executeMigration('bootstrap-monitoring-dashboards', ctx);
+  console.log('upgrade.migration.refresh_monitoring_cron_dashboard_v2: complete');
+});
+
 registerMigration('rebuild-base-service-images', async (ctx) => {
   await ensureCloudSwarmRepo(ctx.cloudSwarmDir);
   const scriptPath = path.join(ctx.cloudSwarmDir, 'scripts', 'build-services.sh');
