@@ -166,7 +166,19 @@ function parseDesiredReplicaCountFromMode(raw: string): number | null {
 }
 
 async function isDatabaseReplicaExpected(environmentId: number): Promise<boolean> {
-  const serviceName = `mz-env-${environmentId}_database-replica`;
+  return isServiceExpected(environmentId, 'database-replica', 'replica stabilization checks');
+}
+
+async function isProxySqlExpected(environmentId: number): Promise<boolean> {
+  return isServiceExpected(environmentId, 'proxysql', 'ProxySQL stabilization checks');
+}
+
+async function isServiceExpected(
+  environmentId: number,
+  serviceSuffix: string,
+  checkDescription: string,
+): Promise<boolean> {
+  const serviceName = `mz-env-${environmentId}_${serviceSuffix}`;
   const inspect = await runCommand(
     'docker',
     ['service', 'inspect', serviceName, '--format', '{{json .Spec.Mode}}'],
@@ -175,19 +187,19 @@ async function isDatabaseReplicaExpected(environmentId: number): Promise<boolean
   if (inspect.code !== 0) {
     const errorText = `${inspect.stderr || ''} ${inspect.stdout || ''}`.toLowerCase();
     if (errorText.includes('no such service') || errorText.includes('not found')) {
-      log(`env=${environmentId} ${serviceName} is absent; skipping replica stabilization checks`);
+      log(`env=${environmentId} ${serviceName} is absent; skipping ${checkDescription}`);
       return false;
     }
-    log(`env=${environmentId} failed to inspect ${serviceName}; keeping replica stabilization checks enabled`);
+    log(`env=${environmentId} failed to inspect ${serviceName}; keeping ${checkDescription} enabled`);
     return true;
   }
   const desiredReplicas = parseDesiredReplicaCountFromMode(inspect.stdout || '');
   if (desiredReplicas === null) {
-    log(`env=${environmentId} unable to parse replica mode for ${serviceName}; keeping replica stabilization checks enabled`);
+    log(`env=${environmentId} unable to parse replica mode for ${serviceName}; keeping ${checkDescription} enabled`);
     return true;
   }
   if (desiredReplicas < 1) {
-    log(`env=${environmentId} ${serviceName} desired replicas=${desiredReplicas}; skipping replica stabilization checks`);
+    log(`env=${environmentId} ${serviceName} desired replicas=${desiredReplicas}; skipping ${checkDescription}`);
     return false;
   }
   return true;
@@ -197,12 +209,13 @@ async function runStabilizationCycle(environmentId: number, reason: string): Pro
   const runId = crypto.randomUUID();
   const checks: StabilizationCheck[] = [];
   const dbReplicaExpected = await isDatabaseReplicaExpected(environmentId);
+  const proxysqlExpected = await isProxySqlExpected(environmentId);
 
   upsertStabilizationState(environmentId, {
     status: 'stabilizing',
     mode: 'active',
     run_id: runId,
-    current_step: dbReplicaExpected ? 'db_replication_status' : 'proxysql_ready',
+    current_step: dbReplicaExpected ? 'db_replication_status' : (proxysqlExpected ? 'proxysql_ready' : 'http_smoke_check'),
     current_step_started_at: nowIso(),
     checks: [],
     last_error: '',
@@ -255,15 +268,24 @@ async function runStabilizationCycle(environmentId: number, reason: string): Pro
     });
   }
 
-  upsertStabilizationState(environmentId, {
-    status: 'stabilizing',
-    mode: 'active',
-    run_id: runId,
-    current_step: 'proxysql_ready',
-    current_step_started_at: nowIso(),
-    checks,
-  });
-  checks.push(await executeCheck(environmentId, 'proxysql_ready'));
+  if (proxysqlExpected) {
+    upsertStabilizationState(environmentId, {
+      status: 'stabilizing',
+      mode: 'active',
+      run_id: runId,
+      current_step: 'proxysql_ready',
+      current_step_started_at: nowIso(),
+      checks,
+    });
+    checks.push(await executeCheck(environmentId, 'proxysql_ready'));
+  } else {
+    checks.push({
+      runbook_id: 'proxysql_ready',
+      status: 'ok',
+      summary: 'ProxySQL is intentionally disabled (service absent or scaled to 0); readiness checks skipped.',
+      finished_at: nowIso(),
+    });
+  }
 
   upsertStabilizationState(environmentId, {
     status: 'stabilizing',
@@ -458,5 +480,7 @@ export const __testing = {
   parseServiceEnvironmentIds,
   parseDesiredReplicaCountFromMode,
   isDatabaseReplicaExpected,
+  isProxySqlExpected,
+  isServiceExpected,
   runStabilizationCycle,
 };

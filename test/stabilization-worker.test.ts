@@ -63,16 +63,22 @@ describe('stabilization-worker replica checks', () => {
   });
 
   it('skips replica runbooks when replica service is scaled to zero', async () => {
-    runCommandMock.mockResolvedValue({
-      code: 0,
-      stdout: '{"Replicated":{"Replicas":0}}',
-      stderr: '',
+    runCommandMock.mockImplementation(async (_cmd, args) => {
+      const service = String(args?.[2] || '');
+      if (service.endsWith('_database-replica') || service.endsWith('_proxysql')) {
+        return {
+          code: 0,
+          stdout: '{"Replicated":{"Replicas":0}}',
+          stderr: '',
+        };
+      }
+      return { code: 0, stdout: '', stderr: '' };
     });
 
     await __testing.runStabilizationCycle(15, 'test');
 
     const runbookIds = executeRunbookByIdMock.mock.calls.map(([runbookId]) => String(runbookId));
-    expect(runbookIds).toEqual(['proxysql_ready', 'http_smoke_check', 'varnish_ready']);
+    expect(runbookIds).toEqual(['http_smoke_check', 'varnish_ready']);
 
     const finalState = upsertStabilizationStateMock.mock.calls.at(-1)?.[1] as {
       status?: string;
@@ -88,10 +94,42 @@ describe('stabilization-worker replica checks', () => {
   });
 
   it('skips replica runbooks when replica service is absent', async () => {
-    runCommandMock.mockResolvedValue({
-      code: 1,
-      stdout: '',
-      stderr: 'Error response from daemon: no such service',
+    runCommandMock.mockImplementation(async (_cmd, args) => {
+      const service = String(args?.[2] || '');
+      if (service.endsWith('_database-replica') || service.endsWith('_proxysql')) {
+        return {
+          code: 1,
+          stdout: '',
+          stderr: 'Error response from daemon: no such service',
+        };
+      }
+      return { code: 0, stdout: '', stderr: '' };
+    });
+
+    await __testing.runStabilizationCycle(15, 'test');
+
+    const runbookIds = executeRunbookByIdMock.mock.calls.map(([runbookId]) => String(runbookId));
+    expect(runbookIds).toEqual(['http_smoke_check', 'varnish_ready']);
+  });
+
+  it('keeps proxysql readiness checks when proxysql is enabled', async () => {
+    runCommandMock.mockImplementation(async (_cmd, args) => {
+      const service = String(args?.[2] || '');
+      if (service.endsWith('_database-replica')) {
+        return {
+          code: 0,
+          stdout: '{"Replicated":{"Replicas":0}}',
+          stderr: '',
+        };
+      }
+      if (service.endsWith('_proxysql')) {
+        return {
+          code: 0,
+          stdout: '{"Replicated":{"Replicas":1}}',
+          stderr: '',
+        };
+      }
+      return { code: 0, stdout: '', stderr: '' };
     });
 
     await __testing.runStabilizationCycle(15, 'test');
