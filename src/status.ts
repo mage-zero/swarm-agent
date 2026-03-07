@@ -3343,10 +3343,15 @@ export async function handleJoinTokenRequest(secretHeader: string | undefined) {
 }
 
 export const __testing = {
+  compareTaskRecency,
+  desiredStateRank,
+  getNodeConstraintValue,
+  mapSwarmNodes,
   parseTaskRecency,
   taskGroupingKey,
   selectLatestServiceTasks,
   parsePlacementConstraint,
+  readAgentVersion,
   nodeMatchesPlacementConstraints,
   countEligibleReadyNodesForService,
 };
