@@ -1,7 +1,7 @@
 {
-  "version": "0.4.97",
-  "date": "2026-03-06",
-  "summary": "Require node-auth for planner, services, and runbook reads while suppressing unsigned detailed status expansions",
+  "version": "0.4.98",
+  "date": "2026-03-07",
+  "summary": "Improve deploy root-cause diagnostics, fail fast on broken monitoring states, and avoid zero-replica verification false negatives",
   "requires": {
     "cloud-swarm": ">=1.0.42"
   },

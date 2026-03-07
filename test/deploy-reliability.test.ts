@@ -72,6 +72,14 @@ describe('classifyDeployError', () => {
     expect(result).toEqual({ kind: 'permanent', category: 'build_manifest', retryable: false });
   });
 
+  it('classifies "No such image" as build_manifest', () => {
+    const result = classifyDeployError(
+      'worker-1|Rejected 2 seconds ago|No such image: registry.internal:5000/mz-varnish:env-15-0b6c71a02134',
+      'deploy',
+    );
+    expect(result).toEqual({ kind: 'permanent', category: 'build_manifest', retryable: false });
+  });
+
   // -- container_startup (transient, retryable) --
   it('classifies smoke check failures as container_startup', () => {
     const result = classifyDeployError(
@@ -132,6 +140,14 @@ describe('classifyDeployError', () => {
     const result = classifyDeployError(
       'SQLSTATE[23000]: Integrity constraint violation: 1062 Duplicate entry',
       'magento_cli',
+    );
+    expect(result).toEqual({ kind: 'permanent', category: 'magento_cli_schema', retryable: false });
+  });
+
+  it('classifies setup:db:status mismatch hints as magento_cli_schema', () => {
+    const result = classifyDeployError(
+      'Post-deploy smoke checks failed: nginx.health_check.php expected 200 got 0. Root cause hints: setup:db:status still reports pending schema/data changes after setup:upgrade.',
+      'deploy',
     );
     expect(result).toEqual({ kind: 'permanent', category: 'magento_cli_schema', retryable: false });
   });

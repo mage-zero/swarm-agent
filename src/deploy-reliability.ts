@@ -74,6 +74,7 @@ const ERROR_RULES: ErrorRule[] = [
   // build_manifest — permanent, not retryable
   { pattern: /manifest unknown/i, category: 'build_manifest', kind: 'permanent', retryable: false },
   { pattern: /failed to resolve source image.*not found/i, category: 'build_manifest', kind: 'permanent', retryable: false },
+  { pattern: /No such image/i, category: 'build_manifest', kind: 'permanent', retryable: false },
 
   // magento_cli_lock — transient, retryable
   { pattern: /Another process is running/i, category: 'magento_cli_lock', kind: 'transient', retryable: true },
@@ -82,6 +83,8 @@ const ERROR_RULES: ErrorRule[] = [
   { pattern: /SQLSTATE\[42S21\]/i, category: 'magento_cli_schema', kind: 'permanent', retryable: false },
   { pattern: /SQLSTATE\[42S01\]/i, category: 'magento_cli_schema', kind: 'permanent', retryable: false },
   { pattern: /SQLSTATE\[23000\]/i, category: 'magento_cli_schema', kind: 'permanent', retryable: false },
+  { pattern: /setup:db:status still reports/i, category: 'magento_cli_schema', kind: 'permanent', retryable: false },
+  { pattern: /persistent schema\/data mismatch/i, category: 'magento_cli_schema', kind: 'permanent', retryable: false },
 
   // config_error — permanent, not retryable
   { pattern: /invalid configuration/i, category: 'config_error', kind: 'permanent', retryable: false },

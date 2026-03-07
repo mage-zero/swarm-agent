@@ -102,6 +102,7 @@ import {
   captureServicePs,
 } from './lib/docker-service.js';
 import {
+  type PostDeploySmokeCheckResult,
   runPostDeploySmokeChecks,
 } from './lib/smoke-check.js';
 import {
@@ -1821,6 +1822,11 @@ type MonitoringRuntimeStatus = {
   issues: string[];
 };
 
+type SmokeFailureDiagnostics = {
+  hints: string[];
+  summary: string;
+};
+
 type DockerServiceNetworkRef = {
   Target?: string;
 };
@@ -1897,6 +1903,14 @@ function summarizeMonitoringRuntimeIssues(statuses: MonitoringRuntimeStatus[]): 
     .join(' | ');
 }
 
+function detectFatalMonitoringRuntimeIssue(statuses: MonitoringRuntimeStatus[]): string | null {
+  const zeroDesired = statuses.filter((status) => status.desiredRunning === 0);
+  if (!zeroDesired.length) {
+    return null;
+  }
+  return summarizeMonitoringRuntimeIssues(zeroDesired) || 'monitoring services have zero desired tasks';
+}
+
 async function waitForMonitoringRuntimeHealthy(log: (msg: string) => void): Promise<void> {
   const deadline = Date.now() + MONITORING_HEALTH_TIMEOUT_MS;
   let lastSummary = '';
@@ -1904,6 +1918,10 @@ async function waitForMonitoringRuntimeHealthy(log: (msg: string) => void): Prom
     const statuses = await inspectMonitoringRuntimeServices([...MONITORING_RUNTIME_SERVICES]);
     if (monitoringRuntimeHealthy(statuses)) {
       return;
+    }
+    const fatalSummary = detectFatalMonitoringRuntimeIssue(statuses);
+    if (fatalSummary) {
+      throw new Error(`Monitoring stack has services with zero desired tasks and will not self-heal: ${fatalSummary}`);
     }
     const summary = summarizeMonitoringRuntimeIssues(statuses);
     if (summary && summary !== lastSummary) {
@@ -3419,6 +3437,85 @@ function shouldSkipReleaseCohortTaskReadiness(
   expectedTag: string,
 ): boolean {
   return desiredReplicas === 0 && specTag === expectedTag;
+}
+
+function shouldSkipPostDeployTaskReadiness(
+  desiredReplicas: number | null,
+  image: string | null,
+  expectedTag: string,
+): boolean {
+  const imageTag = image ? parseImageReference(image).tag : '';
+  return desiredReplicas === 0 && imageTag === expectedTag;
+}
+
+function hasRecordNeededFlag(recordState: Record<string, unknown>, key: string): boolean {
+  const value = recordState[key];
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  return (value as Record<string, unknown>).needed === true;
+}
+
+function buildSmokeFailureDiagnostics(
+  results: PostDeploySmokeCheckResult[],
+  servicePs: Record<string, string[]>,
+  recordState: Record<string, unknown>,
+): SmokeFailureDiagnostics {
+  const hints: string[] = [];
+  const failed = results.filter((result) => !result.ok);
+  const byName = new Map(results.map((result) => [result.name, result]));
+  const nginxHealth = byName.get('nginx.mz-healthz');
+  const varnishHealth = byName.get('varnish.mz-healthz');
+  const varnishRoot = byName.get('varnish.root');
+  const phpHealth = byName.get('nginx.health_check.php');
+
+  if (
+    failed.length === 1
+    && failed[0]?.name === 'nginx.health_check.php'
+    && nginxHealth?.ok
+    && varnishHealth?.ok
+    && varnishRoot?.ok
+    && phpHealth
+  ) {
+    hints.push('only the deep PHP readiness probe failed while nginx and varnish were already serving traffic; inspect php-fpm application logs');
+  }
+
+  const servicePsText = Object.values(servicePs).flat().join('\n');
+  if (/No such image/i.test(servicePsText)) {
+    hints.push('one or more service tasks were rejected because the image was unavailable in the registry');
+  }
+
+  if (hasRecordNeededFlag(recordState, 'setup_upgrade_post_check')) {
+    hints.push('setup:db:status still reports pending schema/data changes after setup:upgrade');
+  }
+
+  if (hasRecordNeededFlag(recordState, 'setup_upgrade_skipped_persistent_mismatch')) {
+    hints.push('persistent schema/data mismatch was detected before smoke checks');
+  }
+
+  return {
+    hints,
+    summary: hints.join('; '),
+  };
+}
+
+async function captureServiceLogs(serviceName: string, tail = 40): Promise<string[]> {
+  const result = await runCommandCaptureWithStatus('docker', [
+    'service',
+    'logs',
+    '--tail',
+    String(Math.max(1, tail)),
+    serviceName,
+  ]);
+  const out = (result.stdout || result.stderr || '').trim();
+  if (result.code !== 0) {
+    return [out ? `error: ${out}` : `error: exit ${result.code}`];
+  }
+  return out
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(-tail);
 }
 
 function filterReleaseCohortServicesForGate(services: string[]): string[] {
@@ -5279,12 +5376,23 @@ async function processDeployment(recordPath: string) {
         [`${stackName}_nginx`]: await captureServicePs(`${stackName}_nginx`),
         [`${stackName}_varnish`]: await captureServicePs(`${stackName}_varnish`),
         [`${stackName}_php-fpm`]: await captureServicePs(`${stackName}_php-fpm`),
+        [`${stackName}_php-fpm-admin`]: await captureServicePs(`${stackName}_php-fpm-admin`),
       };
+      const serviceLogs = {
+        [`${stackName}_nginx`]: await captureServiceLogs(`${stackName}_nginx`),
+        [`${stackName}_varnish`]: await captureServiceLogs(`${stackName}_varnish`),
+        [`${stackName}_php-fpm`]: await captureServiceLogs(`${stackName}_php-fpm`),
+        [`${stackName}_php-fpm-admin`]: await captureServiceLogs(`${stackName}_php-fpm-admin`),
+      };
+      const diagnostics = buildSmokeFailureDiagnostics(smoke.results, servicePs, recordState);
       recordState.post_deploy_smoke_checks = {
         ok: false,
         summary: smoke.summary,
+        diagnosis: diagnostics.summary || null,
+        hints: diagnostics.hints,
         results: smoke.results,
         service_ps: servicePs,
+        service_logs: serviceLogs,
         captured_at: new Date().toISOString(),
       };
       writeJsonFileBestEffort(recordPath, recordState);
@@ -5309,11 +5417,15 @@ async function processDeployment(recordPath: string) {
             queued_at: new Date().toISOString(),
           };
           writeJsonFileBestEffort(recordPath, recordState);
-          throw new Error(`Post-deploy smoke checks failed: ${smoke.summary}. Auto-rollback queued (${rollbackDeploymentId}).`);
+          const hintSuffix = diagnostics.summary ? ` Root cause hints: ${diagnostics.summary}.` : '';
+          throw new Error(
+            `Post-deploy smoke checks failed: ${smoke.summary}.${hintSuffix} Auto-rollback queued (${rollbackDeploymentId}).`
+          );
         }
       }
 
-      throw new Error(`Post-deploy smoke checks failed: ${smoke.summary}`);
+      const hintSuffix = diagnostics.summary ? ` Root cause hints: ${diagnostics.summary}.` : '';
+      throw new Error(`Post-deploy smoke checks failed: ${smoke.summary}.${hintSuffix}`);
     }
     progress.ok('smoke_checks');
   } else {
@@ -5336,11 +5448,14 @@ async function processDeployment(recordPath: string) {
   const failures: string[] = [];
   for (const target of verifyTargets) {
     const image = await inspectServiceImage(target.service);
+    const desiredReplicas = await inspectServiceDesiredReplicas(target.service);
     const updateStatus = await inspectServiceUpdateStatus(target.service);
     const tasks = await listServiceTasksWithImages(target.service);
     const taskSummary = summarizeReleaseServiceState(tasks, target.expected_tag);
+    const skipTaskReadiness = shouldSkipPostDeployTaskReadiness(desiredReplicas, image, target.expected_tag);
     verifySnapshot[target.service] = {
       image,
+      desired_replicas: desiredReplicas,
       update_status: updateStatus,
       tasks: {
         desired_running: taskSummary.desired_running,
@@ -5353,11 +5468,14 @@ async function processDeployment(recordPath: string) {
     if (!image || !image.includes(`:${target.expected_tag}`)) {
       failures.push(`${target.service} image mismatch`);
     }
-    if (!taskSummary.ok) {
+    if (!skipTaskReadiness && !taskSummary.ok) {
       failures.push(`${target.service} tasks not aligned`);
     }
     const state = (updateStatus?.state || '').toLowerCase();
-    if (state.includes('pause') || (state.includes('rollback') && (!image || !image.includes(`:${target.expected_tag}`)))) {
+    if (
+      !skipTaskReadiness
+      && (state.includes('pause') || (state.includes('rollback') && (!image || !image.includes(`:${target.expected_tag}`))))
+    ) {
       failures.push(`${target.service} update=${updateStatus?.state || 'unknown'}`);
     }
   }
@@ -5658,6 +5776,9 @@ export const __testing = {
   buildNginxPhpUpstreamEnv,
   filterReleaseCohortServicesForGate,
   shouldSkipReleaseCohortTaskReadiness,
+  shouldSkipPostDeployTaskReadiness,
+  detectFatalMonitoringRuntimeIssue,
+  buildSmokeFailureDiagnostics,
   buildProxySqlQueryRulesSql,
   buildProxySqlRuleReconcileScript,
   shouldReuseAppImagesForCloudSwarmRef,
