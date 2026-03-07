@@ -184,6 +184,8 @@ type ServiceStatus = {
   name?: string;
   service?: string;
   environment_id?: number;
+  image?: string;
+  image_tag?: string;
   mode?: string;
   desired_replicas: number;
   running_replicas: number;
@@ -999,6 +1001,22 @@ function parseEnvironmentServiceName(name: string) {
   };
 }
 
+function extractImageTag(image: string): string {
+  const trimmed = String(image || '').trim();
+  if (!trimmed) {
+    return '';
+  }
+
+  const withoutDigest = trimmed.split('@', 1)[0] || '';
+  const lastSlash = withoutDigest.lastIndexOf('/');
+  const lastColon = withoutDigest.lastIndexOf(':');
+  if (lastColon <= lastSlash) {
+    return '';
+  }
+
+  return withoutDigest.slice(lastColon + 1);
+}
+
 function parseTimestamp(value: unknown): number {
   const text = String(value || '').trim();
   if (!text) {
@@ -1208,6 +1226,8 @@ export async function buildServiceStatusPayload(environmentId?: number): Promise
     }
 
     const mode = service?.Spec?.Mode?.Replicated ? 'replicated' : 'global';
+    const image = String(service?.Spec?.TaskTemplate?.ContainerSpec?.Image || '').trim();
+    const imageTag = extractImageTag(image);
     const desiredReplicas = mode === 'replicated'
       ? Number(service?.Spec?.Mode?.Replicated?.Replicas || 0)
       : countEligibleReadyNodesForService(service, readyNodes);
@@ -1311,6 +1331,8 @@ export async function buildServiceStatusPayload(environmentId?: number): Promise
       name,
       service: parsed.service,
       environment_id: parsed.environmentId,
+      image: image || undefined,
+      image_tag: imageTag || undefined,
       mode,
       desired_replicas: desiredReplicas,
       running_replicas: effectiveRunningReplicas,
@@ -3345,6 +3367,7 @@ export async function handleJoinTokenRequest(secretHeader: string | undefined) {
 export const __testing = {
   compareTaskRecency,
   desiredStateRank,
+  extractImageTag,
   getNodeConstraintValue,
   mapSwarmNodes,
   parseTaskRecency,

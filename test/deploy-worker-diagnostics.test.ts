@@ -94,7 +94,7 @@ describe('smoke failure diagnostics', () => {
     );
   });
 
-  it('surfaces image pull failures and setup mismatch hints', () => {
+  it('surfaces image pull failures without escalating known schema mismatch flags', () => {
     const diagnostics = buildSmokeFailureDiagnostics(
       [
         { name: 'nginx.mz-healthz', url: 'http://nginx/mz-healthz', expected: '200', status: 0, ok: false, detail: 'operation timed out' },
@@ -111,10 +111,10 @@ describe('smoke failure diagnostics', () => {
     expect(diagnostics.hints).toContain(
       'one or more service tasks were rejected because the image was unavailable in the registry',
     );
-    expect(diagnostics.hints).toContain(
+    expect(diagnostics.hints).not.toContain(
       'setup:db:status still reports pending schema/data changes after setup:upgrade',
     );
-    expect(diagnostics.hints).toContain(
+    expect(diagnostics.hints).not.toContain(
       'persistent schema/data mismatch was detected before smoke checks',
     );
   });

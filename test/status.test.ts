@@ -172,6 +172,13 @@ describe('service status helpers', () => {
     expect(__testing.nodeMatchesPlacementConstraints(node, ['node.labels.region == eu-west-1'])).toBe(false);
   });
 
+  it('extracts image tags from swarm image references with digests', () => {
+    expect(__testing.extractImageTag('10.100.0.10:5000/mz-magento:env-15-73d803d3e7bf@sha256:deadbeef')).toBe(
+      'env-15-73d803d3e7bf',
+    );
+    expect(__testing.extractImageTag('registry.internal/mz-varnish')).toBe('');
+  });
+
   it('builds stable grouping keys and recency from partial task payloads', () => {
     expect(__testing.taskGroupingKey({ Slot: 3 })).toBe('slot:3');
     expect(__testing.taskGroupingKey({ Slot: 0, NodeID: 'node-a' })).toBe('node:node-a');

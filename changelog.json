@@ -1,7 +1,7 @@
 {
-  "version": "0.4.98",
+  "version": "0.4.99",
   "date": "2026-03-07",
-  "summary": "Improve deploy root-cause diagnostics, fail fast on broken monitoring states, and avoid zero-replica verification false negatives",
+  "summary": "Keep known declarative-schema drift informational during deploy failures and expose live service tags for currently running commit views",
   "requires": {
     "cloud-swarm": ">=1.0.42"
   },

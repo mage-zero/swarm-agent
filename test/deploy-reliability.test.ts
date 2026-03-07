@@ -144,12 +144,12 @@ describe('classifyDeployError', () => {
     expect(result).toEqual({ kind: 'permanent', category: 'magento_cli_schema', retryable: false });
   });
 
-  it('classifies setup:db:status mismatch hints as magento_cli_schema', () => {
+  it('does not let setup:db:status mismatch hints override smoke-check classification', () => {
     const result = classifyDeployError(
-      'Post-deploy smoke checks failed: nginx.health_check.php expected 200 got 0. Root cause hints: setup:db:status still reports pending schema/data changes after setup:upgrade.',
+      'Post-deploy smoke checks failed: nginx.health_check.php expected 200 got 502. Root cause hints: setup:db:status still reports pending schema/data changes after setup:upgrade.',
       'deploy',
     );
-    expect(result).toEqual({ kind: 'permanent', category: 'magento_cli_schema', retryable: false });
+    expect(result).toEqual({ kind: 'transient', category: 'container_startup', retryable: true });
   });
 
   // -- config_error (permanent, not retryable) --

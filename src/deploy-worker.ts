@@ -3448,18 +3448,10 @@ function shouldSkipPostDeployTaskReadiness(
   return desiredReplicas === 0 && imageTag === expectedTag;
 }
 
-function hasRecordNeededFlag(recordState: Record<string, unknown>, key: string): boolean {
-  const value = recordState[key];
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-  return (value as Record<string, unknown>).needed === true;
-}
-
 function buildSmokeFailureDiagnostics(
   results: PostDeploySmokeCheckResult[],
   servicePs: Record<string, string[]>,
-  recordState: Record<string, unknown>,
+  _recordState: Record<string, unknown>,
 ): SmokeFailureDiagnostics {
   const hints: string[] = [];
   const failed = results.filter((result) => !result.ok);
@@ -3483,14 +3475,6 @@ function buildSmokeFailureDiagnostics(
   const servicePsText = Object.values(servicePs).flat().join('\n');
   if (/No such image/i.test(servicePsText)) {
     hints.push('one or more service tasks were rejected because the image was unavailable in the registry');
-  }
-
-  if (hasRecordNeededFlag(recordState, 'setup_upgrade_post_check')) {
-    hints.push('setup:db:status still reports pending schema/data changes after setup:upgrade');
-  }
-
-  if (hasRecordNeededFlag(recordState, 'setup_upgrade_skipped_persistent_mismatch')) {
-    hints.push('persistent schema/data mismatch was detected before smoke checks');
   }
 
   return {

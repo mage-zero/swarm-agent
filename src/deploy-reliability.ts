@@ -83,8 +83,6 @@ const ERROR_RULES: ErrorRule[] = [
   { pattern: /SQLSTATE\[42S21\]/i, category: 'magento_cli_schema', kind: 'permanent', retryable: false },
   { pattern: /SQLSTATE\[42S01\]/i, category: 'magento_cli_schema', kind: 'permanent', retryable: false },
   { pattern: /SQLSTATE\[23000\]/i, category: 'magento_cli_schema', kind: 'permanent', retryable: false },
-  { pattern: /setup:db:status still reports/i, category: 'magento_cli_schema', kind: 'permanent', retryable: false },
-  { pattern: /persistent schema\/data mismatch/i, category: 'magento_cli_schema', kind: 'permanent', retryable: false },
 
   // config_error — permanent, not retryable
   { pattern: /invalid configuration/i, category: 'config_error', kind: 'permanent', retryable: false },
